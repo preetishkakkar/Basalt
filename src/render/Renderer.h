@@ -38,6 +38,7 @@ struct RenderSettings {
   bool clusteredLights = true;
   float groundRoughness = 0.8f;
   float groundMetallic = 0.0f;
+  Vec3 groundColor{0.34f, 0.34f, 0.36f};
 
   int shadowMode = 0; // 0 cascades, 1 traced
   int shadowSamples = 4;
@@ -116,7 +117,8 @@ public:
   void rebakeProceduralSky();
   // Every material set holds the environment cubes and must be rewritten.
   void environmentChanged() { rebuildSceneResources(); }
-  void setGroundMaterial(float roughness, float metallic);
+  // Pushes the ground settings into the plane's material.
+  void applyGroundMaterial();
   VkFormat swapchainFormat() const;
 
 private:

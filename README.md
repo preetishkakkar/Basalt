@@ -121,6 +121,8 @@ basalt [model.gltf|model.glb] [environment.hdr] [options]
   --ao N              0 the material's occlusion map, 1 ray traced
   --reflections N     0 environment only, 1 screen space, 2 ray traced
   --ground R M        roughness and metallic of the built-in ground plane
+  --ground-color R G B  base colour of the ground plane, 0 to 1
+  --ground-preset N   0 matte, 1 polished, 2 glossy dark, 3 mirror
   --no-ui             start with the interface hidden
   --aa N              0 none, 1 FXAA, 2 temporal
   --taa-feedback F    how much of a moving frame is the new one

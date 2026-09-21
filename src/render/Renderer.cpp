@@ -658,14 +658,22 @@ void Renderer::buildHitTextureTable(const Scene &scene, std::vector<VkImageView>
                kHitTextureSlots - 2);
 }
 
-void Renderer::setGroundMaterial(float roughness, float metallic) {
+void Renderer::applyGroundMaterial() {
   if (!activeScene || activeScene->groundPrimitive < 0) return;
   const std::uint32_t index =
       activeScene->primitives[static_cast<std::size_t>(activeScene->groundPrimitive)].material;
   MaterialUniforms &uniforms = activeScene->materials[index].uniforms;
-  if (uniforms.factors.x == metallic && uniforms.factors.y == roughness) return;
+  const float metallic = std::clamp(settings.groundMetallic, 0.0f, 1.0f);
+  const float roughness = std::clamp(settings.groundRoughness, 0.02f, 1.0f);
+  const Vec4 colour{std::clamp(settings.groundColor.x, 0.0f, 1.0f), std::clamp(settings.groundColor.y, 0.0f, 1.0f),
+                    std::clamp(settings.groundColor.z, 0.0f, 1.0f), 1.0f};
+  if (uniforms.factors.x == metallic && uniforms.factors.y == roughness &&
+      uniforms.baseColorFactor.x == colour.x && uniforms.baseColorFactor.y == colour.y &&
+      uniforms.baseColorFactor.z == colour.z)
+    return;
   uniforms.factors.x = metallic;
   uniforms.factors.y = roughness;
+  uniforms.baseColorFactor = colour;
 
   context.waitIdle();
   std::vector<MaterialUniforms> materials;
@@ -983,7 +991,7 @@ std::uint64_t Renderer::settingsKey() const {
   const RenderSettings &s = settings;
   add(s.sunAzimuth); add(s.sunElevation); add(s.sunColor); add(s.sunIntensity); add(s.sunAngularRadius);
   add(s.iblIntensity); add(s.skyTurbidity); add(s.skyIntensity); add(s.drawSky); add(s.groundPlane);
-  add(s.groundRoughness); add(s.groundMetallic);
+  add(s.groundRoughness); add(s.groundMetallic); add(s.groundColor);
   add(s.shadowMode); add(s.shadowSamples); add(s.shadowsEnabled); add(s.shadowDepthBias);
   add(s.shadowNormalBias); add(s.shadowSoftness); add(s.cascadeSplitLambda); add(s.shadowDistance);
   add(s.freezeCascades);

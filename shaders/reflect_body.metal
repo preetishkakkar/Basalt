@@ -273,6 +273,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
     // While accumulating, sample the GGX lobe per frame; otherwise the mirror direction and a blurred mip.
     float3 rayDirection = direction;
     bool sendRay = true;
+    bool keepEscape = true;
     if (uniforms.sampling.x > 0.5f) {
       const float2 pixel = float2(float(id.x), float(id.y));
       const float3 rotation = frameRotation(uniforms.sampling.y);
@@ -284,12 +285,14 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
         const float2 xi2 = float2(fract(xi.x + 0.618034f), fract(xi.y + 0.324717f));
         sampled = reflect(-view, importanceSampleGGX(xi2, normal, roughness));
       }
-      // The prefiltered environment weights directions by cosine; keeping a sample with that
-      // probability gives the same weighted mean, the environment standing in when it is dropped.
+      // Every ray is traced, and one that hits is kept whatever its angle: the environment
+      // cannot stand in for the scene. An escaping ray is kept with probability cosine, the
+      // prefiltered environment standing in otherwise, which matches how that is weighted.
       const float cosine = dot(sampled, normal);
       // Its own sequence, uncorrelated with the direction draw.
       const float accept = fract(hashFloat(id.x * 26699u + id.y * 15485863u) + rotation.z);
-      sendRay = cosine > 1e-3f && accept <= cosine;
+      sendRay = cosine > 1e-3f;
+      keepEscape = accept <= cosine;
       if (sendRay) rayDirection = sampled;
     }
     if (sendRay) {
@@ -328,7 +331,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
         colour = shadeSurface(surface, rayDirection, visible, uniforms, lights, prefilteredCube,
                               clampSampler);
         confidence = 1.0f;
-      } else if (uniforms.sampling.x > 0.5f) {
+      } else if (uniforms.sampling.x > 0.5f && keepEscape) {
         // An escaped sampled ray reads the sharp environment: the lobe itself is being averaged.
         colour = prefilteredCube.sample(clampSampler, rayDirection, level(0.0f)).rgb * uniforms.sunColor.w;
         confidence = 1.0f;

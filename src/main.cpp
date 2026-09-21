@@ -63,6 +63,34 @@ void applyDarkStyle() {
   colors[ImGuiCol_CheckMark] = ImVec4(0.45f, 0.62f, 0.95f, 1.00f);
 }
 
+// A white floor shows shadows but drowns a reflection; a metal mirror reflects but has
+// no diffuse for a shadow to darken; a dark gloss does both.
+struct GroundPreset {
+  Vec3 colour;
+  float roughness;
+  float metallic;
+};
+constexpr GroundPreset kGroundPresets[] = {
+    {{0.34f, 0.34f, 0.36f}, 0.8f, 0.0f},   // Matte
+    {{0.18f, 0.18f, 0.19f}, 0.08f, 0.0f},  // Polished
+    {{0.03f, 0.03f, 0.035f}, 0.05f, 0.0f}, // Glossy dark
+    {{0.95f, 0.95f, 0.95f}, 0.02f, 1.0f},  // Mirror
+};
+constexpr int kGroundPresetCount = IM_ARRAYSIZE(kGroundPresets);
+// The presets in order, then "Custom" for anything the sliders make.
+constexpr const char *groundPresetNames[] = {"Matte", "Polished", "Glossy dark", "Mirror", "Custom"};
+static_assert(IM_ARRAYSIZE(groundPresetNames) == kGroundPresetCount + 1);
+
+int groundPresetIndex(const RenderSettings &s) {
+  for (int i = 0; i < kGroundPresetCount; ++i) {
+    const GroundPreset &p = kGroundPresets[i];
+    if (s.groundRoughness == p.roughness && s.groundMetallic == p.metallic && s.groundColor.x == p.colour.x &&
+        s.groundColor.y == p.colour.y && s.groundColor.z == p.colour.z)
+      return i;
+  }
+  return kGroundPresetCount;
+}
+
 } // namespace
 
 struct Application {
@@ -86,7 +114,7 @@ struct Application {
   void loadScene(const std::string &path) {
     try {
       renderer.setScene(loadGltf(context, uploader, path));
-      renderer.setGroundMaterial(renderer.settings.groundRoughness, renderer.settings.groundMetallic);
+      renderer.applyGroundMaterial();
       camera.frame(renderer.scene()->bounds);
       status = "loaded " + std::filesystem::path(path).filename().string();
     } catch (const std::exception &failure) {
@@ -258,7 +286,7 @@ void Application::drawInterface() {
     }
     if (ImGui::Button("Reset to the built-in cube", ImVec2(-1, 0))) {
       renderer.setScene(createDefaultScene(context, uploader));
-      renderer.setGroundMaterial(settings.groundRoughness, settings.groundMetallic);
+      renderer.applyGroundMaterial();
       camera.frame(renderer.scene()->bounds);
     }
     if (!status.empty()) ImGui::TextWrapped("%s", status.c_str());
@@ -278,9 +306,21 @@ void Application::drawInterface() {
     ImGui::SameLine();
     ImGui::Checkbox("Ground", &settings.groundPlane);
     if (settings.groundPlane) {
-      bool groundChanged = ImGui::SliderFloat("Ground roughness", &settings.groundRoughness, 0.02f, 1.0f);
+      int preset = groundPresetIndex(settings);
+      bool groundChanged = false;
+      if (ImGui::Combo("Ground look", &preset, groundPresetNames, IM_ARRAYSIZE(groundPresetNames))) {
+        if (preset < kGroundPresetCount) {
+          const GroundPreset &chosen = kGroundPresets[preset];
+          settings.groundColor = chosen.colour;
+          settings.groundRoughness = chosen.roughness;
+          settings.groundMetallic = chosen.metallic;
+          groundChanged = true;
+        }
+      }
+      groundChanged |= ImGui::ColorEdit3("Ground colour", &settings.groundColor.x);
+      groundChanged |= ImGui::SliderFloat("Ground roughness", &settings.groundRoughness, 0.02f, 1.0f);
       groundChanged |= ImGui::SliderFloat("Ground metallic", &settings.groundMetallic, 0.0f, 1.0f);
-      if (groundChanged) renderer.setGroundMaterial(settings.groundRoughness, settings.groundMetallic);
+      if (groundChanged) renderer.applyGroundMaterial();
     }
 
     Environment &environment = renderer.environment();
@@ -448,7 +488,7 @@ void Application::run(const std::string &initialScene, const std::string &initia
     alignSunToEnvironment(renderer);
   }
   if (!initialScene.empty()) loadScene(initialScene);
-  else renderer.setGroundMaterial(renderer.settings.groundRoughness, renderer.settings.groundMetallic);
+  else renderer.applyGroundMaterial();
   if (renderer.scene()) {
     const float yaw = camera.yaw, pitch = camera.pitch;
     camera.frame(renderer.scene()->bounds);
@@ -558,6 +598,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
   int debugView = 0;
   int shadowMode = -1, occlusionMode = -1, reflectionMode = -1;
   float groundRoughness = -1.0f, groundMetallic = 0.0f;
+  basalt::Vec3 groundColor{-1.0f, -1.0f, -1.0f};
+  int groundPreset = -1;
   int antialiasing = -1;
   float spin = 0.0f;
   float feedback = -1.0f;
@@ -594,6 +636,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       } else if (argument == "--ground" && i + 2 < count) {
         groundRoughness = static_cast<float>(_wtof(arguments[++i]));
         groundMetallic = static_cast<float>(_wtof(arguments[++i]));
+      } else if (argument == "--ground-color" && i + 3 < count) {
+        groundColor.x = static_cast<float>(_wtof(arguments[++i]));
+        groundColor.y = static_cast<float>(_wtof(arguments[++i]));
+        groundColor.z = static_cast<float>(_wtof(arguments[++i]));
+      } else if (argument == "--ground-preset" && i + 1 < count) {
+        groundPreset = _wtoi(arguments[++i]);
       } else if (argument == "--clustered" && i + 1 < count) {
         clustered = _wtoi(arguments[++i]) != 0;
       } else if (argument == "--lights" && i + 1 < count) {
@@ -649,10 +697,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     if (lightShadows >= 0) application.renderer.settings.lightShadows = lightShadows != 0;
     if (clustered >= 0) application.renderer.settings.clusteredLights = clustered != 0;
     if (feedback > 0.0f) application.renderer.settings.temporalFeedback = feedback;
+    if (groundPreset >= 0 && groundPreset < basalt::kGroundPresetCount) {
+      const basalt::GroundPreset &chosen = basalt::kGroundPresets[groundPreset];
+      application.renderer.settings.groundColor = chosen.colour;
+      application.renderer.settings.groundRoughness = chosen.roughness;
+      application.renderer.settings.groundMetallic = chosen.metallic;
+    }
     if (groundRoughness >= 0.0f) {
       application.renderer.settings.groundRoughness = groundRoughness;
       application.renderer.settings.groundMetallic = groundMetallic;
     }
+    if (groundColor.x >= 0.0f) application.renderer.settings.groundColor = groundColor;
     if (!vsync) application.swapchain.recreate(application.window.width(),
                                                application.window.height(), false);
     if (hasView) {
