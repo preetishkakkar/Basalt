@@ -1,0 +1,7 @@
+# Text files are stored with LF and checked out with the platform's endings.
+* text=auto
+
+# The bundled compiler and the screenshots are binary.
+*.exe binary
+*.png binary
+*.spv binary

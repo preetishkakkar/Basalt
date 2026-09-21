@@ -1,0 +1,25 @@
+#pragma once
+// The aggregate header: every individual header of the specification, all
+// independently authored. Unsupported library calls produce diagnostics that
+// name the function; nothing here has a body.
+#include "metal_types"
+#include "metal_math"
+#include "metal_common"
+#include "metal_relational"
+#include "metal_geometric"
+#include "metal_integer"
+#include "metal_atomic"
+#include "metal_texture"
+#include "metal_uniform"
+#include "metal_pixel"
+#include "metal_matrix"
+#include "metal_pack"
+#include "metal_compute"
+#include "metal_imageblocks"
+#include "metal_logging"
+#include "metal_graphics"
+#include "metal_function_constant"
+#include "metal_interpolate"
+#include "metal_mesh"
+#include "metal_tessellation"
+#include "metal_tensor"
