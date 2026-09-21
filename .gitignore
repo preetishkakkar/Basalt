@@ -1,0 +1,24 @@
+# Build output. Any build directory, however it is named, and whatever a
+# generator puts beside it.
+build*/
+out/
+*.spv
+*.spv.d
+
+# Captures and logs the engine writes beside the binary
+*.png
+*.log
+!docs/*.png
+
+# Sample models are not committed; see the README for where to get them
+assets/*
+!assets/README.md
+
+# The shader compiler: fetched by the first CMake configure, see cmake/msl2spirv.cmake
+tools/metal2vulkan/bin/
+
+# Editor and OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
