@@ -57,6 +57,22 @@ interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
   and a choice of no antialiasing, FXAA or temporal.
 - **A user interface** built with Dear ImGui, drawn through the engine's own
   Metal shaders rather than the library's bundled SPIR-V.
+- **A path tracer** beside the rasteriser, switched with F5 or the interface,
+  on the CPU and on the GPU in three ways: inline ray queries, its own BVH in
+  compute (SAH or GPU LBVH, binary or quantized BVH4/BVH8), and a full Vulkan
+  ray-tracing pipeline. Each runs as a megakernel or as bounce-synchronous
+  wavefront stages, and a hybrid mode continues rasterised primaries with
+  traced paths. It is unidirectional, with next-event estimation of the
+  environment, the sun, punctual lights and emissive meshes, multiple
+  importance sampling and Russian roulette. It uses one BSDF for the glTF
+  material with transmission, IOR, thin and closed dielectrics and clearcoat.
+  Options add thin-lens depth of field, ray-cone texture filtering and ReSTIR DI
+  at the primary vertex. Temporal reconstruction and Intel Open Image Denoise
+  clean up the display without touching the raw image. The light transport is
+  written once, in the subset of MSL that also compiles as C++, so every
+  backend runs the same code and they agree to within tested tolerances.
+  Captures write linear PFM or OpenEXR with JSON metadata; `basalt --help`
+  lists every option.
 - **Debug views** for base colour, normals, metallic, roughness, occlusion,
   the shadow term, cascade assignment, emissive, texture coordinates, the
   reflection weight, the resolved reflection and the trace's confidence. They
@@ -105,37 +121,42 @@ again. To build a copy of your own instead, put it at that path or pass
 `-DBASALT_DOWNLOAD_MSL2SPIRV=OFF` if you would rather it never reached the
 network.
 
+The first configure also fetches Intel Embree and Intel Open Image Denoise,
+prebuilt and checked against pinned hashes, into `.deps/`. Both are optional:
+without them, or with `-DBASALT_WITH_EMBREE=OFF` and `-DBASALT_WITH_OIDN=OFF`,
+the path tracer uses its own BVH and does not denoise.
+
 ## Running
 
 ```
 basalt [model.gltf|model.glb] [environment.hdr] [options]
-
-  --screenshot FILE   render a frame to a PNG and exit
-  --frame N           which frame to capture (default 8)
-  --debug N           start in debug view N (0 is the shaded image)
-  --wireframe         start in wireframe
-  --no-vsync          present without waiting for the display
-  --view YAW PITCH D  camera yaw and pitch in degrees and a multiplier on the
-                      framed distance, for repeatable captures
-  --shadows N         0 none, 1 cascaded shadow maps, 2 ray traced
-  --ao N              0 the material's occlusion map, 1 ray traced
-  --reflections N     0 environment only, 1 screen space, 2 ray traced
-  --ground R M        roughness and metallic of the built-in ground plane
-  --ground-color R G B  base colour of the ground plane, 0 to 1
-  --ground-preset N   0 matte, 1 polished, 2 glossy dark, 3 mirror
-  --no-ui             start with the interface hidden
-  --aa N              0 none, 1 FXAA, 2 temporal
-  --taa-feedback F    how much of a moving frame is the new one
-  --lights N          scatter N test point lights through the scene
-  --light-shadows 0|1 whether those lights cast traced shadows
-  --clustered 0|1     whether lights are culled into a grid
-  --spin DEG          turn the camera this many degrees every frame, so a
-                      capture exercises what only moves
+basalt --help
 ```
 
-F1 hides and shows the interface; F12 saves a screenshot next to the
-executable, named by the time, without leaving. A capture that should
-converge first takes `--frame 200` or so with accumulation on.
+A few common runs:
+
+```powershell
+# Look around a model; F5 switches to the path tracer.
+basalt DamagedHelmet.glb
+
+# A converged GPU path-traced reference: 1024 samples per pixel, raw linear OpenEXR.
+basalt DamagedHelmet.glb sky.hdr --renderer gpu --spp 1024 --pfm reference.exr --no-ui
+
+# The same on the CPU, headless, with no Vulkan at all.
+basalt-pt-cli DamagedHelmet.glb --environment sky.hdr --spp 1024 --output reference.exr
+
+# ReSTIR DI and depth of field on the GPU's own BVH, wavefront execution.
+basalt scene.gltf --renderer gpu-bvh --path-execution wavefront --di-estimator restir --aperture 0.05
+```
+
+`basalt --help` lists every option. An output path ending in `.exr` writes
+OpenEXR, any other PFM, and each capture writes a JSON metadata file beside it.
+`ctest --test-dir build` runs the test suite; a test that needs a capability the
+device lacks reports itself skipped.
+
+F1 hides and shows the interface; F5 switches between the rasteriser and the
+path tracer; F12 saves a screenshot next to the executable, named by the time,
+without leaving.
 
 Orbit with the left mouse button, pan with the middle, zoom with the wheel.
 Hold the right mouse button to fly, then use W, A, S, D, Q and E; Escape or
@@ -195,8 +216,22 @@ Metal2Vulkan checkout.
 | `src/scene/` | glTF loading, the scene representation, the camera. |
 | `src/render/` | The frame: shadow, forward, sky, reflection, bloom and post passes; the acceleration structures; the IBL bake; the ImGui backend. |
 | `tools/metal2vulkan/` | The shader compiler, its owned standard library, and the host reflection library that turns each shader's reflection JSON into Vulkan descriptor layouts. |
+| `shaders/shared/` | Headers compiled both as MSL and as C++: the buffer structures, the shading maths and the sample stream the rasteriser and the path tracer share. |
+| `shaders/pt/` | The path tracer's shared code: BVH traversal, hit reconstruction, the BSDF, light sampling, and the path loop itself (`integrator.inc`). |
+| `src/pt/` | The C++ side: the shim that gives MSVC the MSL types, the BVH builders and wide layouts, the environment and albedo tables, the CPU tracer, capture metadata and image files. |
+| `tests/` | The CTest manifest's programs and scripts: CPU transport tests, GPU oracles and image gates per backend, lifecycle and CLI rejection tests, and generated test scenes in `tests/data/`. |
+| `tools/` | The image comparison script, the benchmark harness and `shader-stats`. |
+| `docs/` | The user guide, the path tracer's plan, designs, results per milestone, performance guide and known issues. |
 
 ## Known limitations
+
+- With an `.hdr` the path tracer's sun is whatever the environment holds; the
+  rasteriser adds its analytic sun on top, so the two differ there. With the
+  procedural sky both use the analytic sun, but the rasteriser also counts the
+  sky's painted disc in its ambient light, about ten per cent too bright, and
+  its ambient light ignores occlusion, which the path tracer does not.
+- The rasteriser draws the base layer of transmissive and clearcoated
+  materials only; the path tracers render both layers.
 
 - Windows only. Nothing in the engine is Windows-specific except the window and
   the file dialogs.
@@ -208,16 +243,18 @@ Metal2Vulkan checkout.
   `fragment void`. The validation layers report that as a warning; opaque
   casters go through a depth-only pipeline with no fragment stage at all.
 - `KHR_materials_specular_glossiness` is approximated, not implemented.
-- Transparent (blended) surfaces are left out of the acceleration structure
-  altogether, so rays pass through them.
+- In the rasteriser's traced effects, blended surfaces are left out of the
+  acceleration structure, so those rays pass through them; the path tracers
+  test blended and masked surfaces in their any-hit.
 - A hit shaded by a reflection ray takes the punctual lights unshadowed, and a
   reflection of a reflection is the environment.
 - A cell of the light grid holds at most sixty-four lights. Past that the rest
   are dropped by index, so the cell keeps whichever come first rather than the
   nearest, and a light with no falloff reaches every cell. Both only bite where
   that many lights genuinely overlap.
-- Punctual lights are shadowed only on a ray tracing device. The rasterised
-  path lights through walls, and the interface says so by greying the control.
+- In the rasteriser, punctual lights are shadowed only on a ray tracing device;
+  the rasterised path lights through walls, and the interface says so by
+  greying the control. The path tracers shadow them on every device.
 - Once a still view has converged, the traced reflection is the average of one
   lobe sample per frame, kept with the cosine as its probability; the frames it
   is not kept read the prefiltered environment instead. Both estimate the same
@@ -225,8 +262,6 @@ Metal2Vulkan checkout.
 - The temporal history is reprojected from depth, which is right for a static
   scene but would smear a moving object, so the reprojection will need per
   object motion once anything animates.
-
-
 
 ## Licence
 

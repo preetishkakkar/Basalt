@@ -1,0 +1,4 @@
+#pragma once
+// The M2V Vulkan ray-tracing pipeline extension (docs/RAY_PIPELINES.md). Not an MSL header.
+#include "metal_raytracing"
+#include "msl_ray_pipeline.h"

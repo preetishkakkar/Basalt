@@ -1,0 +1,16 @@
+{
+  "generator_revision": "1cc7201",
+  "generator_executable_built_before_commit": true,
+  "width": 32,
+  "height": 24,
+  "frames": 12,
+  "spp": 4096,
+  "seed": 1701,
+  "backend": "cpu-own-bvh",
+  "format": "little-endian RGB float32, top-down, frames concatenated",
+  "sha256": {
+    "rotation.rgb32f": "962190f3390b9396b97cc130b9b2f04a362245fd80943bdbec0782f449f1f472",
+    "stop-start.rgb32f": "3a768bcccc425ad7dbb6ab7967dc1db1bb134e086dd1e02e714bac9ed3d1f178",
+    "translation.rgb32f": "2187f57514608aeb02cba8bd7c967e088d03c3322929ac35c74cafb8ea6b0820"
+  }
+}

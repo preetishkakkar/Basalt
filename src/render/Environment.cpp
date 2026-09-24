@@ -1,5 +1,7 @@
 #include "render/Environment.h"
 
+#include "pt/Tables.h"
+
 #include "core/Log.h"
 
 #include <stb_image.h>
@@ -67,10 +69,9 @@ Environment::~Environment() {
   if (sampler) vkDestroySampler(context.device, sampler, nullptr);
 }
 
-std::vector<float> Environment::proceduralSky(std::uint32_t width, std::uint32_t height,
+std::vector<float> Environment::proceduralSky(std::uint32_t width, std::uint32_t height, bool sunDisc,
                                               Vec3 sunDirection, float turbidity,
                                               float intensity) const {
-  // Analytic sky: a gradient, a sun disc with an aureole, a dim ground.
   std::vector<float> texels(static_cast<std::size_t>(width) * height * 4, 0.0f);
   const Vec3 sun = normalize(sunDirection);
   const Vec3 zenithColor{0.12f, 0.26f, 0.58f};
@@ -91,7 +92,7 @@ std::vector<float> Environment::proceduralSky(std::uint32_t width, std::uint32_t
         const float t = std::pow(1.0f - direction.y, 2.0f + haze * 0.25f);
         colour = zenithColor * (1.0f - t) + horizonColor * t;
         const float cosine = std::max(0.0f, dot(direction, sun));
-        const float disc = std::pow(cosine, 6000.0f) * 400.0f;
+        const float disc = sunDisc ? std::pow(cosine, 6000.0f) * 400.0f : 0.0f;
         const float aureole = std::pow(cosine, 8.0f / haze) * 0.5f;
         colour += sunColor * (disc + aureole);
       } else {
@@ -113,6 +114,7 @@ std::vector<float> Environment::proceduralSky(std::uint32_t width, std::uint32_t
 void Environment::uploadEquirectangular(const std::vector<float> &texels, std::uint32_t width,
                                         std::uint32_t height, const std::string &name) {
   context.waitIdle();
+  ++generation;
   projectIrradiance(texels, width, height);
   equirectangular = uploader.createTexture(texels.data(), texels.size() * sizeof(float), width,
                                            height, VK_FORMAT_R32G32B32A32_SFLOAT, 1, name);
@@ -168,8 +170,12 @@ void Environment::setProceduralSky(Vec3 sunDirection, float turbidity, float int
   skyIntensity = intensity;
   isProcedural = true;
   sourceName = "procedural sky";
-  uploadEquirectangular(proceduralSky(1024, 512, sunDirection, turbidity, intensity), 1024, 512,
+  uploadEquirectangular(proceduralSky(1024, 512, true, sunDirection, turbidity, intensity), 1024, 512,
                         "environment.procedural");
+  const std::vector<float> traced = proceduralSky(1024, 512, false, sunDirection, turbidity, intensity);
+  traceEquirectangular = uploader.createTexture(traced.data(), traced.size() * sizeof(float), 1024, 512,
+                                                VK_FORMAT_R32G32B32A32_SFLOAT, 1, "environment.procedural.traced");
+  buildTraceDistribution(traced, 1024, 512);
   bake();
 }
 
@@ -218,9 +224,18 @@ void Environment::load(const std::string &path) {
   uploadEquirectangular(texels, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
                         "environment.source");
   isProcedural = false;
+  traceEquirectangular = Image();
+  buildTraceDistribution(texels, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
   sourceName = std::filesystem::path(path).filename().string();
   bake();
   logInfo("environment: {} ({} by {})", sourceName, width, height);
+}
+
+void Environment::buildTraceDistribution(const std::vector<float> &texels, std::uint32_t width,
+                                         std::uint32_t height) {
+  pt::float4 info;
+  pt::buildEnvironmentDistribution(texels.data(), width, height, distribution, info);
+  distributionInfo = {info.x, info.y, info.z, info.w};
 }
 
 void Environment::bake() {

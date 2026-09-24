@@ -114,10 +114,10 @@ struct HitSurface {
 
 static HitSurface surfaceAt(uint instance, uint primitive, float2 barycentric, float3 rayOrigin,
                             float3 rayDirection, float distance, float4x3 objectToWorld,
-                            const device PrimitiveInfo* primitives, const device Material* materials,
+                            const device TraceInstance* traceInstances, const device Material* materials,
                             const device uint* indices, const device float* vertices,
                             array<texture2d<float>, kHitTextureSlots> maps, sampler materialSampler) {
-  const PrimitiveInfo info = primitives[instance];
+  const TraceInstance info = traceInstances[instance];
   const Material material = materials[info.material];
   const uint base = info.firstIndex + primitive * 3u;
   const uint i0 = indices[base] + info.vertexOffset;
@@ -216,7 +216,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
                                 constant ReflectionUniforms& uniforms [[buffer(0)]],
 #ifdef BASALT_RAY_TRACING
                                 instance_acceleration_structure scene [[buffer(1)]],
-                                const device PrimitiveInfo* primitives [[buffer(2)]],
+                                const device TraceInstance* traceInstances [[buffer(2)]],
                                 const device Material* materials [[buffer(3)]],
                                 const device uint* indices [[buffer(4)]],
                                 const device float* vertices [[buffer(5)]],
@@ -301,7 +301,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
       while (query.next()) {
         if (query.get_candidate_intersection_type() == intersection_type::triangle) {
           if (candidateIsSolid(query.get_candidate_instance_id(), query.get_candidate_primitive_id(),
-                               query.get_candidate_triangle_barycentric_coord(), primitives, materials,
+                               query.get_candidate_triangle_barycentric_coord(), traceInstances, materials,
                                indices, vertices, maps, materialSampler))
             query.commit_triangle_intersection();
         }
@@ -311,7 +311,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
             query.get_committed_instance_id(), query.get_committed_primitive_id(),
             query.get_committed_triangle_barycentric_coord(), r.origin, rayDirection,
             query.get_committed_distance(), query.get_committed_object_to_world_transform(),
-            primitives, materials, indices, vertices, maps, materialSampler);
+            traceInstances, materials, indices, vertices, maps, materialSampler);
         // Sun shadow ray from the hit, alpha-tested.
         ray towardsSun(surface.position + surface.normal * (scale * 2e-3f), normalize(uniforms.sun.xyz),
                        scale * 1e-3f, scale * 1.0e4f);
@@ -322,7 +322,7 @@ kernel void RESOLVE_REFLECTIONS(texture2d<float> depthBuffer [[texture(0)]],
         while (shadowQuery.next()) {
           if (shadowQuery.get_candidate_intersection_type() == intersection_type::triangle &&
               candidateIsSolid(shadowQuery.get_candidate_instance_id(), shadowQuery.get_candidate_primitive_id(),
-                               shadowQuery.get_candidate_triangle_barycentric_coord(), primitives, materials,
+                               shadowQuery.get_candidate_triangle_barycentric_coord(), traceInstances, materials,
                                indices, vertices, maps, materialSampler))
             shadowQuery.commit_triangle_intersection();
         }
@@ -367,7 +367,7 @@ kernel void COMPOSITE_REFLECTIONS(texture2d<float> sceneColor [[texture(0)]],
   const float3 resolved = mix(sharp.rgb, blurred.rgb, saturate(blurred.a));
   float3 shown = colour + weight * resolved;
   // Debug views 11 and 12: the resolved reflection and its confidence.
-  if (uniforms.debug.x > 11.5f) shown = float3(sharp.a);
-  else if (uniforms.debug.x > 10.5f) shown = resolved;
+  if (uniforms.debug.x > 11.5f && uniforms.debug.x < 12.5f) shown = float3(sharp.a);
+  else if (uniforms.debug.x > 10.5f && uniforms.debug.x < 11.5f) shown = resolved;
   lit.write(float4(shown, 1.0f), id);
 }

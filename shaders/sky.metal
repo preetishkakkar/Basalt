@@ -11,6 +11,10 @@ struct SkyOutput {
   float4 color            [[color(0)]];
   float4 normalRoughness  [[color(1)]];
   float4 reflectionWeight [[color(2)]];
+  float4 baseMetallic [[color(3)]];
+  float4 geometricCoverage [[color(4)]];
+  float4 emissive [[color(5)]];
+  uint4 identity [[color(6)]];
 };
 
 vertex SkyVaryings sky_vertex(uint vertexIndex [[vertex_id]]) {
@@ -36,5 +40,9 @@ fragment SkyOutput sky_fragment(SkyVaryings input [[stage_in]],
   out.color = float4(radiance * frame.environment.x, 1.0f);
   out.normalRoughness = float4(0.0f, 0.0f, 0.0f, 1.0f);
   out.reflectionWeight = float4(0.0f);
+  out.baseMetallic = float4(0.0f);
+  out.geometricCoverage = float4(0.0f);
+  out.emissive = float4(0.0f);
+  out.identity = uint4(0u);
   return out;
 }

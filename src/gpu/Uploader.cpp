@@ -33,6 +33,18 @@ void Uploader::runImmediate(const std::function<void(VkCommandBuffer)> &record) 
   begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   check(vkBeginCommandBuffer(command, &begin), "vkBeginCommandBuffer (upload)");
   record(command);
+  // A fence makes these writes available, not visible: later submissions on this queue read
+  // uploaded buffers, images and acceleration structures from any stage, including ray
+  // tracing. One global barrier orders every write here before every later read.
+  VkMemoryBarrier2 published{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  published.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  published.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+  published.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+  published.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &published;
+  vkCmdPipelineBarrier2(command, &dependency);
   check(vkEndCommandBuffer(command), "vkEndCommandBuffer (upload)");
 
   VkCommandBufferSubmitInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
@@ -158,6 +170,37 @@ Image Uploader::createTexture(const void *texels, VkDeviceSize bytes, std::uint3
 
   image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   return image;
+}
+
+std::vector<std::uint8_t> Uploader::readBuffer(const Buffer &buffer, VkDeviceSize bytes) {
+  Buffer destination(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO,
+                     VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, "readback");
+  runImmediate([&](VkCommandBuffer cmd) {
+    const VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cmd, buffer.handle, destination.handle, 1, &region);
+  });
+  const auto *data = static_cast<const std::uint8_t *>(destination.mapped);
+  return std::vector<std::uint8_t>(data, data + bytes);
+}
+
+std::vector<std::uint8_t> Uploader::readImage(Image &image, std::uint32_t texelBytes) {
+  const VkDeviceSize bytes =
+      static_cast<VkDeviceSize>(image.description.width) * image.description.height * texelBytes;
+  Buffer destination(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO,
+                     VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, "readback");
+  const VkImageLayout restore = image.layout;
+  runImmediate([&](VkCommandBuffer cmd) {
+    transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                    VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {image.description.width, image.description.height, 1};
+    vkCmdCopyImageToBuffer(cmd, image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination.handle, 1, &region);
+    transitionImage(cmd, image, restore, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+  });
+  const auto *data = static_cast<const std::uint8_t *>(destination.mapped);
+  return std::vector<std::uint8_t>(data, data + bytes);
 }
 
 } // namespace basalt

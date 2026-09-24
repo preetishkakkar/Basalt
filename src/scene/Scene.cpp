@@ -22,8 +22,9 @@ void Scene::destroy(const Context &context) {
 }
 
 VkBufferUsageFlags geometryBufferUsage(const Context &context, VkBufferUsageFlags base) {
-  VkBufferUsageFlags usage = base | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  if (context.rayTracingSupported)
+  // Transfer source too: the CPU path tracer reads the geometry back.
+  VkBufferUsageFlags usage = base | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (context.accelerationStructureSupported)
     usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
   return usage;

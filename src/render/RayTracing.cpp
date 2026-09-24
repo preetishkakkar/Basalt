@@ -14,12 +14,12 @@ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
 } // namespace
 
 SceneAccelerationStructure::SceneAccelerationStructure(const Context &ctx, Uploader &uploader,
-                                                       const Scene &scene,
-                                                       const std::vector<std::uint32_t> &materialSlots)
+                                                       const Scene &scene, const TraceScene &trace)
     : context(ctx) {
-  if (!ctx.rayTracingSupported) throw Error("acceleration structures need a ray tracing device");
+  if (!ctx.accelerationStructureSupported)
+    throw Error("acceleration structures need an acceleration-structure capable device");
   try {
-    build(uploader, scene, materialSlots);
+    build(uploader, scene, trace);
   } catch (...) {
     release();
     throw;
@@ -35,16 +35,15 @@ void SceneAccelerationStructure::release() {
   bottomLevels.clear();
 }
 
-void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
-                                       const std::vector<std::uint32_t> &materialSlots) {
+void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene, const TraceScene &trace) {
   const Context &ctx = context;
-  if (scene.primitives.empty()) throw Error("no geometry to build an acceleration structure over");
+  if (trace.instances.empty()) throw Error("no triangles to build an acceleration structure over");
 
   const VkDeviceAddress vertexAddress = scene.vertexBuffer.deviceAddress();
   const VkDeviceAddress indexAddress = scene.indexBuffer.deviceAddress();
   const VkDeviceSize scratchAlignment = std::max<VkDeviceSize>(ctx.scratchAlignment, 16);
 
-  // One BLAS per primitive. Blended surfaces are left out; masked ones are built non-opaque so queries can alpha-test them.
+  // One BLAS per instance. Masked and blended ones are non-opaque, so queries run the candidate test.
   struct Build {
     VkAccelerationStructureGeometryKHR geometry{};
     VkAccelerationStructureBuildRangeInfoKHR range{};
@@ -54,16 +53,17 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
   };
   std::vector<Build> builds;
   VkDeviceSize scratchBytes = 0;
-  for (std::uint32_t i = 0; i < scene.primitives.size(); ++i) {
+  for (std::size_t b = 0; b < trace.instances.size(); ++b) {
+    const std::uint32_t i = trace.primitives[b];
     const Primitive &primitive = scene.primitives[i];
-    const Material &material = scene.materials[primitive.material];
-    if (material.alphaMode == AlphaMode::Blend || primitive.indexCount < 3) continue;
+    const bool opaque = (trace.instances[b].flags & (pt::kInstanceMasked | pt::kInstanceBlended)) == 0 &&
+                        (trace.instances[b].flags & pt::kInstanceDoubleSided) != 0;
 
     Build build;
     build.primitive = i;
     build.geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
     build.geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    build.geometry.flags = material.alphaMode == AlphaMode::Mask ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+    build.geometry.flags = opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0;
     auto &triangles = build.geometry.geometry.triangles;
     triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
     triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
@@ -86,7 +86,6 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
     // pGeometries is set after the vector stops moving.
     builds.push_back(build);
   }
-  if (builds.empty()) throw Error("every primitive is blended; nothing to trace against");
 
   for (Build &build : builds) {
     build.info.pGeometries = &build.geometry;
@@ -138,7 +137,6 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
   });
 
   std::vector<VkAccelerationStructureInstanceKHR> instances;
-  std::vector<PrimitiveInfo> table;
   for (std::size_t b = 0; b < builds.size(); ++b) {
     const Primitive &primitive = scene.primitives[builds[b].primitive];
     VkAccelerationStructureInstanceKHR instance{};
@@ -151,21 +149,13 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
       instance.transform.matrix[row][3] = r.w;
     }
     instance.instanceCustomIndex = builds[b].primitive;
-    // Mask bit one is the ground plane, so rays can skip it when hidden.
-    instance.mask = static_cast<int>(builds[b].primitive) == scene.groundPrimitive ? 0x02 : 0x01;
+    instance.mask = trace.instances[b].mask;
     instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
     addressInfo.accelerationStructure = bottomLevels[b];
     instance.accelerationStructureReference = ctx.rt.address(ctx.device, &addressInfo);
     instances.push_back(instance);
-
-    PrimitiveInfo info;
-    info.firstIndex = primitive.firstIndex;
-    info.vertexOffset = static_cast<std::uint32_t>(primitive.vertexOffset);
-    info.material = primitive.material;
-    info.slots = primitive.material < materialSlots.size() ? materialSlots[primitive.material] : 0;
-    table.push_back(info);
   }
   instanceCount = static_cast<std::uint32_t>(instances.size());
 
@@ -174,8 +164,6 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene,
       VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
       "tlas.instances");
-  primitiveInfo = uploader.createBuffer(table.data(), table.size() * sizeof(PrimitiveInfo),
-                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "tlas.primitives");
 
   VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
   geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;

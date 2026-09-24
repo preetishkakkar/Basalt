@@ -31,6 +31,7 @@ struct GraphicsPipelineDescription {
   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
   VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  bool dynamicFrontFace = false;  // set per draw with vkCmdSetFrontFace instead
   VkPolygonMode polygonMode = VK_POLYGON_MODE_FILL;
   bool depthTest = true;
   bool depthWrite = true;

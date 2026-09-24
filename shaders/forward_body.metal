@@ -13,6 +13,7 @@ struct VertexInput {
   float4 tangent  [[attribute(2)]]; // xyz tangent, w handedness
   float2 uv0      [[attribute(3)]];
   float2 uv1      [[attribute(4)]];
+  float4 color    [[attribute(5)]];
 };
 
 struct Varyings {
@@ -22,14 +23,19 @@ struct Varyings {
   float4 tangent   [[user(locn2)]];
   float2 uv0       [[user(locn3)]];
   float2 uv1       [[user(locn4)]];
-  float  viewDepth [[user(locn5)]];
-  uint   material  [[user(locn6)]] [[flat]];
+  float4 color     [[user(locn5)]];
+  float  viewDepth [[user(locn6)]];
+  uint2  identity  [[user(locn7)]] [[flat]]; // material, instance
 };
 
 struct ForwardOutput {
   float4 color          [[color(0)]]; // Lit radiance without the specular reflection; alpha for blending.
   float4 normalRoughness [[color(1)]]; // World shading normal, roughness.
   float4 reflectionWeight [[color(2)]]; // What the reflection is multiplied by; w is the surface depth.
+  float4 baseMetallic [[color(3)]]; // Linear base colour, metallic.
+  float4 geometricCoverage [[color(4)]]; // World geometric normal, coverage class.
+  float4 emissive [[color(5)]]; // Primary emissive radiance.
+  uint4 identity [[color(6)]]; // Instance, material, primitive, coverage class.
 };
 
 vertex Varyings FORWARD_VERTEX(VertexInput input [[stage_in]],
@@ -51,8 +57,9 @@ vertex Varyings FORWARD_VERTEX(VertexInput input [[stage_in]],
   out.tangent = float4(tangent, input.tangent.w);
   out.uv0 = input.uv0;
   out.uv1 = input.uv1;
+  out.color = input.color;
   out.viewDepth = -(frame.view * float4(world, 1.0f)).z;
-  out.material = uint(instance.materialAndFlags.x);
+  out.identity = uint2(uint(instance.materialAndFlags.x), instanceIndex);
   return out;
 }
 
@@ -109,6 +116,7 @@ static float cascadedSunVisibility(depth2d_array<float> shadowMap, sampler shado
 }
 
 fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
+                                 uint primitive [[primitive_id]],
                                  constant FrameUniforms& frame [[buffer(0)]],
                                  const device Material* materials [[buffer(1)]],
                                  const device float4* cascadeRows [[buffer(2)]],
@@ -117,7 +125,7 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
                                  const device uint* lightClusters [[buffer(8)]],
 #ifdef BASALT_RAY_TRACING
                                  instance_acceleration_structure scene [[buffer(4)]],
-                                 const device PrimitiveInfo* primitives [[buffer(5)]],
+                                 const device TraceInstance* traceInstances [[buffer(5)]],
                                  const device uint* indices [[buffer(6)]],
                                  const device float* vertices [[buffer(7)]],
 #endif
@@ -140,18 +148,24 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
                                  , sampler tableSampler [[sampler(3)]]
 #endif
                                  ) {
-  const Material material = materials[input.material];
+  const Material material = materials[input.identity.x];
 
-  const float4 baseSample = baseColorMap.sample(materialSampler, input.uv0);
-  const float4 base = baseSample * material.baseColorFactor;
+  const uint uvBits = material.texture.x;
+  float2 baseUv = input.uv0, metallicUv = input.uv0, emissiveUv = input.uv0, normalUv = input.uv0;
+  if ((uvBits & 0xFFu) == 1u) baseUv = input.uv1;
+  if (((uvBits >> 8u) & 0xFFu) == 1u) metallicUv = input.uv1;
+  if (((uvBits >> 16u) & 0xFFu) == 1u) emissiveUv = input.uv1;
+  if (((uvBits >> 24u) & 0xFFu) == 1u) normalUv = input.uv1;
+  const float4 baseSample = baseColorMap.sample(materialSampler, baseUv);
+  const float4 base = baseSample * material.baseColorFactor * input.color;
   if (material.alpha.y < 1.5f && material.alpha.y > 0.5f && base.a < material.alpha.x)
     discard_fragment();
 
-  const float4 metallicRoughness = metallicRoughnessMap.sample(materialSampler, input.uv0);
+  const float4 metallicRoughness = metallicRoughnessMap.sample(materialSampler, metallicUv);
   const float metallic = saturate(metallicRoughness.b * material.factors.x);
   const float roughness = clamp(metallicRoughness.g * material.factors.y, kMinRoughness, 1.0f);
   float occlusion = mix(1.0f, occlusionMap.sample(materialSampler, input.uv1).r, material.factors.w);
-  const float3 emissive = emissiveMap.sample(materialSampler, input.uv0).rgb *
+  const float3 emissive = emissiveMap.sample(materialSampler, emissiveUv).rgb *
                           material.emissive.rgb * material.emissive.w;
 
   float3 geometricNormal = normalize(input.normal);
@@ -162,7 +176,7 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
   if (dot(tangent, tangent) > 1e-8f) {
     const float3 t = normalize(tangent - geometricNormal * dot(geometricNormal, tangent));
     const float3 b = cross(geometricNormal, t) * input.tangent.w;
-    const float3 raw = normalMap.sample(materialSampler, input.uv0).rgb * 2.0f - 1.0f;
+    const float3 raw = normalMap.sample(materialSampler, normalUv).rgb * 2.0f - 1.0f;
     const float3 sampled = float3(raw.x * material.factors.z, raw.y * material.factors.z, raw.z);
     shadingNormal = normalize(t * sampled.x + b * sampled.y + geometricNormal * sampled.z);
   }
@@ -201,7 +215,7 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
       while (query.next()) {
         if (query.get_candidate_intersection_type() == intersection_type::triangle &&
             candidateIsSolid(query.get_candidate_instance_id(), query.get_candidate_primitive_id(),
-                             query.get_candidate_triangle_barycentric_coord(), primitives, materials,
+                             query.get_candidate_triangle_barycentric_coord(), traceInstances, materials,
                              indices, vertices, maps, tableSampler))
           query.commit_triangle_intersection();
       }
@@ -233,7 +247,7 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
       while (query.next()) {
         if (query.get_candidate_intersection_type() == intersection_type::triangle &&
             candidateIsSolid(query.get_candidate_instance_id(), query.get_candidate_primitive_id(),
-                             query.get_candidate_triangle_barycentric_coord(), primitives, materials,
+                             query.get_candidate_triangle_barycentric_coord(), traceInstances, materials,
                              indices, vertices, maps, tableSampler))
           query.commit_triangle_intersection();
       }
@@ -297,7 +311,7 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
       while (lightQuery.next()) {
         if (lightQuery.get_candidate_intersection_type() == intersection_type::triangle &&
             candidateIsSolid(lightQuery.get_candidate_instance_id(), lightQuery.get_candidate_primitive_id(),
-                             lightQuery.get_candidate_triangle_barycentric_coord(), primitives, materials,
+                             lightQuery.get_candidate_triangle_barycentric_coord(), traceInstances, materials,
                              indices, vertices, maps, tableSampler))
           lightQuery.commit_triangle_intersection();
       }
@@ -330,6 +344,14 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
   out.normalRoughness = float4(shadingNormal, roughness);
   // w carries depth: a blended surface writes none to the depth buffer.
   out.reflectionWeight = float4(reflectionWeight, input.position.z);
+  const uint coverage = max(max(emissive.x, emissive.y), emissive.z) > 0.0f ? 4u :
+                        material.alpha.y > 1.5f ? 2u : material.alpha.y > 0.5f ? 3u : 1u;
+  out.baseMetallic = float4(base.rgb, metallic);
+  // Reverse-Z depth is duplicated here so the hybrid shader stays within the 128-index
+  // texture namespace while the integer identity carries the coverage class.
+  out.geometricCoverage = float4(geometricNormal, input.position.z);
+  out.emissive = float4(emissive, 0.0f);
+  out.identity = uint4(input.identity.y, input.identity.x, primitive, coverage);
 
   // Debug views show the raw quantity.
   const uint debug = uint(frame.viewportAndLights.w);
@@ -351,9 +373,14 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
     else if (debug == 8u) shown = float4(emissive, 1.0f);
     else if (debug == 9u) shown = float4(float3(input.uv0, 0.0f), 1.0f);
     else if (debug == 10u) shown = float4(reflectionWeight, 1.0f);
+    else if (debug == 13u) shown = float4(geometricNormal * 0.5f + 0.5f, 1.0f);
+    else if (debug == 14u) shown = float4(float3(float(coverage) / 4.0f), 1.0f);
+    else if (debug == 15u)
+      shown = float4(hashFloat(input.identity.y), hashFloat(input.identity.x), hashFloat(primitive), 1.0f);
     out.color = shown;
-    // Views 11 and up are the reflection's own and keep the weight so the resolve runs.
-    if (debug < 11u) out.reflectionWeight = float4(0.0f, 0.0f, 0.0f, input.position.z);
+    // Views 11 and 12 are the reflection's own and keep the weight so the resolve runs.
+    if (debug != 11u && debug != 12u)
+      out.reflectionWeight = float4(0.0f, 0.0f, 0.0f, input.position.z);
   }
   return out;
 }

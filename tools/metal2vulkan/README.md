@@ -10,6 +10,33 @@ This folder contains
 | `bin/msl2spirv.exe` | The compiler. Not committed: the first CMake configure fetches it from the release named `msl2spirv-<version>` and checks it against the SHA-256 pinned in [`cmake/msl2spirv.cmake`](../../cmake/msl2spirv.cmake). To publish a new one, zip the executable, attach it to a release under that tag, and pin the hash `Get-FileHash` reports. |
 | `share/metal2vulkan/stdlib/` | The owned Metal standard library it parses against. Required at run time. Independently authored: no Apple code. |
 | `src/m2v_host.h`, `src/m2v_host.cpp` | The host reflection library, compiled into Basalt. It reads the reflection JSON and builds the Vulkan descriptor layouts from it. |
+| `SOURCE.txt` | Which compiler build this bundle is: its version, the Metal2Vulkan commit, the LLVM fork pin and the asset's SHA-256. |
+
+## Updating to a newer compiler
+
+From a Metal2Vulkan checkout with a Release build in its `build/`:
+
+1. Mirror `stdlib/` into `share/metal2vulkan/stdlib/` (remove files the compiler dropped).
+2. Copy `host/m2v_host.h` and `host/m2v_host.cpp` into `src/`.
+3. Copy `build/msl2spirv.exe` into `bin/` (gitignored; the build uses a copy already there).
+4. Zip the executable alone as `msl2spirv-<version>-windows-x64.zip` and pin `<version>` and the
+   zip's SHA-256 (`Get-FileHash -Algorithm SHA256`) in [`cmake/msl2spirv.cmake`](../../cmake/msl2spirv.cmake).
+5. Record the version, source commit, LLVM fork pin and SHA-256 in `SOURCE.txt`.
+6. Publish the release `msl2spirv-<version>` with the zip attached, so machines without `bin/` can fetch it.
+
+An existing build directory keeps the old cached pin until it is reconfigured with
+`-U "BASALT_MSL2SPIRV_*"`.
+
+## Ray-tracing pipelines
+
+`#include <m2v_ray_pipeline>` gives Vulkan ray-generation, miss, closest-hit, any-hit, intersection
+and callable entries (`[[m2v::ray_stage(...)]]`), `m2v::trace_ray`, `execute_callable`,
+`report_intersection`, the ray built-ins, motion-blur traces and SIMD-group functions. This is a
+Metal2Vulkan extension, not MSL. The host library groups the stages (`checkRayShaderGroups`), merges
+set 0 (`rayDescriptorBindings`), bounds recursion, builds the shader binding table
+(`buildShaderBindingTable`), sizes pipeline-library interfaces (`rayPipelineInterface`) and defers
+destroying replaced pipelines while frames are in flight (`RetirementQueue`). The contract is
+`docs/RAY_PIPELINES.md` in the Metal2Vulkan repository.
 
 ## Usage
 

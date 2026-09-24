@@ -4,6 +4,7 @@
 #include "gpu/Resources.h"
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,8 +20,9 @@ struct Vertex {
   Vec4 tangent; // xyz tangent, w handedness (+1 or -1)
   Vec2 uv0;
   Vec2 uv1;
+  Vec4 color{1, 1, 1, 1};
 };
-static_assert(sizeof(Vertex) == 56, "the vertex layout must match the pipeline's stride");
+static_assert(sizeof(Vertex) == 72, "the vertex layout must match the pipeline's stride");
 
 enum class AlphaMode : std::uint32_t { Opaque = 0, Mask = 1, Blend = 2 };
 
@@ -30,8 +32,12 @@ struct MaterialUniforms {
   Vec4 emissive{0, 0, 0, 1};      // rgb factor, w strength
   Vec4 factors{1, 1, 1, 1};       // metallic, roughness, normal scale, occlusion strength
   Vec4 alpha{0.5f, 0, 0, 0};      // cutoff, mode, double sided, unused
+  std::array<std::uint32_t, 4> texture{}; // packed UV-set and sampler-mode bytes
+  Vec4 transmission{0, 1.5f, 0, 0};       // factor, IOR, volume thickness (0 thin-walled), IOR given
+  Vec4 clearcoat{0, 0, 1, 0};             // factor, roughness, normal scale, reserved
+  std::array<std::uint32_t, 4> extensionTextures{0, 0, 0, 1};  // slot | UV << 8 | sampler << 16
 };
-static_assert(sizeof(MaterialUniforms) == 64, "the material layout must match the shader");
+static_assert(sizeof(MaterialUniforms) == 128, "the material layout must match the shader");
 
 // Texture indices into Scene::textures; -1 is the neutral default.
 struct Material {
@@ -42,6 +48,8 @@ struct Material {
   int normal = -1;
   int occlusion = -1;
   int emissive = -1;
+  // KHR_materials_transmission / clearcoat textures, placed in the hit table's slots.
+  int transmissionTexture = -1, clearcoatTexture = -1, clearcoatRoughnessTexture = -1, clearcoatNormalTexture = -1;
   int sampler = 0;           // Index into Scene::samplers.
   AlphaMode alphaMode = AlphaMode::Opaque;
   bool doubleSided = false;

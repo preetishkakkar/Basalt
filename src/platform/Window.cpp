@@ -13,7 +13,7 @@ namespace {
 constexpr wchar_t kClassName[] = L"BasaltWindowClass";
 }
 
-Window::Window(const std::string &title, std::uint32_t width, std::uint32_t height) {
+Window::Window(const std::string &title, std::uint32_t width, std::uint32_t height, bool visible) {
   instance = GetModuleHandleW(nullptr);
 
   WNDCLASSEXW windowClass{sizeof(WNDCLASSEXW)};
@@ -39,8 +39,8 @@ Window::Window(const std::string &title, std::uint32_t width, std::uint32_t heig
   clientWidth = static_cast<std::uint32_t>(client.right - client.left);
   clientHeight = static_cast<std::uint32_t>(client.bottom - client.top);
 
-  ShowWindow(window, SW_SHOWNORMAL);
-  UpdateWindow(window);
+  ShowWindow(window, visible ? SW_SHOWNORMAL : SW_HIDE);
+  if (visible) UpdateWindow(window);
 }
 
 Window::~Window() {

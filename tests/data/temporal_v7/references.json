@@ -1,0 +1,17 @@
+{
+  "generator_revision": "ad9a1db",
+  "generator_executable_built_before_commit": true,
+  "generator": "build/temporal-motion-tests.exe --v7 --generate-references",
+  "width": 32,
+  "height": 24,
+  "frames": 12,
+  "spp": 4096,
+  "seed": 1701,
+  "backend": "cpu-own-bvh",
+  "format": "little-endian RGB float32, top-down, frames concatenated",
+  "sha256": {
+    "dof-stop-start.rgb32f": "122f7d71114877eaac1a1d10fc0bb4550752a5d406a64a78317007d86fe6ba04",
+    "dof-translation.rgb32f": "b1cf65f1346a6f3111597b65b3c3e02881bdbe60998c2d42c575dd3e308c9a03",
+    "glass-translation.rgb32f": "9931f14935e492ce085f1398eb592701e1cb536674a88b1cbab08bd2db12efb1"
+  }
+}

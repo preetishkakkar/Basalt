@@ -5,3 +5,4 @@
 *.exe binary
 *.png binary
 *.spv binary
+*.hdr binary

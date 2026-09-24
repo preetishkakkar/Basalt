@@ -123,6 +123,7 @@ Pipeline::Pipeline(const Context &ctx, const GraphicsPipelineDescription &descri
 
   std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
   if (description.depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+  if (description.dynamicFrontFace) dynamicStates.push_back(VK_DYNAMIC_STATE_FRONT_FACE);
   VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
   dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
   dynamic.pDynamicStates = dynamicStates.data();

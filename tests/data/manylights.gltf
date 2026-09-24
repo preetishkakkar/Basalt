@@ -1,0 +1,1825 @@
+{
+ "asset": {
+  "version": "2.0",
+  "generator": "basalt tests/data/make_manylights_gltf.py"
+ },
+ "extensionsUsed": [
+  "KHR_lights_punctual",
+  "KHR_materials_emissive_strength"
+ ],
+ "extensions": {
+  "KHR_lights_punctual": {
+   "lights": [
+    {
+     "type": "point",
+     "color": [
+      0.44346074616617076,
+      0.4869214923323415,
+      0.8524055848020142
+     ],
+     "intensity": 10.036897219520869
+    },
+    {
+     "type": "point",
+     "color": [
+      0.47413138017853057,
+      0.55588921950103,
+      0.4263126573586633
+     ],
+     "intensity": 14.00099545472191
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7405722133211261,
+      0.906138704509041,
+      0.9207415884641794
+     ],
+     "intensity": 15.994974542946627
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.8575417715724422,
+      0.7178484779125658,
+      0.9737788967727169
+     ],
+     "intensity": 52.15329617487335,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6017761501487755,
+      0.48113527122911426,
+      0.9875394827191577
+     ],
+     "intensity": 33.32751882174506
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6627420462348363,
+      0.8598123140306706,
+      0.7249347676813915
+     ],
+     "intensity": 5.49109729673103
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7898649576562142,
+      0.9601556420233464,
+      0.7420004577706569
+     ],
+     "intensity": 30.73739235889024
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.6906385900663767,
+      0.756401922636759,
+      0.9565209430075532
+     ],
+     "intensity": 5.17964916927653,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.660498970016022,
+      0.8035614557106889,
+      0.9242481116960403
+     ],
+     "intensity": 9.389116723536995
+    },
+    {
+     "type": "point",
+     "color": [
+      0.607168688487068,
+      0.9358022430762188,
+      0.9833371480888075
+     ],
+     "intensity": 7.765622104717159
+    },
+    {
+     "type": "point",
+     "color": [
+      0.8451453421835661,
+      0.725603112840467,
+      0.7748958571755551
+     ],
+     "intensity": 22.025675059355724
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.4896314946211948,
+      0.866184481574731,
+      0.9247882810711834
+     ],
+     "intensity": 53.84172807776856,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6140352483405814,
+      0.9601922636758984,
+      0.9580132753490501
+     ],
+     "intensity": 14.235120778092067
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6228061341268025,
+      0.9609521629663539,
+      0.6919661249713893
+     ],
+     "intensity": 42.172163262174216
+    },
+    {
+     "type": "point",
+     "color": [
+      0.44345159075303275,
+      0.9558251316090639,
+      0.7372396429388877
+     ],
+     "intensity": 7.120440343449883
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.7691371023117419,
+      0.9146990157930877,
+      0.8917280842298009
+     ],
+     "intensity": 23.721167170932112,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.887168688487068,
+      0.7288441290913252,
+      0.47956969558251317
+     ],
+     "intensity": 34.6009372650758
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9434195468070496,
+      0.9803524834058137,
+      0.943099107347219
+     ],
+     "intensity": 19.21004288469696
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7956878004119936,
+      0.8631998168917372,
+      0.975866330968185
+     ],
+     "intensity": 24.72434641556093
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.9212634470130465,
+      0.4281437399862669,
+      0.7045365072098879
+     ],
+     "intensity": 7.614811152665082,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7461112382696269,
+      0.629242389562829,
+      0.6147585259784848
+     ],
+     "intensity": 25.020461702238713
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6574776836804761,
+      0.4640146486610208,
+      0.5568780041199359
+     ],
+     "intensity": 8.751030054702493
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9284687571526665,
+      0.7722590981918059,
+      0.8364751659418631
+     ],
+     "intensity": 20.564144833019796
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.5901304646372167,
+      0.5697596704051271,
+      0.7890959029526208
+     ],
+     "intensity": 8.898967337223667,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.8224765392538338,
+      0.8488258182650492,
+      0.44175783932249946
+     ],
+     "intensity": 5.582640573215338
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6534218356603342,
+      0.9747493705653468,
+      0.41350423437857636
+     ],
+     "intensity": 30.71221398785701
+    },
+    {
+     "type": "point",
+     "color": [
+      0.40651865415426874,
+      0.4175143053330282,
+      0.7422568093385213
+     ],
+     "intensity": 48.045866052785286
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.9660334172579538,
+      0.9273517967498284,
+      0.4998214694438087
+     ],
+     "intensity": 9.212153575192499,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6527351796749828,
+      0.44596017395284965,
+      0.9992217898832685
+     ],
+     "intensity": 14.693244323885715
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5064408331425956,
+      0.4331700617990387,
+      0.8256992446784162
+     ],
+     "intensity": 6.124812096880365
+    },
+    {
+     "type": "point",
+     "color": [
+      0.4558297093156329,
+      0.5382742046234836,
+      0.4875257495994507
+     ],
+     "intensity": 6.962401777031673
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.8846509498741131,
+      0.7423392080567636,
+      0.5413046463721676
+     ],
+     "intensity": 12.719675722908388,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9730464637216755,
+      0.9813138017853056,
+      0.4330235751888304
+     ],
+     "intensity": 30.599661821796246
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6049988555733578,
+      0.5046738384069581,
+      0.9277637903410392
+     ],
+     "intensity": 44.557041931208914
+    },
+    {
+     "type": "point",
+     "color": [
+      0.4772991531242847,
+      0.7542687113756008,
+      0.7577660791943237
+     ],
+     "intensity": 27.817513550240207
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.7080613412680248,
+      0.552831311512932,
+      0.5567498283360037
+     ],
+     "intensity": 25.72679254259573,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6580544747081712,
+      0.5913664454108492,
+      0.6921309224078737
+     ],
+     "intensity": 6.971021151103381
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5834378576333257,
+      0.8046601052872511,
+      0.6270725566491188
+     ],
+     "intensity": 12.862858742652055
+    },
+    {
+     "type": "point",
+     "color": [
+      0.4360814831769284,
+      0.4477363241016251,
+      0.4591256580453193
+     ],
+     "intensity": 7.540049209909046
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.4362371252002747,
+      0.711842526894026,
+      0.8509407186999314
+     ],
+     "intensity": 8.069151033809211,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7595605401693751,
+      0.4922224765392539,
+      0.502513160906386
+     ],
+     "intensity": 40.034715448317236
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7577752346074617,
+      0.4906935225452049,
+      0.738942549782559
+     ],
+     "intensity": 5.308078094409758
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9443625543602655,
+      0.6698832684824902,
+      0.9023483634699015
+     ],
+     "intensity": 44.255803021918496
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.945131609063859,
+      0.8444953078507669,
+      0.41523460746166174
+     ],
+     "intensity": 23.723212864769952,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5593316548409247,
+      0.46889448386358434,
+      0.4449530785076677
+     ],
+     "intensity": 9.514303583252468
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5460013733119707,
+      0.9231403067063402,
+      0.9251819638361181
+     ],
+     "intensity": 5.5448406824872585
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5236346990157931,
+      0.7802700846875715,
+      0.810180819409476
+     ],
+     "intensity": 24.21326662461966
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.47130235751888305,
+      0.49285420004577707,
+      0.9653376058594644
+     ],
+     "intensity": 60.5360291998096,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.7572716868848707,
+      0.8853284504463264,
+      0.7270405127031356
+     ],
+     "intensity": 45.156981715874394
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6631174181734951,
+      0.6195651178759441,
+      0.5801052872510872
+     ],
+     "intensity": 20.36798841264314
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9696314946211948,
+      0.9068528267338064,
+      0.9766628519111925
+     ],
+     "intensity": 55.324811084036156
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.6257175555046921,
+      0.4874158846417945,
+      0.8471961547264821
+     ],
+     "intensity": 5.398668948080785,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.8053376058594645,
+      0.6622751201647974,
+      0.7007186999313344
+     ],
+     "intensity": 5.204607508636723
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9217395284962234,
+      0.8064271000228886,
+      0.8813275349050126
+     ],
+     "intensity": 9.571237232684002
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6232455939574273,
+      0.5091142137788968,
+      0.7889036392767224
+     ],
+     "intensity": 6.658893649664138
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.5947264820325018,
+      0.6674113069352254,
+      0.46709086747539486
+     ],
+     "intensity": 9.181643983409403,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6848706797894255,
+      0.9472556649118792,
+      0.9187548638132296
+     ],
+     "intensity": 6.408505596741352
+    },
+    {
+     "type": "point",
+     "color": [
+      0.8244907301441977,
+      0.8325291828793775,
+      0.6889356832227054
+     ],
+     "intensity": 5.058252707878284
+    },
+    {
+     "type": "point",
+     "color": [
+      0.99898374914168,
+      0.9895078965438315,
+      0.4012634470130465
+     ],
+     "intensity": 17.58497621990231
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.49252460517280844,
+      0.4950606546120394,
+      0.6750469214923324
+     ],
+     "intensity": 5.002778909223715,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    },
+    {
+     "type": "point",
+     "color": [
+      0.6054291599908446,
+      0.7659510185397116,
+      0.6753032730601969
+     ],
+     "intensity": 5.114831233174671
+    },
+    {
+     "type": "point",
+     "color": [
+      0.9297779812314031,
+      0.9081162737468528,
+      0.5473563744563974
+     ],
+     "intensity": 56.14987705031757
+    },
+    {
+     "type": "point",
+     "color": [
+      0.5314351110093843,
+      0.9055161364156558,
+      0.6011444266422522
+     ],
+     "intensity": 39.26937823222816
+    },
+    {
+     "type": "spot",
+     "color": [
+      0.7470176241702907,
+      0.41271686884870684,
+      0.6259006637674525
+     ],
+     "intensity": 12.070560773245784,
+     "spot": {
+      "innerConeAngle": 0.3,
+      "outerConeAngle": 0.6
+     }
+    }
+   ]
+  }
+ },
+ "scene": 0,
+ "scenes": [
+  {
+   "nodes": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    64
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "mesh": 0
+  },
+  {
+   "translation": [
+    -3.919508659494926,
+    2.2546715495536738,
+    3.2740520332646668
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 0
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.54711223010605,
+    1.6840177004654002,
+    0.07804989700160192
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 1
+    }
+   }
+  },
+  {
+   "translation": [
+    0.8890669108110174,
+    2.27833829251545,
+    -2.2428473334859236
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 2
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.9256122682536048,
+    1.7326604104676893,
+    -0.8985275043869692
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 3
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.795376516365301,
+    0.5808117799649042,
+    1.9404135194934007
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 4
+    }
+   }
+  },
+  {
+   "translation": [
+    3.620584420538645,
+    1.346170748455024,
+    2.869535362783245
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 5
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.665980010681315,
+    0.5425757228961623,
+    1.3617914091706718
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 6
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.9098954757000075,
+    2.3405767910276953,
+    -4.051194018463416
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 7
+    }
+   }
+  },
+  {
+   "translation": [
+    4.63805600061036,
+    2.383344777599756,
+    1.7595941100175487
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 8
+    }
+   }
+  },
+  {
+   "translation": [
+    3.666819256885635,
+    0.38103761348897536,
+    4.771114671549553
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 9
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.7240405889982453,
+    0.48282139314869915,
+    1.502784771496147
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 10
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.209658960860609,
+    0.5567086289768826,
+    0.7463950560769046
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 11
+    }
+   }
+  },
+  {
+   "translation": [
+    2.3801785305561918,
+    2.0469413290608074,
+    4.221026932173649
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 12
+    }
+   }
+  },
+  {
+   "translation": [
+    0.08491645685511529,
+    2.3761943999389636,
+    0.22102693217364777
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 13
+    }
+   }
+  },
+  {
+   "translation": [
+    1.0932326237888148,
+    2.1811200122072174,
+    -3.1463340199893186
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 14
+    }
+   }
+  },
+  {
+   "translation": [
+    0.3969634546425569,
+    2.081719691767758,
+    4.691615167467765
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 15
+    }
+   }
+  },
+  {
+   "translation": [
+    0.7537193865873189,
+    2.2930418860151067,
+    4.1090257114518955
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 16
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.2549019607843137,
+    1.999742122529946,
+    -3.0643930724040587
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 17
+    }
+   }
+  },
+  {
+   "translation": [
+    2.3240253299763483,
+    1.0677759975585566,
+    1.1480125123979557
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 18
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.69741359578851,
+    1.9452582589456018,
+    1.0282291905088883
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 19
+    }
+   }
+  },
+  {
+   "translation": [
+    -0.2884718089570457,
+    0.8492027161058977,
+    -1.1440451667048142
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 20
+    }
+   }
+  },
+  {
+   "translation": [
+    1.3292896925307085,
+    2.197904936293584,
+    -4.094987411306935
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 21
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.9649042496375984,
+    2.089709315632868,
+    -4.441519798580911
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 22
+    }
+   }
+  },
+  {
+   "translation": [
+    2.5819028000305178,
+    0.8083817807278555,
+    -2.1512932021057454
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 23
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.726253147173266,
+    2.1920637827115286,
+    -2.591821164263371
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 24
+    }
+   }
+  },
+  {
+   "translation": [
+    1.0144960708018615,
+    1.4473838406958117,
+    0.055466544594491296
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 25
+    }
+   }
+  },
+  {
+   "translation": [
+    1.1687647821774627,
+    2.441084916456855,
+    3.6677347981994366
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 26
+    }
+   }
+  },
+  {
+   "translation": [
+    4.5197985809109635,
+    0.5043396658274205,
+    -0.933012893873503
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 27
+    }
+   }
+  },
+  {
+   "translation": [
+    0.24589913786526285,
+    1.8680811779964905,
+    -3.306706340123598
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 28
+    }
+   }
+  },
+  {
+   "translation": [
+    0.7421225299458296,
+    1.7254428931105519,
+    0.4436560616464478
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 29
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.6933699549858856,
+    2.040294499122606,
+    -0.8083466849774927
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 30
+    }
+   }
+  },
+  {
+   "translation": [
+    4.097886625467307,
+    1.203331044480049,
+    -2.23598077363241
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 31
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.7126726176852065,
+    0.9943923094529641,
+    3.4966811627374685
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 32
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.696803234912642,
+    1.934952315556573,
+    4.287251087205311
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 33
+    }
+   }
+  },
+  {
+   "translation": [
+    1.1272602426184486,
+    1.3407660028992143,
+    3.4176394293125814
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 34
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.5064469367513542,
+    2.444475471122301,
+    4.958342870222019
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 35
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.300984206912337,
+    0.3235324635690852,
+    1.3262378881513692
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 36
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.0791180285343707,
+    1.045418478675517,
+    4.938658731975281
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 37
+    }
+   }
+  },
+  {
+   "translation": [
+    1.1605249103532467,
+    0.4144731822690165,
+    -0.24040588998245216
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 38
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.758831158922713,
+    1.5183504997329673,
+    3.6884870679789437
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 39
+    }
+   }
+  },
+  {
+   "translation": [
+    2.949645227740901,
+    0.8298329137102312,
+    4.180895704585335
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 40
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.672083619439994,
+    1.5862623025864044,
+    -3.9021133745326924
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 41
+    }
+   }
+  },
+  {
+   "translation": [
+    1.8041504539559021,
+    2.01404287785153,
+    -4.09773403524834
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 42
+    }
+   }
+  },
+  {
+   "translation": [
+    0.9893186846723125,
+    2.280956740672923,
+    -3.247959105821317
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 43
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.427557793545434,
+    1.8800991836423286,
+    1.3198290989547568
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 44
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.781948577096208,
+    1.4205279621576257,
+    4.827878233005263
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 45
+    }
+   }
+  },
+  {
+   "translation": [
+    2.0363927672236217,
+    1.0141649500267034,
+    -1.6007476920729378
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 46
+    }
+   }
+  },
+  {
+   "translation": [
+    0.6813916227969781,
+    1.9410284580758375,
+    4.834744792858777
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 47
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.416876478217746,
+    2.4079514763103687,
+    1.5682459754329745
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 48
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.887998779278249,
+    1.4115648126955063,
+    1.624704356450751
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 49
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.7981994354161897,
+    0.3990646219577325,
+    -2.2568856336308842
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 50
+    }
+   }
+  },
+  {
+   "translation": [
+    0.23826962691691467,
+    1.37376516365301,
+    -4.368276493476769
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 51
+    }
+   }
+  },
+  {
+   "translation": [
+    -2.7036697947661557,
+    0.6098496986343176,
+    -1.5377279316395818
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 52
+    }
+   }
+  },
+  {
+   "translation": [
+    -4.497062638284886,
+    1.6092576485847259,
+    4.655298695353627
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 53
+    }
+   }
+  },
+  {
+   "translation": [
+    3.670481422140842,
+    2.4795559624628063,
+    1.3717097734035244
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 54
+    }
+   }
+  },
+  {
+   "translation": [
+    4.369344625009537,
+    0.31060807202258334,
+    -2.991149767299916
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 55
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.8886854352635996,
+    2.4942931258106356,
+    -1.0068665598535134
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 56
+    }
+   }
+  },
+  {
+   "translation": [
+    1.3094529640650032,
+    2.344873731593805,
+    1.859388113221943
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 57
+    }
+   }
+  },
+  {
+   "translation": [
+    3.699778744182499,
+    1.8453543907835508,
+    -4.086747539482719
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 58
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.6567483024338143,
+    1.4820950637064165,
+    4.535820553902495
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 59
+    }
+   }
+  },
+  {
+   "translation": [
+    -1.0178530556191352,
+    0.7275455863279164,
+    2.5207141222247653
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 60
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.469825284199283,
+    1.6609216449225606,
+    -2.8208590829327838
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 61
+    }
+   }
+  },
+  {
+   "translation": [
+    -0.45754177157244236,
+    1.336267643244068,
+    2.53505760280766
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 62
+    }
+   }
+  },
+  {
+   "translation": [
+    -3.952315556572824,
+    1.0189318684672313,
+    3.1069657434958415
+   ],
+   "rotation": [
+    -0.7071067811865476,
+    0.0,
+    0.0,
+    0.7071067811865476
+   ],
+   "extensions": {
+    "KHR_lights_punctual": {
+     "light": 63
+    }
+   }
+  }
+ ],
+ "meshes": [
+  {
+   "primitives": [
+    {
+     "attributes": {
+      "POSITION": 0,
+      "NORMAL": 1
+     },
+     "indices": 2,
+     "material": 0
+    },
+    {
+     "attributes": {
+      "POSITION": 3,
+      "NORMAL": 4
+     },
+     "indices": 5,
+     "material": 1
+    },
+    {
+     "attributes": {
+      "POSITION": 6,
+      "NORMAL": 7
+     },
+     "indices": 8,
+     "material": 2
+    }
+   ]
+  }
+ ],
+ "materials": [
+  {
+   "name": "floor",
+   "pbrMetallicRoughness": {
+    "baseColorFactor": [
+     0.7,
+     0.7,
+     0.7,
+     1.0
+    ],
+    "metallicFactor": 0.0,
+    "roughnessFactor": 0.6
+   }
+  },
+  {
+   "name": "pillars",
+   "pbrMetallicRoughness": {
+    "baseColorFactor": [
+     0.8,
+     0.5,
+     0.3,
+     1.0
+    ],
+    "metallicFactor": 0.0,
+    "roughnessFactor": 0.4
+   }
+  },
+  {
+   "name": "panels",
+   "emissiveFactor": [
+    1.0,
+    0.9,
+    0.7
+   ],
+   "extensions": {
+    "KHR_materials_emissive_strength": {
+     "emissiveStrength": 3.0
+    }
+   },
+   "pbrMetallicRoughness": {
+    "baseColorFactor": [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ],
+    "metallicFactor": 0.0
+   }
+  }
+ ],
+ "accessors": [
+  {
+   "bufferView": 0,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    -6.0,
+    0.0,
+    -6.0
+   ],
+   "max": [
+    6.0,
+    0.0,
+    6.0
+   ]
+  },
+  {
+   "bufferView": 1,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3"
+  },
+  {
+   "bufferView": 2,
+   "componentType": 5125,
+   "count": 6,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 3,
+   "componentType": 5126,
+   "count": 160,
+   "type": "VEC3",
+   "min": [
+    -3.25,
+    0.0,
+    -3.25
+   ],
+   "max": [
+    3.25,
+    2.0,
+    3.25
+   ]
+  },
+  {
+   "bufferView": 4,
+   "componentType": 5126,
+   "count": 160,
+   "type": "VEC3"
+  },
+  {
+   "bufferView": 5,
+   "componentType": 5125,
+   "count": 240,
+   "type": "SCALAR"
+  },
+  {
+   "bufferView": 6,
+   "componentType": 5126,
+   "count": 8,
+   "type": "VEC3",
+   "min": [
+    -4.5,
+    0.2,
+    -1.0
+   ],
+   "max": [
+    4.5,
+    1.4,
+    1.0
+   ]
+  },
+  {
+   "bufferView": 7,
+   "componentType": 5126,
+   "count": 8,
+   "type": "VEC3"
+  },
+  {
+   "bufferView": 8,
+   "componentType": 5125,
+   "count": 12,
+   "type": "SCALAR"
+  }
+ ],
+ "bufferViews": [
+  {
+   "buffer": 0,
+   "byteOffset": 0,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 48,
+   "byteLength": 48,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 96,
+   "byteLength": 24,
+   "target": 34963
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 120,
+   "byteLength": 1920,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 2040,
+   "byteLength": 1920,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 3960,
+   "byteLength": 960,
+   "target": 34963
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 4920,
+   "byteLength": 96,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 5016,
+   "byteLength": 96,
+   "target": 34962
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 5112,
+   "byteLength": 48,
+   "target": 34963
+  }
+ ],
+ "buffers": [
+  {
+   "byteLength": 5160,
+   "uri": "data:application/octet-stream;base64,AADAwAAAAAAAAMBAAADAQAAAAAAAAMBAAADAQAAAAAAAAMDAAADAwAAAAAAAAMDAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAEAAAACAAAAAAAAAAIAAAADAAAAAAAwQAAAAAAAAIA+AABQQAAAAAAAAIA+AABQQAAAAEAAAIA+AAAwQAAAAEAAAIA+AABQQAAAAAAAAIC+AAAwQAAAAAAAAIC+AAAwQAAAAEAAAIC+AABQQAAAAEAAAIC+AABQQAAAAAAAAIA+AABQQAAAAAAAAIC+AABQQAAAAEAAAIC+AABQQAAAAEAAAIA+AAAwQAAAAAAAAIC+AAAwQAAAAAAAAIA+AAAwQAAAAEAAAIA+AAAwQAAAAEAAAIC+AAAwQAAAAEAAAIA+AABQQAAAAEAAAIA+AABQQAAAAEAAAIC+AAAwQAAAAEAAAIC+bYfvPwAAAAC2wxdAtsMXQAAAAAC2wxdAtsMXQAAAAEC2wxdAbYfvPwAAAEC2wxdAtsMXQAAAAABth+8/bYfvPwAAAABth+8/bYfvPwAAAEBth+8/tsMXQAAAAEBth+8/tsMXQAAAAAC2wxdAtsMXQAAAAABth+8/tsMXQAAAAEBth+8/tsMXQAAAAEC2wxdAbYfvPwAAAABth+8/bYfvPwAAAAC2wxdAbYfvPwAAAEC2wxdAbYfvPwAAAEBth+8/bYfvPwAAAEC2wxdAtsMXQAAAAEC2wxdAtsMXQAAAAEBth+8/bYfvPwAAAEBth+8/AACAvgAAAAAAAFBAAACAPgAAAAAAAFBAAACAPgAAAEAAAFBAAACAvgAAAEAAAFBAAACAPgAAAAAAADBAAACAvgAAAAAAADBAAACAvgAAAEAAADBAAACAPgAAAEAAADBAAACAPgAAAAAAAFBAAACAPgAAAAAAADBAAACAPgAAAEAAADBAAACAPgAAAEAAAFBAAACAvgAAAAAAADBAAACAvgAAAAAAAFBAAACAvgAAAEAAAFBAAACAvgAAAEAAADBAAACAvgAAAEAAAFBAAACAPgAAAEAAAFBAAACAPgAAAEAAADBAAACAvgAAAEAAADBAtsMXwAAAAAC2wxdAbYfvvwAAAAC2wxdAbYfvvwAAAEC2wxdAtsMXwAAAAEC2wxdAbYfvvwAAAABth+8/tsMXwAAAAABth+8/tsMXwAAAAEBth+8/bYfvvwAAAEBth+8/bYfvvwAAAAC2wxdAbYfvvwAAAABth+8/bYfvvwAAAEBth+8/bYfvvwAAAEC2wxdAtsMXwAAAAABth+8/tsMXwAAAAAC2wxdAtsMXwAAAAEC2wxdAtsMXwAAAAEBth+8/tsMXwAAAAEC2wxdAbYfvvwAAAEC2wxdAbYfvvwAAAEBth+8/tsMXwAAAAEBth+8/AABQwAAAAAAAAIA+AAAwwAAAAAAAAIA+AAAwwAAAAEAAAIA+AABQwAAAAEAAAIA+AAAwwAAAAAAAAIC+AABQwAAAAAAAAIC+AABQwAAAAEAAAIC+AAAwwAAAAEAAAIC+AAAwwAAAAAAAAIA+AAAwwAAAAAAAAIC+AAAwwAAAAEAAAIC+AAAwwAAAAEAAAIA+AABQwAAAAAAAAIC+AABQwAAAAAAAAIA+AABQwAAAAEAAAIA+AABQwAAAAEAAAIC+AABQwAAAAEAAAIA+AAAwwAAAAEAAAIA+AAAwwAAAAEAAAIC+AABQwAAAAEAAAIC+tsMXwAAAAABth++/bYfvvwAAAABth++/bYfvvwAAAEBth++/tsMXwAAAAEBth++/bYfvvwAAAAC2wxfAtsMXwAAAAAC2wxfAtsMXwAAAAEC2wxfAbYfvvwAAAEC2wxfAbYfvvwAAAABth++/bYfvvwAAAAC2wxfAbYfvvwAAAEC2wxfAbYfvvwAAAEBth++/tsMXwAAAAAC2wxfAtsMXwAAAAABth++/tsMXwAAAAEBth++/tsMXwAAAAEC2wxfAtsMXwAAAAEBth++/bYfvvwAAAEBth++/bYfvvwAAAEC2wxfAtsMXwAAAAEC2wxfAAACAvgAAAAAAADDAAACAPgAAAAAAADDAAACAPgAAAEAAADDAAACAvgAAAEAAADDAAACAPgAAAAAAAFDAAACAvgAAAAAAAFDAAACAvgAAAEAAAFDAAACAPgAAAEAAAFDAAACAPgAAAAAAADDAAACAPgAAAAAAAFDAAACAPgAAAEAAAFDAAACAPgAAAEAAADDAAACAvgAAAAAAAFDAAACAvgAAAAAAADDAAACAvgAAAEAAADDAAACAvgAAAEAAAFDAAACAvgAAAEAAADDAAACAPgAAAEAAADDAAACAPgAAAEAAAFDAAACAvgAAAEAAAFDAbYfvPwAAAABth++/tsMXQAAAAABth++/tsMXQAAAAEBth++/bYfvPwAAAEBth++/tsMXQAAAAAC2wxfAbYfvPwAAAAC2wxfAbYfvPwAAAEC2wxfAtsMXQAAAAEC2wxfAtsMXQAAAAABth++/tsMXQAAAAAC2wxfAtsMXQAAAAEC2wxfAtsMXQAAAAEBth++/bYfvPwAAAAC2wxfAbYfvPwAAAABth++/bYfvPwAAAEBth++/bYfvPwAAAEC2wxfAbYfvPwAAAEBth++/tsMXQAAAAEBth++/tsMXQAAAAEC2wxfAbYfvPwAAAEC2wxfAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAPwAAAIAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAACAvwAAAAAAAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAgAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIA/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AAAAAAAAAAAAAIC/AACAPwAAAIAAAAAAAACAPwAAAIAAAAAA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"
+  }
+ ]
+}

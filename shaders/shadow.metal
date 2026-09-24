@@ -4,12 +4,16 @@
 struct ShadowVertexInput {
   float3 position [[attribute(0)]];
   float2 uv0      [[attribute(1)]];
+  float2 uv1      [[attribute(2)]];
+  float4 color    [[attribute(3)]];
 };
 
 struct ShadowVaryings {
   float4 position [[position]];
   float2 uv0      [[user(locn0)]];
-  uint   material [[user(locn1)]] [[flat]];
+  float2 uv1      [[user(locn1)]];
+  float4 color    [[user(locn2)]];
+  uint   material [[user(locn3)]] [[flat]];
 };
 
 vertex ShadowVaryings shadow_vertex(ShadowVertexInput input [[stage_in]],
@@ -25,6 +29,8 @@ vertex ShadowVaryings shadow_vertex(ShadowVertexInput input [[stage_in]],
   out.position = float4(dot(cascadeRows[0], point), dot(cascadeRows[1], point),
                         dot(cascadeRows[2], point), dot(cascadeRows[3], point));
   out.uv0 = input.uv0;
+  out.uv1 = input.uv1;
+  out.color = input.color;
   out.material = uint(instance.materialAndFlags.x);
   return out;
 }
@@ -36,7 +42,9 @@ fragment float4 shadow_fragment(ShadowVaryings input [[stage_in]],
                                 sampler materialSampler [[sampler(0)]]) {
   const Material material = materials[input.material];
   if (material.alpha.y > 0.5f) {
-    const float alpha = baseColorMap.sample(materialSampler, input.uv0).a * material.baseColorFactor.a;
+    float2 uv = input.uv0;
+    if ((material.texture.x & 0xFFu) == 1u) uv = input.uv1;
+    const float alpha = baseColorMap.sample(materialSampler, uv).a * material.baseColorFactor.a * input.color.a;
     if (alpha < material.alpha.x) discard_fragment();
   }
   return float4(0.0f, 0.0f, 0.0f, 1.0f);

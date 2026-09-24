@@ -19,13 +19,13 @@ VkDescriptorPool DescriptorPool::createPool() const {
   // Generous; a second pool is allocated the moment one fills.
   std::vector<VkDescriptorPoolSize> sizes{
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, setsPerPool * 4},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool * 6},
-      // Sized for the 120-slot texture table on a ray tracing device.
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, setsPerPool * (context.rayTracingSupported ? 144 : 16)},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool * 16},
+      // Sized for the 120-slot texture table used by both GPU path tracers.
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, setsPerPool * 144},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool * 2},
       {VK_DESCRIPTOR_TYPE_SAMPLER, setsPerPool * 4},
   };
-  if (context.rayTracingSupported)
+  if (context.accelerationStructureSupported)
     sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, setsPerPool});
   VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   info.maxSets = setsPerPool;
@@ -72,6 +72,7 @@ Program::Program(const Context &ctx, std::string computeEntry) : context(ctx) {
 Program::~Program() {
   for (VkDescriptorSetLayout setLayout : setLayouts)
     if (setLayout) vkDestroyDescriptorSetLayout(context.device, setLayout, nullptr);
+  for (VkSampler sampler : immutableSamplers) vkDestroySampler(context.device, sampler, nullptr);
   if (layout) vkDestroyPipelineLayout(context.device, layout, nullptr);
 }
 
@@ -90,6 +91,29 @@ void Program::build() {
   } else {
     perSet[0] = bindingsFor(*vertexShader);
     perSet[1] = bindingsFor(*fragmentShader);
+  }
+
+  const std::size_t samplerCount = (computeShader ? computeShader->reflection.samplers.size() :
+      vertexShader->reflection.samplers.size() + fragmentShader->reflection.samplers.size());
+  immutableSamplers.reserve(samplerCount);
+  auto installImmutableSamplers = [&](const Shader &shader, std::vector<VkDescriptorSetLayoutBinding> &bindings) {
+    for (const m2v::host::Handle &declared : shader.reflection.samplers) {
+      if (!declared.constexprSampler) continue;
+      VkSampler sampler = VK_NULL_HANDLE;
+      VkSamplerCreateInfo info = m2v::host::samplerCreateInfo(declared);
+      check(vkCreateSampler(context.device, &info, nullptr, &sampler), "vkCreateSampler (constexpr)");
+      immutableSamplers.push_back(sampler);
+      for (VkDescriptorSetLayoutBinding &binding : bindings)
+        if (binding.binding == declared.binding) {
+          binding.pImmutableSamplers = &immutableSamplers.back();
+          break;
+        }
+    }
+  };
+  if (computeShader) installImmutableSamplers(*computeShader, perSet[0]);
+  else {
+    installImmutableSamplers(*vertexShader, perSet[0]);
+    installImmutableSamplers(*fragmentShader, perSet[1]);
   }
 
   for (int set = 0; set < 2; ++set) {

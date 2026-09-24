@@ -6,6 +6,7 @@
 #include <vulkan/vulkan_win32.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 
@@ -133,17 +134,47 @@ Context::Context(const Window &window, bool validation) {
     return false;
   };
 
-  for (int pass = 0; pass < 2 && physical == VK_NULL_HANDLE; ++pass) {
-    for (VkPhysicalDevice candidate : devices) {
+  const char *selectionEnvironment = std::getenv("BASALT_VULKAN_DEVICE");
+  const std::string selection = selectionEnvironment ? selectionEnvironment : "";
+  if (!selection.empty()) {
+    auto lower = [](std::string value) {
+      std::transform(value.begin(), value.end(), value.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      return value;
+    };
+    char *end = nullptr;
+    const unsigned long requestedIndex = std::strtoul(selection.c_str(), &end, 10);
+    const bool byIndex = end != selection.c_str() && *end == '\0';
+    const std::string requestedName = lower(selection);
+    for (std::size_t index = 0; index < devices.size(); ++index) {
       VkPhysicalDeviceProperties props{};
-      vkGetPhysicalDeviceProperties(candidate, &props);
-      const bool discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-      if (pass == 0 && !discrete) continue;
+      vkGetPhysicalDeviceProperties(devices[index], &props);
+      const bool match = byIndex ? index == requestedIndex
+                                 : lower(props.deviceName).find(requestedName) != std::string::npos;
       std::uint32_t family = 0;
-      if (suitable(candidate, family)) {
-        physical = candidate;
+      if (match && suitable(devices[index], family)) {
+        physical = devices[index];
         queueFamily = family;
         break;
+      }
+    }
+    if (physical == VK_NULL_HANDLE)
+      throw Error("requested Vulkan device '" + selection +
+                  "' was not found or lacks Vulkan 1.3 graphics, compute and presentation");
+    logInfo("selected Vulkan device using BASALT_VULKAN_DEVICE={}", selection);
+  } else {
+    for (int pass = 0; pass < 2 && physical == VK_NULL_HANDLE; ++pass) {
+      for (VkPhysicalDevice candidate : devices) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(candidate, &props);
+        const bool discrete = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        if (pass == 0 && !discrete) continue;
+        std::uint32_t family = 0;
+        if (suitable(candidate, family)) {
+          physical = candidate;
+          queueFamily = family;
+          break;
+        }
       }
     }
   }
@@ -152,11 +183,21 @@ Context::Context(const Window &window, bool validation) {
 
   vkGetPhysicalDeviceProperties(physical, &properties);
   vkGetPhysicalDeviceMemoryProperties(physical, &memoryProperties);
+  const bool accelerationExtensions =
+      hasDeviceExtension(physical, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+      hasDeviceExtension(physical, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+  const bool rayQueryExtension =
+      accelerationExtensions && hasDeviceExtension(physical, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+  const bool rayPipelineExtension =
+      accelerationExtensions && hasDeviceExtension(physical, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
   {
     VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationProperties{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
     VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    properties2.pNext = &accelerationProperties;
+    if (accelerationExtensions) {
+      properties2.pNext = &accelerationProperties;
+      if (rayPipelineExtension) accelerationProperties.pNext = &rayPipelineProperties;
+    }
     vkGetPhysicalDeviceProperties2(physical, &properties2);
     if (accelerationProperties.minAccelerationStructureScratchOffsetAlignment > 0)
       scratchAlignment = accelerationProperties.minAccelerationStructureScratchOffsetAlignment;
@@ -175,16 +216,19 @@ Context::Context(const Window &window, bool validation) {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
   VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayPipelineFeatures{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
   features.pNext = &features11;
   features11.pNext = &features12;
   features12.pNext = &features13;
   // Queried only where the extensions exist; asking otherwise is invalid.
-  const bool rayExtensions = hasDeviceExtension(physical, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
-                             hasDeviceExtension(physical, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
-                             hasDeviceExtension(physical, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-  if (rayExtensions) {
+  if (accelerationExtensions) {
     features13.pNext = &accelerationFeatures;
-    accelerationFeatures.pNext = &rayQueryFeatures;
+    if (rayQueryExtension) accelerationFeatures.pNext = &rayQueryFeatures;
+    if (rayPipelineExtension) {
+      if (rayQueryExtension) rayQueryFeatures.pNext = &rayPipelineFeatures;
+      else accelerationFeatures.pNext = &rayPipelineFeatures;
+    }
   }
   vkGetPhysicalDeviceFeatures2(physical, &features);
 
@@ -197,6 +241,9 @@ Context::Context(const Window &window, bool validation) {
   enabled.imageCubeArray = features.features.imageCubeArray;
   enabled.textureCompressionBC = features.features.textureCompressionBC;
   enabled.shaderSampledImageArrayDynamicIndexing = features.features.shaderSampledImageArrayDynamicIndexing;
+  enabled.geometryShader = features.features.geometryShader;
+  if (!enabled.geometryShader)
+    throw Error("the device does not offer geometryShader, required for fragment primitive identity");
 
   VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
   enable11.shaderDrawParameters = features11.shaderDrawParameters;
@@ -207,27 +254,50 @@ Context::Context(const Window &window, bool validation) {
   enable12.shaderSampledImageArrayNonUniformIndexing = features12.shaderSampledImageArrayNonUniformIndexing;
   enable12.descriptorIndexing = features12.descriptorIndexing;
   enable12.runtimeDescriptorArray = features12.runtimeDescriptorArray;
-  rayTracingSupported = rayExtensions && features12.bufferDeviceAddress &&
-                        accelerationFeatures.accelerationStructure && rayQueryFeatures.rayQuery;
+  accelerationStructureSupported = accelerationExtensions && features12.bufferDeviceAddress &&
+                                   accelerationFeatures.accelerationStructure;
+  rayQuerySupported = accelerationStructureSupported && rayQueryExtension && rayQueryFeatures.rayQuery;
+  rayPipelineSupported = accelerationStructureSupported && rayPipelineExtension &&
+                         rayPipelineFeatures.rayTracingPipeline;
   // The hit texture table needs 128 sampled images per stage; without them, the rasterised pair.
-  if (rayTracingSupported && (properties.limits.maxPerStageDescriptorSampledImages < 128 ||
-                              properties.limits.maxDescriptorSetSampledImages < 128)) {
-    logWarning("the device allows only {} sampled images per stage; ray tracing is off",
+  if ((rayQuerySupported || rayPipelineSupported) &&
+      (properties.limits.maxPerStageDescriptorSampledImages < 128 ||
+       properties.limits.maxDescriptorSetSampledImages < 128)) {
+    logWarning("the device allows only {} sampled images per stage; path tracing is off",
                properties.limits.maxPerStageDescriptorSampledImages);
-    rayTracingSupported = false;
+    rayQuerySupported = false;
+    rayPipelineSupported = false;
   }
   // BASALT_NO_RAY_TRACING forces the rasterised pair, for testing.
-  if (rayTracingSupported && std::getenv("BASALT_NO_RAY_TRACING")) {
+  if ((rayQuerySupported || rayPipelineSupported) && std::getenv("BASALT_NO_RAY_TRACING")) {
     logInfo("ray tracing is available but disabled by BASALT_NO_RAY_TRACING");
-    rayTracingSupported = false;
+    rayQuerySupported = false;
+    rayPipelineSupported = false;
+    accelerationStructureSupported = false;
   }
-  enable12.bufferDeviceAddress = rayTracingSupported ? VK_TRUE : VK_FALSE;
+  if (rayPipelineSupported && std::getenv("BASALT_NO_RAY_PIPELINE")) {
+    logInfo("ray pipelines are available but disabled by BASALT_NO_RAY_PIPELINE");
+    rayPipelineSupported = false;
+  }
+  rayTracingSupported = rayQuerySupported;
+  enable12.bufferDeviceAddress = accelerationStructureSupported ? VK_TRUE : VK_FALSE;
   VkPhysicalDeviceAccelerationStructureFeaturesKHR enableAcceleration{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
   enableAcceleration.accelerationStructure = VK_TRUE;
   VkPhysicalDeviceRayQueryFeaturesKHR enableRayQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
-  enableRayQuery.rayQuery = VK_TRUE;
-  enableAcceleration.pNext = &enableRayQuery;
+  enableRayQuery.rayQuery = rayQuerySupported ? VK_TRUE : VK_FALSE;
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR enableRayPipeline{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
+  enableRayPipeline.rayTracingPipeline = rayPipelineSupported ? VK_TRUE : VK_FALSE;
+  enableRayPipeline.rayTracingPipelineTraceRaysIndirect =
+      rayPipelineSupported && rayPipelineFeatures.rayTracingPipelineTraceRaysIndirect ? VK_TRUE : VK_FALSE;
+  rayPipelineIndirectSupported = enableRayPipeline.rayTracingPipelineTraceRaysIndirect == VK_TRUE &&
+                                 !std::getenv("BASALT_NO_INDIRECT_TRACE");
+  if (rayQuerySupported) enableAcceleration.pNext = &enableRayQuery;
+  if (rayPipelineSupported) {
+    if (rayQuerySupported) enableRayQuery.pNext = &enableRayPipeline;
+    else enableAcceleration.pNext = &enableRayPipeline;
+  }
   VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
   enable13.pNext = &enable12;
   enable13.dynamicRendering = VK_TRUE;
@@ -252,6 +322,7 @@ Context::Context(const Window &window, bool validation) {
   record("imageCubeArray", enabled.imageCubeArray);
   record("textureCompressionBC", enabled.textureCompressionBC);
   record("shaderSampledImageArrayDynamicIndexing", enabled.shaderSampledImageArrayDynamicIndexing);
+  record("geometryShader", enabled.geometryShader);
   record("shaderDrawParameters", enable11.shaderDrawParameters);
   record("scalarBlockLayout", enable12.scalarBlockLayout);
   record("hostQueryReset", enable12.hostQueryReset);
@@ -262,8 +333,10 @@ Context::Context(const Window &window, bool validation) {
   record("dynamicRendering", enable13.dynamicRendering);
   record("synchronization2", enable13.synchronization2);
   record("shaderDemoteToHelperInvocation", enable13.shaderDemoteToHelperInvocation);
-  record("accelerationStructure", rayTracingSupported ? VK_TRUE : VK_FALSE);
-  record("rayQuery", rayTracingSupported ? VK_TRUE : VK_FALSE);
+  record("accelerationStructure", accelerationStructureSupported ? VK_TRUE : VK_FALSE);
+  record("rayQuery", rayQuerySupported ? VK_TRUE : VK_FALSE);
+  record("rayTracingPipeline", rayPipelineSupported ? VK_TRUE : VK_FALSE);
+  record("rayTracingPipelineTraceRaysIndirect", enableRayPipeline.rayTracingPipelineTraceRaysIndirect);
 
   const float priority = 1.0f;
   VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -272,14 +345,32 @@ Context::Context(const Window &window, bool validation) {
   queueInfo.pQueuePriorities = &priority;
 
   std::vector<const char *> deviceExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-  if (rayTracingSupported) {
+  if (accelerationStructureSupported) {
     deviceExtensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-    deviceExtensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    if (rayQuerySupported) deviceExtensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    if (rayPipelineSupported) deviceExtensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
     enable11.pNext = &enableAcceleration;
   }
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enableExecutables{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
   VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   deviceInfo.pNext = &enable13;
+  if (std::getenv("BASALT_PIPELINE_STATISTICS") &&
+      hasDeviceExtension(physical, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR available{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    query.pNext = &available;
+    vkGetPhysicalDeviceFeatures2(physical, &query);
+    if (available.pipelineExecutableInfo) {
+      deviceExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+      enableExecutables.pipelineExecutableInfo = VK_TRUE;
+      enableExecutables.pNext = const_cast<void *>(deviceInfo.pNext);
+      deviceInfo.pNext = &enableExecutables;
+      pipelineStatisticsEnabled = true;
+    }
+  }
   deviceInfo.queueCreateInfoCount = 1;
   deviceInfo.pQueueCreateInfos = &queueInfo;
   deviceInfo.pEnabledFeatures = &enabled;
@@ -293,10 +384,10 @@ Context::Context(const Window &window, bool validation) {
   allocatorInfo.device = device;
   allocatorInfo.instance = instance;
   allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
-  if (rayTracingSupported) allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+  if (accelerationStructureSupported) allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
   check(vmaCreateAllocator(&allocatorInfo, &allocator), "vmaCreateAllocator");
 
-  if (rayTracingSupported) {
+  if (accelerationStructureSupported) {
     // The extension entry points come through the device, not the loader.
     auto load = [&](const char *name) { return vkGetDeviceProcAddr(device, name); };
     rt.getBuildSizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
@@ -308,14 +399,39 @@ Context::Context(const Window &window, bool validation) {
         load("vkGetAccelerationStructureDeviceAddressKHR"));
     if (!rt.getBuildSizes || !rt.create || !rt.destroy || !rt.build || !rt.address) {
       logWarning("the acceleration structure entry points could not be loaded; ray tracing is off");
+      accelerationStructureSupported = false;
+      rayQuerySupported = false;
+      rayPipelineSupported = false;
       rayTracingSupported = false;
     }
   }
 
-  logInfo("device: {} (Vulkan {}.{}.{}, driver {}), ray tracing {}", info.name,
+  if (rayPipelineSupported) {
+    auto load = [&](const char *name) { return vkGetDeviceProcAddr(device, name); };
+    rt.createPipelines = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+        load("vkCreateRayTracingPipelinesKHR"));
+    rt.getShaderGroupHandles = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+        load("vkGetRayTracingShaderGroupHandlesKHR"));
+    rt.traceRays = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(load("vkCmdTraceRaysKHR"));
+    rt.traceRaysIndirect = reinterpret_cast<PFN_vkCmdTraceRaysIndirectKHR>(
+        load("vkCmdTraceRaysIndirectKHR"));
+    rt.getShaderGroupStackSize = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+        load("vkGetRayTracingShaderGroupStackSizeKHR"));
+    rt.setPipelineStackSize = reinterpret_cast<PFN_vkCmdSetRayTracingPipelineStackSizeKHR>(
+        load("vkCmdSetRayTracingPipelineStackSizeKHR"));
+    if (!rt.createPipelines || !rt.getShaderGroupHandles || !rt.traceRays) {
+      logWarning("the ray-pipeline entry points could not be loaded; ray pipelines are off");
+      rayPipelineSupported = false;
+    }
+  }
+  rayTracingSupported = rayQuerySupported;
+
+  logInfo("device: {} (Vulkan {}.{}.{}, driver {}), acceleration structures {}, ray queries {}, ray pipelines {}", info.name,
           VK_API_VERSION_MAJOR(info.apiVersion), VK_API_VERSION_MINOR(info.apiVersion),
           VK_API_VERSION_PATCH(info.apiVersion), info.driverVersion,
-          rayTracingSupported ? "available" : "not available");
+          accelerationStructureSupported ? "available" : "not available",
+          rayQuerySupported ? "available" : "not available",
+          rayPipelineSupported ? "available" : "not available");
 }
 
 Context::~Context() {

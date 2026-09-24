@@ -52,6 +52,7 @@ private:
   void build();
   const Context &context;
   std::unique_ptr<Shader> vertexShader, fragmentShader, computeShader;
+  std::vector<VkSampler> immutableSamplers;
 };
 
 // Writes by the shader's own names; set and binding come from the reflection.

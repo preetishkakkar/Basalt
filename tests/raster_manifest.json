@@ -1,0 +1,20 @@
+{
+  "name": "v0-v2-raster-regression",
+  "baseline_revision": "884839a79de469a6c2d5830f7a508422fa263f73",
+  "candidate_revision": "a832acc",
+  "configuration": "Windows x64 RelWithDebInfo, Vulkan validation enabled, frame 8, 1600x900",
+  "common_arguments": ["--frame", "8", "--no-ui", "--no-vsync"],
+  "cases": [
+    {"name": "default_cube", "arguments": []},
+    {"name": "helmet", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr"]},
+    {"name": "sponza", "arguments": ["assets/Sponza/Sponza.gltf", "assets/court.hdr"]},
+    {"name": "materials", "arguments": ["tests/data/materials.gltf", "assets/court.hdr"]},
+    {"name": "aa_none", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--aa", "0"]},
+    {"name": "fxaa", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--aa", "1"]},
+    {"name": "debug4", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--debug", "4"]},
+    {"name": "debug11", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--debug", "11"]},
+    {"name": "spin_taa", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--aa", "2", "--spin", "1"]},
+    {"name": "ssr", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--reflections", "1"]},
+    {"name": "traced", "arguments": ["assets/DamagedHelmet.glb", "assets/court.hdr", "--reflections", "2"]}
+  ]
+}

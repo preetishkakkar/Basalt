@@ -21,7 +21,7 @@ struct InputState {
 
 class Window {
 public:
-  Window(const std::string &title, std::uint32_t width, std::uint32_t height);
+  Window(const std::string &title, std::uint32_t width, std::uint32_t height, bool visible = true);
   ~Window();
   Window(const Window &) = delete;
   Window &operator=(const Window &) = delete;

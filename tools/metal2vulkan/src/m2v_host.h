@@ -187,6 +187,29 @@ struct VisibleFunction {
   std::string name, signature;
   std::uint32_t index = 0;
 };
+// A ray-pipeline interface of a ray stage (docs/RAY_PIPELINES.md): payload, incoming_payload,
+// callable_data, incoming_callable_data, hit_attribute or shader_record. Two stages agree on an
+// interface exactly when their fingerprints do; a shader record's offsets and size are the MSL layout
+// the host writes into the SBT record after the group handle.
+struct RayInterface {
+  std::string kind, name, fingerprint;
+  std::uint32_t packedBytes = 0, size = 0, alignment = 0;
+  bool readOnly = false;
+  struct Field { std::string name, type; std::uint32_t offset = 0, count = 1, size = 0; };
+  std::vector<Field> fields;
+};
+// What a ray stage's reflection says beyond its descriptors: its interfaces, the built-ins it reads and
+// the shader calls it makes. `present` is false for every other stage.
+struct RayStageInfo {
+  bool present = false;
+  std::vector<RayInterface> interfaces;
+  std::vector<std::string> builtins;
+  bool traces = false, executesCallables = false, reportsIntersections = false, ignoresIntersections = false, terminatesRays = false;
+  const RayInterface *find(const std::string &kind) const {
+    for (const auto &interface : interfaces) if (interface.kind == kind) return &interface;
+    return nullptr;
+  }
+};
 struct DispatchPlanInfo {
   std::array<std::uint32_t, 3> defaultLocalSize{1, 1, 1};
   std::array<std::uint32_t, 3> specIds{0, 1, 2};
@@ -312,6 +335,8 @@ struct Stage {
   // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT and enables bufferDeviceAddress.
   bool deviceAddresses = false;
   std::uint32_t deviceAddressBinding = 0;
+  // Ray-pipeline stages (ray_generation, miss, closest_hit, any_hit, intersection, callable).
+  RayStageInfo rayPipeline;
 };
 // The standard sample locations Vulkan defines for a sample count, as normalized offsets inside the
 // pixel, in sample-index order. Only counts a device reporting standardSampleLocations must honour
@@ -544,5 +569,71 @@ DispatchPlan planExactGrid(std::array<std::uint32_t, 3> grid, std::array<std::ui
 std::array<std::uint32_t, 16> pushConstants(const DispatchPlan &plan, const Region &region);
 // Specialization entries binding spec ids 0..2 to a uint32[3] of a region's workgroup size.
 std::array<VkSpecializationMapEntry, 3> workgroupSizeSpecialization();
+
+// ---------------------------------------------------------------- ray-tracing pipelines (docs/RAY_PIPELINES.md)
+// The reflected stage names of the six ray stages, and their Vulkan stage bits.
+bool isRayStage(const std::string &stage);
+VkShaderStageFlagBits rayShaderStage(const std::string &stage); // Throws for a stage that is not a ray stage.
+// A shader group over indices into the pipeline's stage list (VK_SHADER_UNUSED_KHR for an empty slot).
+struct RayShaderGroup {
+  VkRayTracingShaderGroupTypeKHR type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+  std::uint32_t general = VK_SHADER_UNUSED_KHR, closestHit = VK_SHADER_UNUSED_KHR, anyHit = VK_SHADER_UNUSED_KHR, intersection = VK_SHADER_UNUSED_KHR;
+};
+// What each group is for, in group order: "raygen", "miss", "callable" or "hit". Throws, before any
+// Vulkan call, for a stage that is not a ray stage, a slot holding the wrong stage, a general group
+// without a raygen, miss or callable stage, a triangle group with an intersection stage or a
+// procedural group without one, a hit group whose stages disagree on the incoming payload, a hit
+// attribute a procedural group's intersection stage does not report or a triangle hit group that
+// reads more than its two barycentric floats, an incoming payload or callable data no stage in the
+// pipeline sends, and a pipeline without a ray-generation group.
+std::vector<std::string> checkRayShaderGroups(const std::vector<Stage> &stages, const std::vector<RayShaderGroup> &groups);
+// The one descriptor-set layout (set 0) every stage of a ray pipeline shares: each binding's type and
+// count, and the stages that use it. Throws when two stages disagree about a binding.
+struct RayDescriptorBinding { std::uint32_t binding = 0; VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; std::uint32_t count = 1; VkShaderStageFlags stages = 0; };
+std::vector<RayDescriptorBinding> rayDescriptorBindings(const std::vector<Stage> &stages);
+// Checks a pipeline's maxPipelineRayRecursionDepth: at least 1, at least 2 when a closest-hit or miss
+// stage traces (a trace from there is a second level), and within the device's maxRayRecursionDepth.
+// A deeper recursion is the application's own; exceeding the depth it creates the pipeline with is
+// undefined in Vulkan, so the host must bound it.
+void checkRayRecursionDepth(const std::vector<Stage> &stages, std::uint32_t depth, const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &properties);
+// A shader binding table: one raygen record, then the miss, hit and callable regions, each record the
+// group's handle followed by its shader-record bytes. The regions' addresses are offsets from the
+// table's start (add the buffer's device address, which must be shaderGroupBaseAlignment-aligned).
+struct ShaderBindingRecord { std::uint32_t group = 0; std::vector<std::byte> data; };
+struct ShaderBindingTable {
+  VkStridedDeviceAddressRegionKHR raygen{}, miss{}, hit{}, callable{};
+  std::vector<std::byte> bytes;
+};
+// Lays out and fills the table from the handles vkGetRayTracingShaderGroupHandlesKHR returned (one per
+// group, shaderGroupHandleSize bytes each). Every record of a region shares its stride; a record's data
+// must cover the shader_record every stage of its group reads. Throws for a record whose group has
+// the wrong role for its region, oversized data, a stride beyond maxShaderGroupStride, or arithmetic
+// that would overflow.
+ShaderBindingTable buildShaderBindingTable(const std::vector<Stage> &stages, const std::vector<RayShaderGroup> &groups,
+                                           const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &properties,
+                                           const std::vector<std::byte> &handles, const ShaderBindingRecord &raygen,
+                                           const std::vector<ShaderBindingRecord> &miss, const std::vector<ShaderBindingRecord> &hit,
+                                           const std::vector<ShaderBindingRecord> &callable);
+// Pipeline libraries (VK_KHR_pipeline_library): every library and the pipeline linking them must
+// declare the same VkRayTracingPipelineInterfaceCreateInfoKHR. This is the smallest one that holds the
+// stages' interfaces as laid out (a float3 takes 16 bytes, as the compiler measures hit attributes):
+// the largest payload or callable data, and the largest hit attributes, at least the 8 bytes a
+// triangle's barycentrics take.
+struct RayPipelineInterface { std::uint32_t maxPayloadSize = 0, maxHitAttributeSize = 0; };
+RayPipelineInterface rayPipelineInterface(const std::vector<Stage> &stages);
+// Deferred destruction for a renderer with frames in flight: an object replaced at frame N is still
+// used by every frame submitted before N, so it is destroyed only once those frames have completed.
+// retire() records the last frame that may use the object; completed(F) destroys, in retirement
+// order, every object whose last use is at or before F; flush() destroys the rest (after the device
+// is idle).
+class RetirementQueue {
+public:
+  void retire(std::uint64_t lastUse, std::function<void()> destroy);
+  void completed(std::uint64_t frame);
+  void flush();
+  std::size_t pending() const { return items.size(); }
+private:
+  std::vector<std::pair<std::uint64_t, std::function<void()>>> items;
+};
 
 } // namespace m2v::host

@@ -1,0 +1,61 @@
+{
+  "schema": "basalt-benchmark/1",
+  "description": "V6.1 wavefront performance manifest. Paths are relative to the repository root. Assets under assets/ are not committed; a missing or changed asset makes its cases SKIP and leaves their gates unverified. Performance runs use --no-validation; correctness runs are separate.",
+  "scenes": {
+    "materials": {
+      "scene": "tests/data/materials.gltf",
+      "environment": "",
+      "sha256": {"tests/data/materials.gltf": "7c049ade27161612a051903ddf56173ab846be5741a91221817fb19b5b4a8c55"},
+      "covers": "material/alpha fixture: opaque, masked and blended surfaces under the procedural sky; mostly open sky, so deep bounces are sparse"
+    },
+    "sponza": {
+      "scene": "assets/Sponza/Sponza.gltf",
+      "environment": "assets/court.hdr",
+      "sha256": {
+        "assets/Sponza/Sponza.gltf": "646c10cbc8fab990ca29f363e90e2d65155f3a3569506852eb1434a9465b9501",
+        "assets/Sponza/Sponza.bin": "fdbdbfb6a76edeb6626f28a1401bc1536bb1c864131a64e90fbc3df2d2d191bd",
+        "assets/court.hdr": "65b82a2f1b7a98d82f24a5c0d2e53c6b150d4e451a1fd22ccc65abb47c406146"
+      },
+      "covers": "large enclosed scene (103 primitive instances), alpha-masked foliage and chains (thin geometry), incoherent deep bounces"
+    },
+    "helmet": {
+      "scene": "assets/DamagedHelmet.glb",
+      "environment": "assets/court.hdr",
+      "sha256": {
+        "assets/DamagedHelmet.glb": "a1e3b04de97b11de564ce6e53b95f02954a297f0008183ac63a4f5974f6b32d8",
+        "assets/court.hdr": "65b82a2f1b7a98d82f24a5c0d2e53c6b150d4e451a1fd22ccc65abb47c406146"
+      },
+      "covers": "mixed rough/glossy metal textures and emissive triangles (emissive NEE/MIS)"
+    }
+  },
+  "backends": {
+    "query-megakernel": {"renderer": "gpu", "execution": "megakernel"},
+    "query-wavefront": {"renderer": "gpu", "execution": "wavefront"},
+    "bvh-megakernel": {"renderer": "gpu-bvh", "execution": "megakernel", "builder": "cpu", "layout": "binary"},
+    "bvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "cpu", "layout": "binary"},
+    "bvh8-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "cpu", "layout": "bvh8"},
+    "lbvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "gpu", "layout": "binary"},
+    "pipeline-iterative": {"renderer": "gpu-pipeline", "execution": "megakernel"},
+    "pipeline-wavefront": {"renderer": "gpu-pipeline", "execution": "wavefront"}
+  },
+  "anchor": {
+    "description": "Historical V6 anchor (b560e13, RTX 4090): 5.731 ms megakernel vs 35.531 ms wavefront per fresh frame",
+    "scene": "materials", "size": "1600x900", "spf": 16, "bounces": 5, "spp": 64, "seed": 1,
+    "backends": ["query-megakernel", "query-wavefront"]
+  },
+  "grid": {
+    "scenes": ["materials", "sponza", "helmet"],
+    "sizes": ["1280x720", "1600x900"],
+    "spf": [1, 4, 16],
+    "bounces": [3, 8],
+    "seed": 7,
+    "frames": 6,
+    "warmup_frames": 1
+  },
+  "motion": {
+    "description": "1-SPP camera motion: every frame restarts accumulation",
+    "scenes": ["materials", "sponza", "helmet"],
+    "size": "1600x900", "spf": 1, "bounces": 3, "seed": 7, "spin_degrees": 0.5, "frames": 12,
+    "warmup_frames": 2
+  }
+}

@@ -27,6 +27,14 @@ public:
   float prefilteredMipCount() const { return static_cast<float>(prefilteredCube.description.mipLevels); }
   const std::string &name() const { return sourceName; }
   bool procedural() const { return isProcedural; }
+  // What the path tracer reads: the equirect it shades escaped rays with, and that image's
+  // luminance distribution (shaders/pt/lights.h) with its (columns, rows, integral, present).
+  // The procedural sky's has no sun disc painted in: the tracer's analytic sun is the disc.
+  Image &traceImage() { return isProcedural ? traceEquirectangular : equirectangular; }
+  const std::vector<float> &traceDistribution() const { return distribution; }
+  const std::array<float, 4> &traceDistributionInfo() const { return distributionInfo; }
+  // Changes whenever the environment's images do.
+  std::uint32_t version() const { return generation; }
   Vec3 brightestDirection() const { return brightest; }
   VkSampler linearSampler() const { return sampler; }
 
@@ -35,13 +43,18 @@ private:
   void projectIrradiance(const std::vector<float> &texels, std::uint32_t width, std::uint32_t height);
   void uploadEquirectangular(const std::vector<float> &texels, std::uint32_t width,
                              std::uint32_t height, const std::string &name);
-  std::vector<float> proceduralSky(std::uint32_t width, std::uint32_t height, Vec3 sunDirection,
+  void buildTraceDistribution(const std::vector<float> &texels, std::uint32_t width, std::uint32_t height);
+  std::vector<float> proceduralSky(std::uint32_t width, std::uint32_t height, bool sunDisc, Vec3 sunDirection,
                                    float turbidity, float intensity) const;
 
   const Context &context;
   Uploader &uploader;
 
   Image equirectangular;
+  Image traceEquirectangular;  // the procedural sky without its disc
+  std::vector<float> distribution;
+  std::array<float, 4> distributionInfo{};
+  std::uint32_t generation = 0;
   Image environmentCube;
   Image prefilteredCube;
   std::array<Vec4, 9> irradiance{};

@@ -53,6 +53,28 @@ VkSamplerAddressMode addressMode(cgltf_int wrap) {
   }
 }
 
+std::uint32_t packedSampler(const cgltf_texture_view &view) {
+  const cgltf_sampler *sampler = view.texture ? view.texture->sampler : nullptr;
+  auto wrap = [](cgltf_int value) {
+    if (value == 33071) return 1u; // clamp
+    if (value == 33648) return 2u; // mirrored repeat
+    return 0u;                     // repeat
+  };
+  const std::uint32_t u = wrap(sampler ? sampler->wrap_s : 10497);
+  const std::uint32_t v = wrap(sampler ? sampler->wrap_t : 10497);
+  if (u != v) throw Error("path tracing currently requires matching glTF wrapS and wrapT modes");
+  const cgltf_int mag = sampler ? sampler->mag_filter : 9729;
+  const std::uint32_t nearest = mag == 9728 ? 1u : 0u;
+  return u | (v << 2u) | (nearest << 4u);
+}
+
+std::uint32_t textureUv(const cgltf_texture_view &view, const std::string &material) {
+  if (!view.texture) return 0u;
+  if (view.texcoord < 0 || view.texcoord > 1)
+    throw Error("material " + material + " uses unsupported UV set " + std::to_string(view.texcoord));
+  return static_cast<std::uint32_t>(view.texcoord);
+}
+
 // The minification enumerant encodes the mip filter too.
 VkFilter filterOf(cgltf_int filter, bool defaultLinear = true) {
   switch (filter) {
@@ -286,6 +308,14 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
         material.baseColor = viewTexture(pbr.base_color_texture, true);
         material.metallicRoughness = viewTexture(pbr.metallic_roughness_texture, false);
         if (pbr.base_color_texture.texture) material.sampler = samplerIndex(pbr.base_color_texture.texture->sampler);
+        material.uniforms.texture[0] = textureUv(pbr.base_color_texture, material.name) |
+            (textureUv(pbr.metallic_roughness_texture, material.name) << 8u) |
+            (textureUv(source->emissive_texture, material.name) << 16u) |
+            (textureUv(source->normal_texture, material.name) << 24u);
+        material.uniforms.texture[1] = packedSampler(pbr.base_color_texture) |
+            (packedSampler(pbr.metallic_roughness_texture) << 8u) |
+            (packedSampler(source->emissive_texture) << 16u) |
+            (packedSampler(source->normal_texture) << 24u);
       } else if (source->has_pbr_specular_glossiness) {
         // Specular-glossiness, approximated: diffuse as base colour, glossiness as roughness.
         const cgltf_pbr_specular_glossiness &sg = source->pbr_specular_glossiness;
@@ -308,6 +338,38 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
                                  : 1.0f;
       material.uniforms.emissive = {source->emissive_factor[0], source->emissive_factor[1],
                                     source->emissive_factor[2], strength};
+      // V7 extensions: read here, rendered by the path tracers only.
+      auto extension = [&](const cgltf_texture_view &view, bool srgb, int &texture) -> std::uint32_t {
+        texture = viewTexture(view, srgb);
+        return (textureUv(view, material.name) << 8u) | (packedSampler(view) << 16u);
+      };
+      if (source->has_transmission) {
+        material.uniforms.transmission.x = source->transmission.transmission_factor;
+        material.uniforms.extensionTextures[0] =
+            extension(source->transmission.transmission_texture, false, material.transmissionTexture);
+      }
+      if (source->has_ior) {
+        material.uniforms.transmission.y = source->ior.ior;
+        material.uniforms.transmission.w = 1.0f;
+      }
+      if (source->has_volume) {
+        material.uniforms.transmission.z = source->volume.thickness_factor;
+        if (source->volume.attenuation_distance > 0.0f && source->volume.attenuation_distance < 1e30f)
+          logWarning("material {} has KHR_materials_volume attenuation, ignored: there are no participating media",
+                     material.name);
+      }
+      if (source->has_clearcoat) {
+        material.uniforms.clearcoat = {source->clearcoat.clearcoat_factor,
+                                       source->clearcoat.clearcoat_roughness_factor,
+                                       source->clearcoat.clearcoat_normal_texture.texture
+                                           ? source->clearcoat.clearcoat_normal_texture.scale : 1.0f, 0.0f};
+        material.uniforms.extensionTextures[1] =
+            extension(source->clearcoat.clearcoat_texture, false, material.clearcoatTexture);
+        material.uniforms.extensionTextures[2] =
+            extension(source->clearcoat.clearcoat_roughness_texture, false, material.clearcoatRoughnessTexture);
+        material.uniforms.extensionTextures[3] =
+            extension(source->clearcoat.clearcoat_normal_texture, false, material.clearcoatNormalTexture);
+      }
       material.doubleSided = source->double_sided != 0;
       switch (source->alpha_mode) {
       case cgltf_alpha_mode_mask: material.alphaMode = AlphaMode::Mask; break;
@@ -347,6 +409,7 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
     const cgltf_accessor *tangentAccessor = nullptr;
     const cgltf_accessor *uv0Accessor = nullptr;
     const cgltf_accessor *uv1Accessor = nullptr;
+    const cgltf_accessor *colorAccessor = nullptr;
     for (cgltf_size a = 0; a < primitive.attributes_count; ++a) {
       const cgltf_attribute &attribute = primitive.attributes[a];
       switch (attribute.type) {
@@ -356,6 +419,9 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
       case cgltf_attribute_type_texcoord:
         if (attribute.index == 0) uv0Accessor = attribute.data;
         else if (attribute.index == 1) uv1Accessor = attribute.data;
+        break;
+      case cgltf_attribute_type_color:
+        if (attribute.index == 0) colorAccessor = attribute.data;
         break;
       default: break;
       }
@@ -370,7 +436,14 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
     const std::vector<float> uv0 = readFloats(uv0Accessor, 2);
     const std::vector<float> uv1 = readFloats(uv1Accessor, 2);
     const std::size_t count = positionAccessor->count;
-
+    std::vector<float> colors(count * 4u, 1.0f);
+    if (colorAccessor) {
+      const cgltf_size components = cgltf_num_components(colorAccessor->type);
+      if (components != 3 && components != 4) throw Error("COLOR_0 must have three or four components");
+      for (std::size_t i = 0; i < count; ++i)
+        if (!cgltf_accessor_read_float(colorAccessor, i, colors.data() + i * 4u, 4u))
+          throw Error("COLOR_0 could not be read as floats");
+    }
     Aabb localBounds;
     for (std::size_t i = 0; i < count; ++i) {
       Vertex vertex;
@@ -381,6 +454,7 @@ std::unique_ptr<Scene> loadGltf(const Context &context, Uploader &uploader, cons
       if (!uv0.empty()) vertex.uv0 = {uv0[i * 2], uv0[i * 2 + 1]};
       if (!uv1.empty()) vertex.uv1 = {uv1[i * 2], uv1[i * 2 + 1]};
       else vertex.uv1 = vertex.uv0;
+      vertex.color = {colors[i * 4], colors[i * 4 + 1], colors[i * 4 + 2], colors[i * 4 + 3]};
       localBounds.add(vertex.position);
       vertices.push_back(vertex);
     }

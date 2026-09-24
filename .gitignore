@@ -22,3 +22,14 @@ tools/metal2vulkan/bin/
 .vscode/
 *.user
 Thumbs.db
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Prebuilt dependencies the configure fetches (Embree, Open Image Denoise)
+.deps/
+
+# Plans, designs, results and handoff notes are kept locally, not in the repository
+docs/*.md
+tools/update_msl2spirv.ps1

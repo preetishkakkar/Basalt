@@ -24,6 +24,11 @@ public:
                       std::uint32_t height, VkFormat format, std::uint32_t mipLevels,
                       const std::string &name);
 
+  // Copies back to the host, waiting for the device: a buffer's first `bytes`, or an
+  // image's level zero as tightly packed texels. The buffer needs TRANSFER_SRC usage.
+  std::vector<std::uint8_t> readBuffer(const Buffer &buffer, VkDeviceSize bytes);
+  std::vector<std::uint8_t> readImage(Image &image, std::uint32_t texelBytes);
+
 private:
   const Context &context;
   VkCommandPool pool = VK_NULL_HANDLE;

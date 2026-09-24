@@ -1,11 +1,19 @@
 #include "render/Renderer.h"
+#include "pt/WavefrontPlan.h"
+#include "pt/ImageFile.h"
 
 #include "core/Log.h"
+#include "pt/Tables.h"
+#include "render/GpuBvhBuilder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <map>
+#include <thread>
 
 namespace basalt {
 namespace {
@@ -19,6 +27,15 @@ constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr std::uint32_t kClusterTileSize = 64;
 constexpr std::uint32_t kClusterSlices = 24;
 constexpr std::uint32_t kClusterCapacity = 64;
+
+// glTF 2.0: a node transform with a negative determinant keeps the object-space front face,
+// which is then clockwise in world space.
+VkFrontFace frontFaceOf(const Mat4 &transform) {
+  const Vec4 &x = transform[0], &y = transform[1], &z = transform[2];
+  const float determinant = x.x * (y.y * z.z - y.z * z.y) - x.y * (y.x * z.z - y.z * z.x) +
+                            x.z * (y.x * z.y - y.y * z.x);
+  return determinant < 0.0f ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+}
 
 // Mirrors FrameUniforms in shaders/common.metal.
 struct FrameUniforms {
@@ -118,15 +135,42 @@ VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
 
-// The shadow entry declares only position and uv0, at the same offsets.
+float halfToFloat(std::uint16_t half) {
+  const std::uint32_t sign = static_cast<std::uint32_t>(half & 0x8000u) << 16;
+  const std::uint32_t exponent = (half >> 10) & 0x1Fu;
+  std::uint32_t mantissa = half & 0x3FFu;
+  std::uint32_t bits = 0;
+  if (exponent == 0x1Fu) {
+    bits = sign | 0x7F800000u | (mantissa << 13);
+  } else if (exponent != 0) {
+    bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+  } else if (mantissa != 0) {
+    // Subnormal: shift the mantissa up until the implicit bit appears.
+    std::uint32_t shifted = 113u;
+    while ((mantissa & 0x400u) == 0) {
+      mantissa <<= 1;
+      --shifted;
+    }
+    bits = sign | (shifted << 23) | ((mantissa & 0x3FFu) << 13);
+  } else {
+    bits = sign;
+  }
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+// Shadow alpha testing also needs both UV sets and vertex colour.
 std::vector<VertexAttributeLayout> vertexLayout(bool shadowPass) {
   if (shadowPass)
-    return {{0, 0, offsetof(Vertex, position)}, {1, 0, offsetof(Vertex, uv0)}};
+    return {{0, 0, offsetof(Vertex, position)}, {1, 0, offsetof(Vertex, uv0)},
+            {2, 0, offsetof(Vertex, uv1)}, {3, 0, offsetof(Vertex, color)}};
   return {{0, 0, offsetof(Vertex, position)},
           {1, 0, offsetof(Vertex, normal)},
           {2, 0, offsetof(Vertex, tangent)},
           {3, 0, offsetof(Vertex, uv0)},
-          {4, 0, offsetof(Vertex, uv1)}};
+          {4, 0, offsetof(Vertex, uv1)},
+          {5, 0, offsetof(Vertex, color)}};
 }
 
 // Enters GENERAL with mip zero written, leaves SHADER_READ_ONLY.
@@ -204,6 +248,34 @@ Renderer::Renderer(Context &ctx, Swapchain &chain, Uploader &up)
   compositeProgram = std::make_unique<Program>(ctx, "composite_reflections");
   temporalProgram = std::make_unique<Program>(ctx, "resolve_temporal");
   clusterProgram = std::make_unique<Program>(ctx, "cull_lights");
+  pathTraceProgram = std::make_unique<Program>(ctx, "path_trace");
+  pathTraceEmissiveProgram = std::make_unique<Program>(ctx, "path_trace_emissive");
+  pathTraceWideProgram = std::make_unique<Program>(ctx, "path_trace_wide");
+  pathTraceWideEmissiveProgram = std::make_unique<Program>(ctx, "path_trace_wide_emissive");
+  pathCompareProgram = std::make_unique<Program>(ctx, "path_compare");
+  pathGuideExportProgram = std::make_unique<Program>(ctx, "path_export_guides");
+  pathWaveShadeProgram = std::make_unique<Program>(ctx, "path_wavefront_shade");
+  pathWaveShadeAtomicProgram = std::make_unique<Program>(ctx, "path_wavefront_shade_atomic");
+  if (ctx.rayQuerySupported) pathWaveFusedRtProgram = std::make_unique<Program>(ctx, "path_wavefront_fused_rt");
+  pathWaveFusedProgram = std::make_unique<Program>(ctx, "path_wavefront_fused");
+  pathWaveFusedWideProgram = std::make_unique<Program>(ctx, "path_wavefront_fused_wide");
+  // The subgroup variant needs every property its reflection names, in compute.
+  waveSubgroupAllocationSupported = true;
+  for (const std::string &property : pathWaveShadeProgram->compute().reflection.requiredProperties)
+    if (!m2v::host::supportsProperty(ctx.physical, property)) waveSubgroupAllocationSupported = false;
+  pathWaveResolveProgram = std::make_unique<Program>(ctx, "path_wavefront_resolve");
+  pathWaveIntersectProgram = std::make_unique<Program>(ctx, "path_wavefront_intersect");
+  pathWaveIntersectWideProgram = std::make_unique<Program>(ctx, "path_wavefront_intersect_wide");
+  pathWaveShadowProgram = std::make_unique<Program>(ctx, "path_wavefront_shadow");
+  pathWaveShadowWideProgram = std::make_unique<Program>(ctx, "path_wavefront_shadow_wide");
+  pathRestirInitialProgram = std::make_unique<Program>(ctx, "path_restir_initial");
+  pathRestirSpatialProgram = std::make_unique<Program>(ctx, "path_restir_spatial");
+  if (traced) {
+    pathTraceRtProgram = std::make_unique<Program>(ctx, "path_trace_rt");
+    pathTraceHybridProgram = std::make_unique<Program>(ctx, "path_trace_hybrid_rt");
+    pathWaveIntersectRtProgram = std::make_unique<Program>(ctx, "path_wavefront_intersect_rt");
+    pathWaveShadowRtProgram = std::make_unique<Program>(ctx, "path_wavefront_shadow_rt");
+  }
 
   createStaticResources();
   createPipelines();
@@ -313,6 +385,12 @@ void Renderer::createStaticResources() {
                                     VMA_MEMORY_USAGE_AUTO, hostFlags, "temporal.uniforms");
     frame.clusterUniforms = Buffer(context, sizeof(ClusterUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                    VMA_MEMORY_USAGE_AUTO, hostFlags, "cluster.uniforms");
+    frame.pathUniforms = Buffer(context, sizeof(pt::PathUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                VMA_MEMORY_USAGE_AUTO, hostFlags, "path.uniforms");
+    frame.hybridInverseViewProjection = Buffer(context, sizeof(Mat4), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                VMA_MEMORY_USAGE_AUTO, hostFlags, "hybrid.inverse-view-projection");
+    frame.pathComparisonUniforms = Buffer(context, sizeof(std::uint32_t) * 4,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO, hostFlags, "path.comparison.uniforms");
     frame.cascadePacked = Buffer(context, kCascadeCount * 4 * sizeof(Vec4),
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
                                  hostFlags, "cascades.packed");
@@ -324,7 +402,8 @@ void Renderer::createStaticResources() {
 
 void Renderer::createPipelines() {
   const std::vector<VertexBinding> geometryBinding{{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX}};
-  const std::vector<VkFormat> forwardTargets{kHdrFormat, kHdrFormat, kHdrFormat};
+  const std::vector<VkFormat> forwardTargets{kHdrFormat, kHdrFormat, kHdrFormat,
+      kHdrFormat, kHdrFormat, kHdrFormat, VK_FORMAT_R32G32B32A32_UINT};
 
   GraphicsPipelineDescription forward;
   forward.program = forwardProgram.get();
@@ -334,7 +413,9 @@ void Renderer::createPipelines() {
   forward.attributes = vertexLayout(false);
   forward.cullMode = VK_CULL_MODE_BACK_BIT;
   // Counter-clockwise front faces, as glTF specifies; checked against the debug normal view.
+  // Set per draw: a mirrored node's front is clockwise in world space (frontFaceOf).
   forward.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  forward.dynamicFrontFace = true;
   forward.depthCompare = VK_COMPARE_OP_GREATER_OR_EQUAL;
   forward.name = "forward.opaque";
   forwardPipeline = Pipeline(context, forward);
@@ -362,13 +443,18 @@ void Renderer::createPipelines() {
 
   GraphicsPipelineDescription shadow;
   shadow.program = shadowProgram.get();
+  // The masked entry returns a colour because the bundled compiler has no fragment-void
+  // profile. A throwaway target keeps the depth-only pass validation-clean.
+  shadow.colorFormats = {kHdrFormat};
   shadow.depthFormat = depthFormat;
   shadow.bindings = geometryBinding;
   shadow.attributes = vertexLayout(true);
   // Front faces culled so the map stores the caster's far side, moving self-shadowing error to
-  // the unlit side. Ordinary viewport here, so front faces stay counter-clockwise.
+  // the unlit side. Ordinary viewport here, so front faces stay counter-clockwise (clockwise
+  // for mirrored nodes, set per draw).
   shadow.cullMode = VK_CULL_MODE_FRONT_BIT;
   shadow.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  shadow.dynamicFrontFace = true;
   shadow.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
   shadow.depthBias = true;
   // Opaque casters need no fragment stage at all; only alpha-masked ones do.
@@ -413,6 +499,73 @@ void Renderer::createPipelines() {
   compositePipeline = Pipeline(context, *compositeProgram, "reflections.composite");
   temporalPipeline = Pipeline(context, *temporalProgram, "temporal.resolve");
   clusterPipeline = Pipeline(context, *clusterProgram, "lights.cull");
+  pathTracePipeline = Pipeline(context, *pathTraceProgram, "path.trace.software");
+  pathTraceEmissivePipeline = Pipeline(context, *pathTraceEmissiveProgram, "path.trace.software.emissive");
+  pathTraceWidePipeline = Pipeline(context, *pathTraceWideProgram, "path.trace.software.wide");
+  pathTraceWideEmissivePipeline = Pipeline(context, *pathTraceWideEmissiveProgram,
+                                            "path.trace.software.wide.emissive");
+  if (pathTraceRtProgram) pathTraceRtPipeline = Pipeline(context, *pathTraceRtProgram, "path.trace.rt");
+  if (pathTraceHybridProgram)
+    pathTraceHybridPipeline = Pipeline(context, *pathTraceHybridProgram, "path.trace.hybrid.rt");
+  pathComparePipeline = Pipeline(context, *pathCompareProgram, "path.compare");
+  pathGuideExportPipeline = Pipeline(context, *pathGuideExportProgram, "path.guide.export");
+  if (waveSubgroupAllocationSupported)
+    pathWaveShadePipeline = Pipeline(context, *pathWaveShadeProgram, "path.wavefront.shade");
+  pathWaveShadeAtomicPipeline = Pipeline(context, *pathWaveShadeAtomicProgram, "path.wavefront.shade.atomic");
+  if (pathWaveFusedRtProgram)
+    pathWaveFusedRtPipeline = Pipeline(context, *pathWaveFusedRtProgram, "path.wavefront.fused.rt");
+  pathWaveFusedPipeline = Pipeline(context, *pathWaveFusedProgram, "path.wavefront.fused");
+  pathWaveFusedWidePipeline = Pipeline(context, *pathWaveFusedWideProgram, "path.wavefront.fused.wide");
+  pathWaveResolvePipeline = Pipeline(context, *pathWaveResolveProgram, "path.wavefront.resolve");
+  pathWaveIntersectPipeline = Pipeline(context, *pathWaveIntersectProgram, "path.wavefront.intersect");
+  pathWaveIntersectWidePipeline = Pipeline(context, *pathWaveIntersectWideProgram, "path.wavefront.intersect.wide");
+  pathWaveShadowPipeline = Pipeline(context, *pathWaveShadowProgram, "path.wavefront.shadow");
+  pathWaveShadowWidePipeline = Pipeline(context, *pathWaveShadowWideProgram, "path.wavefront.shadow.wide");
+  pathRestirInitialPipeline = Pipeline(context, *pathRestirInitialProgram, "path.restir.initial");
+  pathRestirSpatialPipeline = Pipeline(context, *pathRestirSpatialProgram, "path.restir.spatial");
+  if (pathWaveIntersectRtProgram) pathWaveIntersectRtPipeline = Pipeline(context, *pathWaveIntersectRtProgram, "path.wavefront.intersect.rt");
+  if (pathWaveShadowRtProgram) pathWaveShadowRtPipeline = Pipeline(context, *pathWaveShadowRtProgram, "path.wavefront.shadow.rt");
+  if (context.rayPipelineSupported) try {
+    const std::vector<RayStageDescription> stages{
+        {"path_trace_pipeline", VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+        {"path_pipeline_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
+        {"path_pipeline_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+        {"path_pipeline_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
+    const std::vector<m2v::host::RayShaderGroup> groups{
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0u},
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1u},
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
+         VK_SHADER_UNUSED_KHR, 2u, 3u, VK_SHADER_UNUSED_KHR}};
+    pathRayPipeline = std::make_unique<RayPipeline>(
+        context, stages, groups, m2v::host::ShaderBindingRecord{0u, {}},
+        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
+        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+
+    const std::vector<RayStageDescription> intersectStages{
+        {"path_wavefront_intersect_pipeline", VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+        {"path_wave_pipeline_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
+        {"path_wave_pipeline_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+        {"path_wave_pipeline_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
+    const std::vector<RayStageDescription> shadowStages{
+        {"path_wavefront_shadow_pipeline", VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+        {"path_wave_shadow_pipeline_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
+        {"path_wave_shadow_pipeline_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+        {"path_wave_shadow_pipeline_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
+    pathWaveIntersectRayPipeline = std::make_unique<RayPipeline>(
+        context, intersectStages, groups, m2v::host::ShaderBindingRecord{0u, {}},
+        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
+        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+    pathWaveShadowRayPipeline = std::make_unique<RayPipeline>(
+        context, shadowStages, groups, m2v::host::ShaderBindingRecord{0u, {}},
+        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
+        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+  } catch (const std::exception &failure) {
+    // The other renderers stay usable; this one reports itself unavailable.
+    logError("the full ray pipeline renderer is unavailable: {}", failure.what());
+    pathRayPipeline.reset();
+    pathWaveIntersectRayPipeline.reset();
+    pathWaveShadowRayPipeline.reset();
+  }
 }
 
 void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
@@ -441,6 +594,19 @@ void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
   normalRoughness = Image(context, colorDescription);
   colorDescription.name = "gbuffer.reflection";
   reflectionWeight = Image(context, colorDescription);
+  colorDescription.name = "gbuffer.base-metallic";
+  gbufferBaseMetallic = Image(context, colorDescription);
+  colorDescription.name = "gbuffer.geometric-coverage";
+  gbufferGeometricCoverage = Image(context, colorDescription);
+  colorDescription.name = "gbuffer.emissive";
+  gbufferEmissive = Image(context, colorDescription);
+  colorDescription.format = VK_FORMAT_R32G32B32A32_UINT;
+  colorDescription.name = "gbuffer.identity";
+  gbufferIdentity = Image(context, colorDescription);
+  colorDescription.format = kHdrFormat;
+  colorDescription.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  colorDescription.name = "path.comparison.raster";
+  pathComparisonRaster = Image(context, colorDescription);
 
   ImageDescription reflectionDescription;
   reflectionDescription.format = kHdrFormat;
@@ -458,7 +624,8 @@ void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
   litDescription.format = kHdrFormat;
   litDescription.width = width;
   litDescription.height = height;
-  litDescription.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  litDescription.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   clusterGrid = {std::max(1u, (width + kClusterTileSize - 1) / kClusterTileSize),
                  std::max(1u, (height + kClusterTileSize - 1) / kClusterTileSize), kClusterSlices};
   clusterCount = clusterGrid[0] * clusterGrid[1] * clusterGrid[2];
@@ -473,6 +640,16 @@ void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
   }
   accumulatedFrames = 0;
   hasPreviousView = false;
+  for (Buffer &staging : cpuStaging) staging = Buffer();
+  cpuUploaded.fill(0);
+  pathAccumulation = Image();
+  pathAlbedoAccumulation = Image();
+  pathNormalAccumulation = Image();
+  pathReconstruction.reset();
+  pathReconstructionSamples = Buffer();
+  pathWaveStatesA=Buffer();pathWaveStatesB=Buffer();pathWaveResults=Buffer();pathWaveShadows=Buffer();pathWaveHits=Buffer();
+  pathWaveCounters=Buffer();pathWaveControl=Buffer();pathWaveCapacity=0;
+  pathSetsGeneration = ~0u;
 
   ImageDescription depthDescription;
   depthDescription.format = depthFormat;
@@ -491,6 +668,11 @@ void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
     shadowDescription.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     shadowDescription.name = "shadow.cascades";
     shadowMap = Image(context, shadowDescription);
+    shadowDescription.format = kHdrFormat;
+    shadowDescription.arrayLayers = 1;
+    shadowDescription.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    shadowDescription.name = "shadow.dummy-color";
+    shadowDummyColor = Image(context, shadowDescription);
   }
   for (std::uint32_t layer = 0; layer < kCascadeCount; ++layer)
     shadowLayerViews[layer] = shadowMap.createView(0, 1, layer, 1, VK_IMAGE_VIEW_TYPE_2D);
@@ -528,9 +710,11 @@ void Renderer::setScene(std::unique_ptr<Scene> next) {
   std::vector<VkImageView> nextViews;
   std::vector<std::uint32_t> nextSlots;
   std::unique_ptr<SceneAccelerationStructure> nextAcceleration;
-  buildHitTextureTable(*next, nextViews, nextSlots);
-  if (context.rayTracingSupported)
-    nextAcceleration = std::make_unique<SceneAccelerationStructure>(context, uploader, *next, nextSlots);
+  std::vector<Image *> nextImages;
+  buildHitTextureTable(*next, nextViews, nextSlots, nextImages);
+  TraceScene nextTrace = buildTraceScene(*next, nextSlots);
+  if (context.accelerationStructureSupported)
+    nextAcceleration = std::make_unique<SceneAccelerationStructure>(context, uploader, *next, nextTrace);
 
   acceleration.reset();
   if (activeScene) activeScene->destroy(context);
@@ -538,8 +722,28 @@ void Renderer::setScene(std::unique_ptr<Scene> next) {
   // Nothing to reproject a history through after a reframe.
   hasPreviousView = false;
   hitTextureViews = std::move(nextViews);
+  hitTextureImages = std::move(nextImages);
+  ++sceneVersion;
   materialSlots = std::move(nextSlots);
   acceleration = std::move(nextAcceleration);
+  traceScene = std::move(nextTrace);
+  softwareBvhNodes.reset();
+  softwareBvhTriangles.reset();
+  softwareBvhStatistics = {};
+  softwareBvhVersion = ~0u;
+  softwareBvhBuilder = -1;
+  softwareBvhScratchBytes = softwareBvhOutputBytes = 0;
+  softwareBvhRadixPasses = softwareBvhMaximumStack = 0;
+  pathEmissiveBuffer.reset();
+  pathEmissiveMetadata.clear();
+  pathEmissiveVersion = ~0u;
+  {
+    // A storage buffer may not be empty.
+    std::vector<pt::TraceInstance> rows = traceScene.instances;
+    if (rows.empty()) rows.push_back({});
+    traceInstanceBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "scene.trace.instances");
+  }
 
   std::vector<MaterialUniforms> materials;
   materials.reserve(activeScene->materials.size());
@@ -617,6 +821,7 @@ void Renderer::buildLights() {
   }
 
   lightCount = static_cast<std::uint32_t>(lights.size());
+  hostLights = lights;
   if (lights.empty()) lights.push_back({}); // A storage buffer may not be empty.
   context.waitIdle();
   lightBuffer = uploader.createBuffer(lights.data(), lights.size() * sizeof(LightRecord),
@@ -624,12 +829,14 @@ void Renderer::buildLights() {
   builtTestLights = requested;
 }
 
-void Renderer::buildHitTextureTable(const Scene &scene, std::vector<VkImageView> &views,
-                                    std::vector<std::uint32_t> &slots) const {
+void Renderer::buildHitTextureTable(Scene &scene, std::vector<VkImageView> &views,
+                                    std::vector<std::uint32_t> &slots, std::vector<Image *> &images) {
   // Slot zero is white for missing maps; a scene with more textures than slots shades the rest white and says so.
   views.assign(kHitTextureSlots, whiteTexture.view);
+  images.assign(kHitTextureSlots, &whiteTexture);
   // Slot one is the flat normal; white would tilt every hit.
   views[1] = normalTexture.view;
+  images[1] = &normalTexture;
   slots.assign(std::max<std::size_t>(scene.materials.size(), 1), 0);
   std::map<int, std::uint32_t> slotOf;
   std::uint32_t nextSlot = 2;
@@ -643,6 +850,7 @@ void Renderer::buildHitTextureTable(const Scene &scene, std::vector<VkImageView>
       return 0;
     }
     views[nextSlot] = scene.textures[static_cast<std::size_t>(texture)].view;
+    images[nextSlot] = &scene.textures[static_cast<std::size_t>(texture)];
     slotOf.emplace(texture, nextSlot);
     return nextSlot++;
   };
@@ -652,6 +860,16 @@ void Renderer::buildHitTextureTable(const Scene &scene, std::vector<VkImageView>
     if (normalSlot == 0) normalSlot = 1;
     slots[m] = slotFor(material.baseColor) | (slotFor(material.metallicRoughness) << 8) |
                (slotFor(material.emissive) << 16) | (normalSlot << 24);
+    // V7 extension textures carry their slots in the material (low byte); 0 is white and 1
+    // the flat normal, the defaults when a texture is absent.
+    std::array<std::uint32_t, 4> &extension = scene.materials[m].uniforms.extensionTextures;
+    const int textures[4] = {material.transmissionTexture, material.clearcoatTexture,
+                             material.clearcoatRoughnessTexture, material.clearcoatNormalTexture};
+    for (std::size_t k = 0; k < 4; ++k) {
+      std::uint32_t slot = slotFor(textures[k]);
+      if (k == 3 && slot == 0) slot = 1;
+      extension[k] = (extension[k] & ~0xFFu) | slot;
+    }
   }
   if (overflowed)
     logWarning("more than {} textures reachable by rays: some reflections and traced cut-outs use white",
@@ -752,7 +970,7 @@ void Renderer::rebuildSceneResources() {
         if (!acceleration)
           throw Error("the ray tracing forward entry needs an acceleration structure for the scene");
         writer.accelerationStructure("scene", acceleration->topLevel)
-            .buffer("primitives", acceleration->primitiveInfo)
+            .buffer("traceInstances", traceInstanceBuffer)
             .buffer("indices", activeScene->indexBuffer)
             .buffer("vertices", activeScene->vertexBuffer)
             .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -785,7 +1003,7 @@ void Renderer::rebuildSceneResources() {
     if (traced) {
       resolveWriter.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
           .accelerationStructure("scene", acceleration->topLevel)
-          .buffer("primitives", acceleration->primitiveInfo)
+          .buffer("traceInstances", traceInstanceBuffer)
           .buffer("materials", materialBuffer)
           .buffer("indices", activeScene->indexBuffer)
           .buffer("vertices", activeScene->vertexBuffer)
@@ -807,6 +1025,14 @@ void Renderer::rebuildSceneResources() {
         .buffer("uniforms", frame.reflectionUniforms)
         .sampler("clampSampler", clampSampler)
         .sampler("pointSampler", pointSampler)
+        .apply();
+
+    frame.pathComparisonSet = pool->allocate(pathCompareProgram->setLayouts[0]);
+    DescriptorWriter(context, pathCompareProgram->compute(), frame.pathComparisonSet)
+        .texture("raster", pathComparisonRaster)
+        .texture("traced", lit)
+        .storageTexture("output", litCurrent.view)
+        .buffer("control", frame.pathComparisonUniforms)
         .apply();
 
     frame.clusterSet = pool->allocate(clusterProgram->setLayouts[0]);
@@ -999,7 +1225,13 @@ std::uint64_t Renderer::settingsKey() const {
   add(s.reflectionMode); add(s.reflectionDistance); add(s.reflectionThickness); add(s.reflectionSteps);
   add(s.accumulate); add(s.debugView); add(s.wireframe); add(s.frustumCulling);
   add(s.antialiasing); add(s.temporalFeedback); add(s.testLights); add(s.lightShadows);
-  add(s.clusteredLights);
+  add(s.clusteredLights); add(s.renderer); add(s.pathBounces); add(s.pathSeed);
+  add(s.pathAperture); add(s.pathFocusDistance); add(s.pathTextureFilter);
+  add(s.pathDiEstimator); add(s.pathRestirReuse); add(s.pathRestirCandidates);
+  add(s.pathStrategy); add(s.pathClamp); add(s.pathTargetSamples); add(s.cpuIntersector); add(s.pathDenoise);
+  add(s.pathSamplesPerFrame); add(s.pathTemporal); add(s.pathBvhDiagnostic); add(s.pathBvhBuilder);
+  add(s.pathBvhWidth);
+  add(s.pathExecution);
   return key;
 }
 
@@ -1007,6 +1239,11 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   elapsedSeconds += deltaSeconds;
   ++frameCounter;
   FrameResources &frame = frames[frameIndex];
+  // A history from another renderer is nothing to reproject.
+  if (settings.renderer != lastRenderer) {
+    hasPreviousView = false;
+    lastRenderer = settings.renderer;
+  }
 
   const float aspect = static_cast<float>(width) / static_cast<float>(std::max(1u, height));
   const Mat4 view = camera.viewMatrix();
@@ -1015,7 +1252,8 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
 
   // The jitter is a clip-space shift proportional to w. Motion vectors and the accumulation
   // key use the un-jittered transform, so a still view stays still.
-  const bool temporal = settings.antialiasing == 2 && settings.debugView == 0;
+  // A path tracer jitters within the pixel itself.
+  const bool temporal = settings.antialiasing == 2 && settings.debugView == 0 && settings.renderer == 0;
   if (temporal) {
     const Vec2 jitter = haltonJitter(frameCounter);
     projection.columns[2].x = -jitter.x * 2.0f / static_cast<float>(width);
@@ -1023,6 +1261,7 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   }
   const Mat4 viewProjection = projection * view;
   const Mat4 inverseViewProjection = inverse(viewProjection);
+  frame.hybridInverseViewProjection.write(&inverseViewProjection, sizeof(inverseViewProjection));
   const float scale = sceneScale();
   const bool traced = rayTracingAvailable();
 
@@ -1057,11 +1296,13 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   key = hashBytes(&steadyViewProjection, sizeof(steadyViewProjection), key);
   const std::uint32_t extentAndGeneration[3] = {width, height, resourceGeneration};
   key = hashBytes(extentAndGeneration, sizeof(extentAndGeneration), key);
-  const bool accumulating = settings.accumulate && settings.debugView == 0;
+  // A path tracer always accumulates while the view holds; that is how it converges.
+  const bool accumulating = (settings.accumulate || settings.renderer != 0) && settings.debugView == 0;
   if (accumulating && key == accumulationKey) accumulatedFrames = std::min(accumulatedFrames + 1, 4096u);
   else accumulatedFrames = 0;
   accumulationKey = key;
   stats.accumulatedFrames = accumulatedFrames;
+  stats.samples = accumulating ? accumulatedFrames + 1 : 1;
   // Noise moves and reflections sample the lobe only once a frame has accumulated: a moving
   // view is deterministic, and the first still frame seeds the average.
   const bool refining = accumulating && accumulatedFrames > 0;
@@ -1204,6 +1445,11 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+  transitionImage(command, shadowDummyColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
   for (std::uint32_t cascade = 0; cascade < kCascadeCount; ++cascade) {
     VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1216,6 +1462,13 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea = {{0, 0}, {kShadowResolution, kShadowResolution}};
     rendering.layerCount = 1;
+    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    colorAttachment.imageView = shadowDummyColor.view;
+    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &colorAttachment;
     rendering.pDepthAttachment = &depthAttachment;
     vkCmdBeginRendering(command, &rendering);
 
@@ -1236,6 +1489,7 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
       // Opaque casters first, then masked; the pipeline changes only when sidedness does.
       std::uint32_t boundMaterial = UINT32_MAX;
       VkPipeline boundPipeline = VK_NULL_HANDLE;
+      VkFrontFace boundFace = VK_FRONT_FACE_MAX_ENUM;
       for (int pass = 0; pass < 2; ++pass) {
         const bool masked = pass == 1;
         for (std::uint32_t index : shadowCasters) {
@@ -1256,6 +1510,10 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
                                     1, 1, &shadowMaterialSets[primitive.material], 0, nullptr);
             boundMaterial = primitive.material;
           }
+          if (const VkFrontFace face = frontFaceOf(primitive.transform); face != boundFace) {
+            vkCmdSetFrontFace(command, face);
+            boundFace = face;
+          }
           vkCmdDrawIndexed(command, primitive.indexCount, 1, primitive.firstIndex,
                            primitive.vertexOffset, index);
           ++stats.shadowDrawCalls;
@@ -1275,7 +1533,8 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
   FrameResources &frame = frames[frameIndex];
   stats.drawCalls = 0;
 
-  for (Image *target : {&hdrColor, &normalRoughness, &reflectionWeight})
+  for (Image *target : {&hdrColor, &normalRoughness, &reflectionWeight, &gbufferBaseMetallic,
+                        &gbufferGeometricCoverage, &gbufferEmissive, &gbufferIdentity})
     transitionImage(command, *target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -1286,9 +1545,10 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
-  std::array<VkRenderingAttachmentInfo, 3> colorAttachments{};
-  const Image *targets[3]{&hdrColor, &normalRoughness, &reflectionWeight};
-  for (int i = 0; i < 3; ++i) {
+  std::array<VkRenderingAttachmentInfo, 7> colorAttachments{};
+  const Image *targets[7]{&hdrColor, &normalRoughness, &reflectionWeight, &gbufferBaseMetallic,
+                          &gbufferGeometricCoverage, &gbufferEmissive, &gbufferIdentity};
+  for (int i = 0; i < 7; ++i) {
     colorAttachments[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     colorAttachments[i].imageView = targets[i]->view;
     colorAttachments[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1340,6 +1600,7 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
       if (list.empty() || !oneSided || !twoSided) return;
       std::uint32_t boundMaterial = UINT32_MAX;
       VkPipeline boundPipeline = VK_NULL_HANDLE;
+      VkFrontFace boundFace = VK_FRONT_FACE_MAX_ENUM;  // the sky's pipeline in between resets it
       for (std::uint32_t index : list) {
         const Primitive &primitive = activeScene->primitives[index];
         const VkPipeline wanted =
@@ -1352,6 +1613,10 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
           vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, forwardProgram->layout, 1,
                                   1, &frame.forwardMaterialSets[primitive.material], 0, nullptr);
           boundMaterial = primitive.material;
+        }
+        if (const VkFrontFace face = frontFaceOf(primitive.transform); face != boundFace) {
+          vkCmdSetFrontFace(command, face);
+          boundFace = face;
         }
         vkCmdDrawIndexed(command, primitive.indexCount, 1, primitive.firstIndex,
                          primitive.vertexOffset, index);
@@ -1547,6 +1812,196 @@ void Renderer::recordPost(VkCommandBuffer command, std::uint32_t imageIndex) {
   // The render pass stays open: the interface is drawn into it by the caller.
 }
 
+void Renderer::recordLinearCapture(VkCommandBuffer command) {
+  // The CPU tracer's own float mean is the better source; writeLinearCapture takes it.
+  if (settings.renderer == 1 && cpuTracer) return;
+  // The GPU tracer's float accumulator, likewise: its w holds the sample count.
+  linearCaptureFloat = settings.renderer >= 2 && pathAccumulation;
+  Image &source = linearCaptureFloat ? pathAccumulation : litColor[frameIndex];
+  const VkDeviceSize planeBytes =
+      static_cast<VkDeviceSize>(width) * height * 4 * (linearCaptureFloat ? sizeof(float) : sizeof(std::uint16_t));
+  const VkDeviceSize bytes = planeBytes * (linearCaptureFloat ? 3u : 1u);
+  if (!linearCaptureBuffer || linearCaptureBuffer.size < bytes)
+    linearCaptureBuffer = Buffer(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO,
+                                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                 "capture.linear");
+  const std::array<Image *, 3> gpuSources{&pathAccumulation, &pathAlbedoAccumulation, &pathNormalAccumulation};
+  const std::size_t planeCount = linearCaptureFloat ? gpuSources.size() : 1u;
+  for (std::size_t plane = 0; plane < planeCount; ++plane) {
+    Image &image = linearCaptureFloat ? *gpuSources[plane] : source;
+    transitionImage(command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                        context.rayTracingShaderStage(),
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkBufferImageCopy region{};
+    region.bufferOffset = planeBytes * plane;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyImageToBuffer(command, image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           linearCaptureBuffer.handle, 1, &region);
+    transitionImage(command, image,
+                    linearCaptureFloat ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                        context.rayTracingShaderStage(),
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+  }
+  linearCaptureExtent = {width, height};
+}
+
+bool Renderer::writeLinearCapture(const std::string &path) {
+  std::uint32_t w = 0, h = 0;
+  std::vector<float> rows;
+  // Float RGB rows from the bottom up, written as PFM or OpenEXR by the path's extension.
+  if (settings.renderer == 1 && cpuTracer) {
+    pt::CpuTracer::Image image;
+    if (!cpuTracer->latest(image, 0, true)) return false;
+    w = image.width;
+    h = image.height;
+    // Denoised only when denoising was asked for; a reference is otherwise the raw mean.
+    const std::vector<float> &source = image.mean; // PFM is always raw; display filtering is independent.
+    rows.resize(static_cast<std::size_t>(w) * h * 3);
+    for (std::uint32_t y = 0; y < h; ++y)
+      for (std::uint32_t x = 0; x < w; ++x)
+        for (std::uint32_t c = 0; c < 3; ++c)
+          rows[(static_cast<std::size_t>(h - 1 - y) * w + x) * 3 + c] =
+              source[(static_cast<std::size_t>(y) * w + x) * 4 + c];
+  } else {
+    if (!linearCaptureBuffer || linearCaptureExtent.width == 0) return false;
+    context.waitIdle();
+    w = linearCaptureExtent.width;
+    h = linearCaptureExtent.height;
+    rows.resize(static_cast<std::size_t>(w) * h * 3);
+    if (linearCaptureFloat) {
+      // Sums with the sample count in w: the mean is their quotient.
+      const auto *texels = static_cast<const float *>(linearCaptureBuffer.mapped);
+      for (std::uint32_t y = 0; y < h; ++y)
+        for (std::uint32_t x = 0; x < w; ++x) {
+          const float *t = texels + (static_cast<std::size_t>(y) * w + x) * 4;
+          const float count = std::max(t[3], 1.0f);
+          for (std::uint32_t c = 0; c < 3; ++c) rows[(static_cast<std::size_t>(h - 1 - y) * w + x) * 3 + c] = t[c] / count;
+        }
+    } else {
+      const auto *texels = static_cast<const std::uint16_t *>(linearCaptureBuffer.mapped);
+      for (std::uint32_t y = 0; y < h; ++y)
+        for (std::uint32_t x = 0; x < w; ++x)
+          for (std::uint32_t c = 0; c < 3; ++c)
+            rows[(static_cast<std::size_t>(h - 1 - y) * w + x) * 3 + c] =
+                halfToFloat(texels[(static_cast<std::size_t>(y) * w + x) * 4 + c]);
+    }
+  }
+  return pt::writeLinearImage(path, rows, w, h, "raw-linear-rgb");
+}
+
+void Renderer::recordHybridSnapshot(VkCommandBuffer command) {
+  Image &lit = litColor[frameIndex];
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+  transitionImage(command, pathComparisonRaster, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkImageCopy copy{};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.extent = {width, height, 1};
+  vkCmdCopyImage(command, lit.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 pathComparisonRaster.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  transitionImage(command, pathComparisonRaster, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+void Renderer::recordPathComparison(VkCommandBuffer command) {
+  if (settings.pathComparison == 0) return;
+  FrameResources &frame = frames[frameIndex];
+  const std::uint32_t control[4] = {static_cast<std::uint32_t>(settings.pathComparison),
+                                    gpuSamples, width, height};
+  frame.pathComparisonUniforms.write(control, sizeof(control));
+
+  Image &lit = litColor[frameIndex];
+  transitionImage(command, litCurrent, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+  vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathComparePipeline.handle);
+  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathCompareProgram->layout,
+                          0, 1, &frame.pathComparisonSet, 0, nullptr);
+  vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
+  transitionImage(command, litCurrent, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  VkImageCopy copy{};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.extent = {width, height, 1};
+  vkCmdCopyImage(command, litCurrent.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 lit.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+bool Renderer::writeGuideCapture(const std::string &path, int plane) {
+  // The GPU tracers' first-hit albedo (plane 1) and normal (plane 2) sums, as means.
+  if (settings.renderer < 2 || !linearCaptureFloat || !linearCaptureBuffer ||
+      linearCaptureExtent.width == 0 || plane < 1 || plane > 2) return false;
+  context.waitIdle();
+  const std::uint32_t w = linearCaptureExtent.width, h = linearCaptureExtent.height;
+  const std::size_t pixels = static_cast<std::size_t>(w) * h;
+  const auto *planes = static_cast<const float *>(linearCaptureBuffer.mapped);
+  const float *counts = planes;  // the radiance plane's w holds the sample count
+  const float *guide = planes + pixels * 4 * static_cast<std::size_t>(plane);
+  std::vector<float> rows(pixels * 3);
+  for (std::uint32_t y = 0; y < h; ++y)
+    for (std::uint32_t x = 0; x < w; ++x) {
+      const std::size_t i = static_cast<std::size_t>(y) * w + x;
+      const float count = std::max(counts[i * 4 + 3], 1.0f);
+      for (std::uint32_t c = 0; c < 3; ++c)
+        rows[(static_cast<std::size_t>(h - 1 - y) * w + x) * 3 + c] = guide[i * 4 + c] / count;
+    }
+  return pt::writeLinearImage(path, rows, w, h, plane == 1 ? "first-hit-albedo-mean" : "first-hit-normal-mean");
+}
+
+bool Renderer::writeDenoisedCapture(const std::string &path) {
+  if (settings.renderer < 2 || !linearCaptureFloat || !linearCaptureBuffer ||
+      linearCaptureExtent.width == 0 || !pt::Denoiser::available()) return false;
+  context.waitIdle();
+  const std::uint32_t w = linearCaptureExtent.width, h = linearCaptureExtent.height;
+  const std::size_t pixels = static_cast<std::size_t>(w) * h;
+  const auto *planes = static_cast<const float *>(linearCaptureBuffer.mapped);
+  const std::size_t stride = pixels * 4;
+  std::vector<float> color(pixels * 3), albedo(pixels * 3), normal(pixels * 3);
+  for (std::size_t i = 0; i < pixels; ++i) {
+    const float count = std::max(planes[i * 4 + 3], 1.0f);
+    for (std::size_t c = 0; c < 3; ++c) {
+      color[i * 3 + c] = planes[i * 4 + c] / count;
+      albedo[i * 3 + c] = planes[stride + i * 4 + c] / count;
+      normal[i * 3 + c] = planes[stride * 2 + i * 4 + c] / count;
+    }
+  }
+  pt::Denoiser denoiser;
+  if (!denoiser.error().empty()) return false;
+  const std::vector<float> filtered = denoiser.denoise(color, albedo, normal, w, h);
+  if (filtered.empty()) return false;
+  std::vector<float> rows(filtered.size());
+  for (std::uint32_t y = 0; y < h; ++y)
+    std::copy_n(filtered.data() + static_cast<std::size_t>(y) * w * 3, static_cast<std::size_t>(w) * 3,
+                rows.data() + static_cast<std::size_t>(h - 1 - y) * w * 3);
+  return pt::writeLinearImage(path, rows, w, h, "denoised-linear-rgb");
+}
+
 void Renderer::render(VkCommandBuffer command, std::uint32_t imageIndex, const Camera &camera,
                       float deltaSeconds) {
   frameIndex = swapchain.frameIndex();
@@ -1569,22 +2024,1127 @@ void Renderer::render(VkCommandBuffer command, std::uint32_t imageIndex, const C
       const double period = context.properties.limits.timestampPeriod;
       stats.gpuMilliseconds = static_cast<float>(
           static_cast<double>(timestamps[1] - timestamps[0]) * period * 1e-6);
+      if (freshSampleFrame[frameIndex]) stats.freshSampleGpuMilliseconds = stats.gpuMilliseconds;
     }
     vkCmdResetQueryPool(command, timestampPool, first, 2);
     vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timestampPool, first);
   }
+  freshSampleFrame[frameIndex] = false;
 
   updateFrameData(camera, deltaSeconds);
-  recordLightCulling(command);
-  recordShadowPass(command);
-  recordForwardPass(command);
-  recordReflections(command);
+  const bool reconstruct = settings.pathTemporal && settings.renderer != 0 &&
+                           !(settings.renderer == 3 && settings.pathBvhDiagnostic != 0);
+  if ((!reconstruct && pathReconstruction) || reconstructionBackend != settings.renderer) {
+    context.waitIdle();
+    pathReconstruction.reset();
+    pathSetsGeneration = ~0u;
+  }
+  reconstructionBackend = settings.renderer;
+  if (reconstruct && settings.renderer >= 2 && !pathReconstruction) {
+    pathReconstruction = std::make_unique<PathReconstruction>(context, width, height);
+    pathSetsGeneration = ~0u;
+  }
+  stats.previewScale = 1;
+  stats.pathsPerSecond = 0.0; // only a current CPU publication supplies this statistic
+  stats.activeRenderer = settings.renderer;
+  stats.unavailableReason.clear();
+  stats.activeWavefront = false;
+  if (settings.renderer == 1) {
+    recordCpuTrace(command, camera);
+  } else {
+    // Leaving the CPU tracer frees its threads and its copy of the scene.
+    if (cpuTracer) {
+      cpuTracer.reset();
+      cpuScene.reset();
+      cpuImage = {};
+      cpuUploaded.fill(0);
+    }
+    if (settings.renderer == 4 && pathTraceHybridPipeline && rayTracingAvailable()) {
+      recordLightCulling(command);
+      recordShadowPass(command);
+      recordForwardPass(command);
+      if (settings.pathComparison != 0) {
+        recordReflections(command);
+        recordHybridSnapshot(command);
+      }
+      recordGpuTrace(command, camera);
+      recordPathComparison(command);
+    } else if ((settings.renderer == 5 && pathRayPipeline && rayPipelineAvailable()) ||
+        (settings.renderer == 2 && pathTraceRtPipeline && rayTracingAvailable()) ||
+        (settings.renderer == 3 && pathTracePipeline)) {
+      recordGpuTrace(command, camera);
+    } else {
+      // The rasteriser, or a requested tracer that cannot run here: the frame is rasterised,
+      // and only the second case says so.
+      stats.activeRenderer = 0;
+      if (settings.renderer != 0) stats.unavailableReason = "the selected renderer is unavailable on this device";
+      recordLightCulling(command);
+      recordShadowPass(command);
+      recordForwardPass(command);
+      recordReflections(command);
+    }
+  }
+  stats.reconstructionMilliseconds = pathReconstruction ? pathReconstruction->filterMilliseconds() : 0.0f;
+  stats.guideUploadMilliseconds = pathReconstruction ? pathReconstruction->uploadMilliseconds() : 0.0f;
+  stats.guideTransferMilliseconds = pathReconstruction ? pathReconstruction->transferMilliseconds() : 0.0f;
+  stats.reconstructionBytes = pathReconstruction ? pathReconstruction->bytes() : 0;
   recordBloom(command);
   recordPost(command, imageIndex);
 
   if (timestampPool)
     vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, timestampPool,
                          frameIndex * 2 + 1);
+}
+
+pt::PathUniforms Renderer::makePathUniforms(const Camera &camera) {
+  // The rasteriser's own view and projection, as a pinhole: forward, and right and up scaled
+  // to the image's half extent at unit distance.
+  const Mat4 cameraToWorld = inverse(camera.viewMatrix());
+  const Vec3 right = normalize(Vec3{cameraToWorld.columns[0].x, cameraToWorld.columns[0].y, cameraToWorld.columns[0].z});
+  const Vec3 up = normalize(Vec3{cameraToWorld.columns[1].x, cameraToWorld.columns[1].y, cameraToWorld.columns[1].z});
+  const Vec3 back = normalize(Vec3{cameraToWorld.columns[2].x, cameraToWorld.columns[2].y, cameraToWorld.columns[2].z});
+  const float tangent = std::tan(camera.fieldOfView * 0.5f);
+  const float aspect = static_cast<float>(width) / static_cast<float>(std::max(1u, height));
+  const Vec3 eye = camera.position();
+  auto vector = [](Vec3 v, float w) { return pt::float4(v.x, v.y, v.z, w); };
+
+  pt::PathUniforms u{};
+  u.cameraPosition = vector(eye, 1.0f);
+  u.cameraForward = vector(-back, 0.0f);
+  u.cameraRight = vector(right * (tangent * aspect), 0.0f);
+  u.cameraUp = vector(up * tangent, 0.0f);
+  const float guideMode = settings.renderer == 3 && settings.pathBvhDiagnostic != 0
+                              ? static_cast<float>(settings.pathBvhDiagnostic + 1)
+                              : settings.pathTemporal || settings.renderer == 4 ? 1.0f : 0.0f;
+  u.image = {static_cast<float>(width), static_cast<float>(height), guideMode, 1.0f};
+  u.path = {static_cast<float>(std::max(1, settings.pathBounces)), pt::kRouletteStartBounce, std::max(0.0f, settings.pathClamp),
+            static_cast<float>(std::clamp(settings.pathStrategy, 0, 2))};
+  const Image &environment = environmentState->traceImage();
+  u.environment = {settings.iblIntensity, static_cast<float>(environment.description.width),
+                   static_cast<float>(environment.description.height), settings.drawSky ? 1.0f : 0.0f};
+  const std::array<float, 4> &distribution = environmentState->traceDistributionInfo();
+  u.distribution = {distribution[0], distribution[1], distribution[2], distribution[3]};
+  // With an .hdr the environment's own sun is the sun; the procedural sky's disc is analytic.
+  if (environmentState->procedural()) {
+    const double radius = std::max(static_cast<double>(settings.sunAngularRadius), 1e-4);
+    const double solidAngle = 2.0 * 3.14159265358979323846 * (1.0 - std::cos(radius));
+    const Vec3 radiance = settings.sunColor * static_cast<float>(settings.sunIntensity / solidAngle);
+    u.sunDirection = vector(sunDirection(), static_cast<float>(std::cos(radius)));
+    u.sunRadiance = vector(radiance, static_cast<float>(solidAngle));
+  }
+  const std::uint32_t mask = pt::kRayMaskScene | (settings.groundPlane ? pt::kRayMaskGround : 0u) | pt::kRayMaskBlended;
+  u.counts = {static_cast<std::uint32_t>(hostLights.size()), mask, settings.pathSeed, 0u};
+  u.emissive = {static_cast<std::uint32_t>(pathEmissiveMetadata.size()), 0u, 0u, 0u};
+  // Thin lens: the focus defaults to the orbit target's depth. The pixel spread angle
+  // is the angle one pixel subtends at the image centre (ray cones).
+  // Hybrid rasterises primaries through a pinhole, so it never gets a lens.
+  const float focus = settings.pathFocusDistance > 0.0f ? settings.pathFocusDistance : std::max(camera.distance, 1e-3f);
+  u.lens = {settings.renderer == 4 ? 0.0f : std::max(0.0f, settings.pathAperture), focus,
+            settings.pathTextureFilter == 1 ? 1.0f : 0.0f,
+            std::atan(2.0f * tangent / static_cast<float>(std::max(1u, height)))};
+  // ReSTIR DI: pure path tracers only; hybrid and raster never select it.
+  const bool restir = settings.pathDiEstimator == 1 && settings.renderer != 0 && settings.renderer != 4;
+  u.estimator = {restir ? 1u : 0u,
+                 static_cast<std::uint32_t>(std::clamp(settings.pathRestirCandidates, 1,
+                                                       static_cast<int>(pt::kPtRestirMaxCandidates))),
+                 static_cast<std::uint32_t>(std::clamp(settings.pathRestirReuse, 0, 3)), 0u};
+  return u;
+}
+
+void Renderer::buildCpuScene() {
+  const auto started = std::chrono::steady_clock::now();
+  context.waitIdle();
+  auto scene = std::make_shared<pt::CpuScene>();
+
+  // Geometry, read back from the buffers the rasteriser draws.
+  const std::vector<std::uint8_t> vertexBytes =
+      uploader.readBuffer(activeScene->vertexBuffer, static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex));
+  scene->vertices.resize(vertexBytes.size() / sizeof(float));
+  std::memcpy(scene->vertices.data(), vertexBytes.data(), vertexBytes.size());
+  const std::vector<std::uint8_t> indexBytes =
+      uploader.readBuffer(activeScene->indexBuffer, static_cast<VkDeviceSize>(activeScene->indexCount) * sizeof(std::uint32_t));
+  scene->indices.resize(indexBytes.size() / sizeof(std::uint32_t));
+  std::memcpy(scene->indices.data(), indexBytes.data(), indexBytes.size());
+  scene->instances = traceScene.instances;
+  for (const std::uint32_t primitive : traceScene.primitives)
+    scene->triangleCounts.push_back(activeScene->primitives[primitive].indexCount / 3);
+
+  // The hit table's images at level zero, each read once however many slots share it.
+  std::map<const Image *, std::uint32_t> textureOf;
+  scene->textures.textures.clear();
+  for (std::uint32_t slot = 0; slot < hitTextureImages.size() && slot < pt::kHitTextureSlots; ++slot) {
+    Image *image = hitTextureImages[slot];
+    auto found = textureOf.find(image);
+    if (found == textureOf.end()) {
+      pt::HostTexture texture;
+      texture.width = image->description.width;
+      texture.height = image->description.height;
+      texture.srgb = image->description.format == VK_FORMAT_R8G8B8A8_SRGB;
+      const std::vector<std::uint8_t> bytes = uploader.readImage(*image, 4);
+      texture.texels.resize(bytes.size() / 4);
+      std::memcpy(texture.texels.data(), bytes.data(), bytes.size());
+      pt::buildMipChain(texture);  // ray-cone filtering
+      found = textureOf.emplace(image, static_cast<std::uint32_t>(scene->textures.textures.size())).first;
+      scene->textures.textures.push_back(std::move(texture));
+    }
+    scene->textures.slots[slot] = found->second;
+  }
+
+  Image &environment = environmentState->traceImage();
+  const std::vector<std::uint8_t> environmentBytes = uploader.readImage(environment, 16);
+  scene->environment.width = environment.description.width;
+  scene->environment.height = environment.description.height;
+  scene->environment.texels.resize(environmentBytes.size() / sizeof(float));
+  std::memcpy(scene->environment.texels.data(), environmentBytes.data(), environmentBytes.size());
+  scene->distribution = environmentState->traceDistribution();
+  if (scene->distribution.empty()) scene->distribution.assign(4, 0.0f);
+
+  if (specularAlbedo.empty()) specularAlbedo = pt::buildSpecularAlbedoTable();
+  scene->specularAlbedo = specularAlbedo;
+  std::vector<pt::Material> pathMaterials;
+  pathMaterials.reserve(activeScene->materials.size());
+  for (const Material &source : activeScene->materials) {
+    pt::Material material{};
+    std::memcpy(&material, &source.uniforms, sizeof(material));
+    pathMaterials.push_back(material);
+  }
+  scene->emissiveTriangles = pt::buildEmissiveTriangles(scene->vertices, scene->indices, scene->instances,
+                                                         scene->triangleCounts, pathMaterials);
+  pathEmissiveMetadata = scene->emissiveTriangles;
+  pathEmissiveVersion = sceneVersion;
+  scene->bvhStatistics = pt::buildBvh(scene->vertices, scene->indices, scene->instances, scene->triangleCounts,
+                                      scene->bvh, cpuTracer->threads());
+  if (settings.cpuIntersector == 1 && pt::EmbreeScene::available()) {
+    scene->embree = std::make_shared<pt::EmbreeScene>(*scene);
+    logInfo("Embree scene built in {:.0f} ms", scene->embree->buildMilliseconds);
+  }
+  if (settings.cpuIntersector == 2 && pt::cpuAvx2Available()) {
+    scene->wideAvx2 = std::make_shared<pt::WideBvh>(pt::buildWideBvh(scene->bvh, scene->instances, 8u));
+    logInfo("AVX2 BVH8: {} quantized nodes, converted in {:.2f} ms",
+            scene->wideAvx2->nodes.size(), scene->wideAvx2->milliseconds);
+  }
+  cpuScene = std::move(scene);
+  const pt::BvhStatistics &bvh = cpuScene->bvhStatistics;
+  logInfo("CPU path tracer: {} instances, {} triangles, {} + {} BVH nodes (depth {} + {}, SAH {:.1f}) in {:.0f} ms; "
+          "scene ready in {:.0f} ms",
+          bvh.instances, bvh.triangles, bvh.topNodes, bvh.bottomNodes, bvh.topDepth, bvh.bottomDepth, bvh.sahCost,
+          bvh.milliseconds,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+
+void Renderer::ensureEmissiveTriangles() {
+  if (!activeScene) return;
+  if (pathEmissiveVersion != sceneVersion) {
+    const std::vector<std::uint8_t> vertexBytes = uploader.readBuffer(
+        activeScene->vertexBuffer, static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex));
+    const std::vector<std::uint8_t> indexBytes = uploader.readBuffer(
+        activeScene->indexBuffer, static_cast<VkDeviceSize>(activeScene->indexCount) * sizeof(std::uint32_t));
+    std::vector<float> vertices(vertexBytes.size() / sizeof(float));
+    std::vector<std::uint32_t> indices(indexBytes.size() / sizeof(std::uint32_t));
+    std::memcpy(vertices.data(), vertexBytes.data(), vertexBytes.size());
+    std::memcpy(indices.data(), indexBytes.data(), indexBytes.size());
+    std::vector<std::uint32_t> triangleCounts;
+    for (const std::uint32_t primitive : traceScene.primitives)
+      triangleCounts.push_back(activeScene->primitives[primitive].indexCount / 3u);
+    std::vector<pt::Material> materials;
+    for (const Material &source : activeScene->materials) {
+      pt::Material material{};
+      std::memcpy(&material, &source.uniforms, sizeof(material));
+      materials.push_back(material);
+    }
+    pathEmissiveMetadata = pt::buildEmissiveTriangles(vertices, indices, traceScene.instances,
+                                                       triangleCounts, materials);
+    pathEmissiveVersion = sceneVersion;
+  }
+  if (!pathEmissiveBuffer) {
+    std::vector<pt::PtEmissiveTriangle> rows = pathEmissiveMetadata;
+    if (rows.empty()) rows.push_back({});
+    pathEmissiveBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::PtEmissiveTriangle),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.emissive.triangles");
+    pathSetsGeneration = ~0u;
+  }
+}
+
+void Renderer::buildSoftwareBvh() {
+  if (!activeScene || (softwareBvhVersion == sceneVersion && softwareBvhBuilder == settings.pathBvhBuilder &&
+                       softwareBvhWidth == settings.pathBvhWidth)) return;
+  const auto started = std::chrono::steady_clock::now();
+  context.waitIdle();
+
+  if (settings.pathBvhBuilder == 1) {
+    if (settings.pathBvhWidth != 0)
+      throw std::runtime_error("quantized wide BVHs currently require the CPU SAH builder");
+    GpuBvhBuildResult built = buildGpuBvh(context, uploader, *activeScene, traceScene);
+    softwareBvhNodes = std::move(built.nodes);
+    softwareBvhTriangles = std::move(built.triangles);
+    softwareBvhStatistics = built.statistics;
+    softwareBvhScratchBytes = built.scratchBytes;
+    softwareBvhOutputBytes = built.outputBytes;
+    softwareBvhRadixPasses = built.radixPasses;
+    softwareBvhMaximumStack = built.maximumBuilderStack;
+    std::vector<pt::TraceInstance> rows = std::move(built.instances);
+    if (rows.empty()) rows.push_back({});
+    // Own buffer: the raster and hardware sets keep naming the shared instance table.
+    softwareTraceInstanceBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
+                                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.bvh.instances");
+    softwareBvhVersion = sceneVersion;
+    softwareBvhBuilder = settings.pathBvhBuilder;
+    softwareBvhWidth = settings.pathBvhWidth;
+    pathSetsGeneration = ~0u;
+    logInfo("GPU LBVH: {} instances, {} triangles, {} + {} nodes (depth {} + {}), {} radix passes, "
+            "stack {}, {:.1f} MiB scratch, {:.1f} MiB output, built in {:.1f} ms",
+            softwareBvhStatistics.instances, softwareBvhStatistics.triangles,
+            softwareBvhStatistics.topNodes, softwareBvhStatistics.bottomNodes,
+            softwareBvhStatistics.topDepth, softwareBvhStatistics.bottomDepth,
+            softwareBvhRadixPasses, softwareBvhMaximumStack,
+            static_cast<double>(softwareBvhScratchBytes) / (1024.0 * 1024.0),
+            static_cast<double>(softwareBvhOutputBytes) / (1024.0 * 1024.0),
+            softwareBvhStatistics.milliseconds);
+    return;
+  }
+
+  const std::vector<std::uint8_t> vertexBytes = uploader.readBuffer(
+      activeScene->vertexBuffer, static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex));
+  std::vector<float> vertices(vertexBytes.size() / sizeof(float));
+  std::memcpy(vertices.data(), vertexBytes.data(), vertexBytes.size());
+  const std::vector<std::uint8_t> indexBytes = uploader.readBuffer(
+      activeScene->indexBuffer, static_cast<VkDeviceSize>(activeScene->indexCount) * sizeof(std::uint32_t));
+  std::vector<std::uint32_t> indices(indexBytes.size() / sizeof(std::uint32_t));
+  std::memcpy(indices.data(), indexBytes.data(), indexBytes.size());
+
+  std::vector<pt::TraceInstance> instances = traceScene.instances;
+  std::vector<std::uint32_t> triangleCounts;
+  triangleCounts.reserve(traceScene.primitives.size());
+  for (const std::uint32_t primitive : traceScene.primitives)
+    triangleCounts.push_back(activeScene->primitives[primitive].indexCount / 3);
+
+  pt::Bvh bvh;
+  const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+  softwareBvhStatistics = pt::buildBvh(vertices, indices, instances, triangleCounts, bvh, threads);
+  std::vector<pt::QuantizedWideNode> wideNodes;
+  if (settings.pathBvhWidth != 0) {
+    pt::WideBvh wide = pt::buildWideBvh(bvh, instances, settings.pathBvhWidth == 1 ? 4u : 8u);
+    wideNodes = std::move(wide.nodes);
+    bvh.triangles = std::move(wide.triangles);
+    instances = std::move(wide.instances);
+  }
+  const pt::float4 empty{};
+  const void *nodeData = settings.pathBvhWidth != 0
+      ? (wideNodes.empty() ? static_cast<const void *>(&empty) : static_cast<const void *>(wideNodes.data()))
+      : (bvh.nodes.empty() ? static_cast<const void *>(&empty) : static_cast<const void *>(bvh.nodes.data()));
+  const void *triangleData = bvh.triangles.empty() ? static_cast<const void *>(&empty) : bvh.triangles.data();
+  const VkDeviceSize nodeBytes = settings.pathBvhWidth != 0
+      ? std::max<std::size_t>(1, wideNodes.size()) * sizeof(pt::QuantizedWideNode)
+      : std::max<std::size_t>(1, bvh.nodes.size()) * sizeof(pt::float4);
+  const VkDeviceSize triangleBytes = std::max<std::size_t>(1, bvh.triangles.size()) * sizeof(pt::float4);
+  softwareBvhNodes = uploader.createBuffer(nodeData, nodeBytes,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "path.bvh.nodes");
+  softwareBvhTriangles = uploader.createBuffer(triangleData, triangleBytes,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "path.bvh.triangles");
+
+  // The builder's rows carry its BLAS roots and triangle offsets. They get their own
+  // buffer: replacing the shared table would free it under the raster descriptor sets.
+  std::vector<pt::TraceInstance> rows = std::move(instances);
+  if (rows.empty()) rows.push_back({});
+  softwareTraceInstanceBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
+                                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.bvh.instances");
+  softwareBvhVersion = sceneVersion;
+  softwareBvhBuilder = settings.pathBvhBuilder;
+  softwareBvhWidth = settings.pathBvhWidth;
+  softwareBvhScratchBytes = softwareBvhOutputBytes = 0;
+  softwareBvhRadixPasses = softwareBvhMaximumStack = 0;
+  pathSetsGeneration = ~0u;
+  logInfo("GPU software BVH: {} instances, {} triangles, {} + {} nodes (depth {} + {}, SAH {:.1f}) "
+          "built in {:.0f} ms; uploaded in {:.0f} ms total",
+          softwareBvhStatistics.instances, softwareBvhStatistics.triangles,
+          softwareBvhStatistics.topNodes, softwareBvhStatistics.bottomNodes,
+          softwareBvhStatistics.topDepth, softwareBvhStatistics.bottomDepth,
+          softwareBvhStatistics.sahCost, softwareBvhStatistics.milliseconds,
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+
+void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
+  FrameResources &frame = frames[frameIndex];
+  if (!activeScene) return;
+  ensureEmissiveTriangles();
+  const bool hybrid = settings.renderer == 4;
+  const bool software = settings.renderer == 3;
+  const bool pipelineBackend = settings.renderer == 5;
+  if (software) buildSoftwareBvh();
+  const bool emissiveSoftware = software && !pathEmissiveMetadata.empty();
+  const bool wideSoftware = software && settings.pathBvhWidth != 0;
+  const bool wavefront = settings.pathExecution == 1 && !hybrid;
+  stats.activeWavefront = wavefront;
+  Program *program = hybrid ? pathTraceHybridProgram.get() :
+                     wideSoftware && emissiveSoftware ? pathTraceWideEmissiveProgram.get() :
+                     wideSoftware ? pathTraceWideProgram.get() :
+                     emissiveSoftware ? pathTraceEmissiveProgram.get() :
+                     software ? pathTraceProgram.get() : pipelineBackend ? nullptr : pathTraceRtProgram.get();
+  Pipeline *pipeline = hybrid ? &pathTraceHybridPipeline :
+                       wideSoftware && emissiveSoftware ? &pathTraceWideEmissivePipeline :
+                       wideSoftware ? &pathTraceWidePipeline :
+                       emissiveSoftware ? &pathTraceEmissivePipeline :
+                       software ? &pathTracePipeline : pipelineBackend ? nullptr : &pathTraceRtPipeline;
+  if (wavefront && settings.pathWaveAllocation == 1 && !waveSubgroupAllocationSupported)
+    throw std::runtime_error("subgroup queue allocation needs subgroup arithmetic and ballot in compute");
+  const int backendKey = (wavefront ? 100 + (waveSubgroupAllocationActive() ? 1000 : 0) + (waveFusionActive() ? 2000 : 0) : 0) + (pipelineBackend ? 50 : hybrid ? 5 : wideSoftware ? 10 + settings.pathBvhWidth * 2 + (emissiveSoftware ? 1 : 0) :
+                         emissiveSoftware ? 4 : settings.renderer);
+  if (pipelineBackend ? !pathRayPipeline : (!program || !*pipeline)) return;
+
+  if (hybrid) {
+    for (Image *image : {&normalRoughness, &gbufferBaseMetallic, &gbufferGeometricCoverage,
+                         &gbufferIdentity})
+      transitionImage(command, *image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,  // hybrid is a compute ray-query entry
+                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  }
+
+  // Float accumulators, made the first time and at each resize; they live in GENERAL.
+  if (!pathAccumulation) {
+    ImageDescription description;
+    description.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    description.width = width;
+    description.height = height;
+    description.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    description.name = "path.accumulation";
+    pathAccumulation = Image(context, description);
+    description.name = "path.albedo";
+    pathAlbedoAccumulation = Image(context, description);
+    description.name = "path.normal";
+    pathNormalAccumulation = Image(context, description);
+    for (Image *image : {&pathAccumulation, &pathAlbedoAccumulation, &pathNormalAccumulation})
+      transitionImage(command, *image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                          context.rayTracingShaderStage(),
+                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    pathSetsGeneration = ~0u;
+    gpuSamples = 0;
+  }
+  if (pathDistributionVersion != environmentState->version()) {
+    std::vector<float> distribution = environmentState->traceDistribution();
+    if (distribution.empty()) distribution.assign(4, 0.0f);
+    context.waitIdle();
+    pathDistribution = uploader.createBuffer(distribution.data(), distribution.size() * sizeof(float),
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.distribution");
+    pathDistributionVersion = environmentState->version();
+    pathSetsGeneration = ~0u;
+  }
+  if (!pathAlbedoTable) {
+    if (specularAlbedo.empty()) specularAlbedo = pt::buildSpecularAlbedoTable();
+    pathAlbedoTable = uploader.createBuffer(specularAlbedo.data(), specularAlbedo.size() * sizeof(float),
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.albedo.table");
+  }
+  // The sets name this frame's lit image; the pool is reset whenever the scene's resources are.
+  // Wavefront only indexes this binding while temporal guide collection is enabled, in
+  // which case PathReconstruction supplies the full-sized buffer.  Keep its dormant
+  // binding small so switching from the megakernel cannot replace an in-flight buffer.
+  const std::size_t guideCount = hybrid && !pathReconstruction
+                                     ? static_cast<std::size_t>(width) * height : 1u;
+  const VkDeviceSize guideBytes = guideCount * sizeof(pt::PtReconstructionSample);
+  if (!pathReconstructionSamples || pathReconstructionSamples.size < guideBytes) {
+    // Descriptor sets from submitted frames can still name the old dummy buffer.  This
+    // growth is rare (currently only entry into hybrid mode), so drain them before VMA
+    // destroys the allocation during move-assignment.
+    if (pathReconstructionSamples) context.waitIdle();
+    // Valid dormant binding when guide collection is disabled.
+    pathReconstructionSamples = Buffer(context, guideBytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO, 0, "path.guides");
+    pathSetsGeneration = ~0u;
+  }
+  if (wavefront) {
+    // Queues hold one batch of whole pixels (pt/WavefrontPlan.h); the allocation follows the
+    // configured samples per frame, and a smaller final frame uses whole-pixel sub-batches.
+    const std::uint32_t planSamples = static_cast<std::uint32_t>(std::max(1, settings.pathSamplesPerFrame));
+    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * height;
+    const std::uint64_t guidePixels = pathReconstruction ? pixels : 0u;
+    pt::WavefrontLimits limits;
+    limits.maxStorageBufferRange = context.properties.limits.maxStorageBufferRange;
+    limits.maxWorkGroupCountX = context.properties.limits.maxComputeWorkGroupCount[0];
+    limits.maxRayDispatchInvocations =
+        pipelineBackend ? context.rayPipelineProperties.maxRayDispatchInvocationCount : 0u;
+    const pt::WavefrontPlan plan = pt::planWavefront(pixels, planSamples,
+        static_cast<std::uint64_t>(std::max(0, settings.pathWaveCapacity)), guidePixels, limits);
+    if (!plan.error.empty()) throw std::runtime_error("wavefront queues: " + plan.error);
+    if (pathWaveCapacity != plan.capacity || pathWaveGuidePixels != std::max<std::uint64_t>(guidePixels, 1u)) {
+      // Submitted frames' descriptor sets name the old queues: drain before replacing them.
+      if (pathWaveCapacity) context.waitIdle();
+      const VkDeviceSize paths = plan.capacity;
+      const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      pathWaveStatesA = Buffer(context, paths * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.states.a");
+      pathWaveStatesB = Buffer(context, paths * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.states.b");
+      pathWaveHits = Buffer(context, paths * 24, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.hits");
+      pathWaveResults = Buffer(context, paths * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.results");
+      pathWaveShadows = Buffer(context, paths * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.shadows");
+      pathWaveCosts = Buffer(context, paths * 8, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.costs");
+      pathWaveGuidePixels = std::max<std::uint64_t>(guidePixels, 1u);
+      pathWaveGuides = Buffer(context, pathWaveGuidePixels * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.wave.guides");
+      // The counters are also the indirect dispatch and trace arguments.
+      VkBufferUsageFlags counterUsage = storage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+      if (context.accelerationStructureSupported) counterUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      pathWaveCounters = Buffer(context, 32 * sizeof(std::uint32_t), counterUsage, VMA_MEMORY_USAGE_AUTO, 0,
+                                "path.wave.counters");
+      pathWaveControl = Buffer(context, 8 * sizeof(std::uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VMA_MEMORY_USAGE_AUTO, 0, "path.wave.control");
+      pathWaveCapacity = plan.capacity;
+      pathSetsGeneration = ~0u;
+      stats.wavefrontQueueBytes = plan.bytes;
+      logInfo("wavefront queues: {} paths per batch ({} per frame, limited by {}), {:.1f} MiB", plan.capacity,
+              plan.batches, plan.limitedBy, static_cast<double>(plan.bytes) / (1024.0 * 1024.0));
+    }
+  }
+  const bool restir = restirActive();
+  if (restir && settings.pathSamplesPerFrame > 1)
+    throw std::runtime_error("ReSTIR DI reuses one path per pixel per frame; samples per frame must be 1");
+  ensureRestirResources(restir, settings.pathTemporal, settings.pathBvhDiagnostic != 0);
+  const Buffer &instanceRows = software ? softwareTraceInstanceBuffer : traceInstanceBuffer;
+  const bool fused = wavefront && waveFusionActive();
+  Program *fusedProgram = !software ? pathWaveFusedRtProgram.get()
+                          : wideSoftware ? pathWaveFusedWideProgram.get() : pathWaveFusedProgram.get();
+  Program *shadeProgram = fused ? fusedProgram :
+                          waveSubgroupAllocationActive() ? pathWaveShadeProgram.get() : pathWaveShadeAtomicProgram.get();
+  if (pathSetsGeneration != resourceGeneration || pathSetsEnvironment != environmentState->version() ||
+      pathSetsBackend != backendKey) {
+    for (std::size_t f = 0; f < frames.size(); ++f) {
+      if (restir) {
+        Program *intersectProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get()) : pathWaveIntersectRtProgram.get();
+        Program *waveShadowProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get()) : pathWaveShadowRtProgram.get();
+        if (pipelineBackend ? (!pathWaveIntersectRayPipeline || !pathWaveShadowRayPipeline)
+                            : (!intersectProgram || !waveShadowProgram))
+          throw std::runtime_error("ReSTIR DI needs the backend's wavefront intersector");
+        frames[f].restirIntersectSet = pool->allocate(pipelineBackend ? pathWaveIntersectRayPipeline->setLayout : intersectProgram->setLayouts[0]);
+        DescriptorWriter iw(context, pipelineBackend ? pathWaveIntersectRayPipeline->shader(0) : intersectProgram->compute(), frames[f].restirIntersectSet);
+        iw.buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
+          .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
+          .buffer("vertices", activeScene->vertexBuffer).buffer("statesA", restirShadows)
+          .buffer("statesB", restirShadows).buffer("counters", restirCounters)
+          .buffer("waveControl", restirControl).buffer("costs", restirCosts).buffer("hits", restirShadows);
+        if (software) iw.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
+        else iw.accelerationStructure("scene", acceleration->topLevel);
+        iw.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          .sampler("materialSampler", defaultSampler).apply();
+        frames[f].restirShadowSet = pool->allocate(pipelineBackend ? pathWaveShadowRayPipeline->setLayout : waveShadowProgram->setLayouts[0]);
+        DescriptorWriter sw(context, pipelineBackend ? pathWaveShadowRayPipeline->shader(0) : waveShadowProgram->compute(), frames[f].restirShadowSet);
+        sw.buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
+          .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
+          .buffer("vertices", activeScene->vertexBuffer).buffer("counters", restirCounters)
+          .buffer("waveControl", restirControl).buffer("results", restirResults).buffer("shadows", restirShadows)
+          .buffer("costs", restirCosts).buffer("waveGuides", restirGuides);
+        if (software) sw.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
+        else sw.accelerationStructure("scene", acceleration->topLevel);
+        sw.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          .sampler("materialSampler", defaultSampler).apply();
+        for (std::uint32_t parity = 0; parity < 2; ++parity) {
+          frames[f].restirInitialSet[parity] = pool->allocate(pathRestirInitialProgram->setLayouts[0]);
+          DescriptorWriter(context, pathRestirInitialProgram->compute(), frames[f].restirInitialSet[parity])
+            .buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
+            .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
+            .buffer("vertices", activeScene->vertexBuffer).buffer("lights", lightBuffer)
+            .buffer("environmentDistribution", pathDistribution).buffer("specularAlbedo", pathAlbedoTable)
+            .buffer("emissiveTriangles", pathEmissiveBuffer).buffer("hits", restirShadows)
+            .buffer("restirCamera", restirCamera).buffer("previousSurfaces", restirSurfaces[1 - parity])
+            .buffer("previousReservoirs", restirFinals[1 - parity]).buffer("surfaces", restirSurfaces[parity])
+            .buffer("reservoirs", restirReservoirs)
+            .texture("environmentMap", environmentState->traceImage())
+            .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .sampler("environmentSampler", environmentState->linearSampler()).sampler("materialSampler", defaultSampler)
+            .apply();
+          frames[f].restirSpatialSet[parity] = pool->allocate(pathRestirSpatialProgram->setLayouts[0]);
+          DescriptorWriter(context, pathRestirSpatialProgram->compute(), frames[f].restirSpatialSet[parity])
+            .buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
+            .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
+            .buffer("vertices", activeScene->vertexBuffer).buffer("lights", lightBuffer)
+            .buffer("environmentDistribution", pathDistribution).buffer("specularAlbedo", pathAlbedoTable)
+            .buffer("emissiveTriangles", pathEmissiveBuffer).buffer("results", restirResults)
+            .buffer("shadows", restirShadows).buffer("waveGuides", restirGuides)
+            .buffer("surfaces", restirSurfaces[parity]).buffer("reservoirs", restirReservoirs)
+            .buffer("finals", restirFinals[parity])
+            .texture("environmentMap", environmentState->traceImage())
+            .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            .sampler("environmentSampler", environmentState->linearSampler()).sampler("materialSampler", defaultSampler)
+            .apply();
+        }
+      }
+      if (wavefront) {
+        Program *intersectProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get()) : pathWaveIntersectRtProgram.get();
+        Program *waveShadowProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get()) : pathWaveShadowRtProgram.get();
+        if (pipelineBackend ? (!pathWaveIntersectRayPipeline || !pathWaveShadowRayPipeline)
+                            : (!intersectProgram || !waveShadowProgram))
+          throw std::runtime_error("wavefront intersector is unavailable");
+        frames[f].pathWaveIntersectSet=pool->allocate(pipelineBackend ? pathWaveIntersectRayPipeline->setLayout : intersectProgram->setLayouts[0]);
+        DescriptorWriter iw(context,pipelineBackend ? pathWaveIntersectRayPipeline->shader(0) : intersectProgram->compute(),frames[f].pathWaveIntersectSet);
+        iw.buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
+          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
+          .buffer("vertices",activeScene->vertexBuffer).buffer("statesA",pathWaveStatesA)
+          .buffer("statesB",pathWaveStatesB).buffer("counters",pathWaveCounters)
+          .buffer("waveControl",pathWaveControl).buffer("costs",pathWaveCosts).buffer("hits",pathWaveHits);
+        if(software)iw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
+        else iw.accelerationStructure("scene",acceleration->topLevel);
+        iw.textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          .sampler("materialSampler",defaultSampler).apply();
+        frames[f].pathWaveShadeSet=pool->allocate(shadeProgram->setLayouts[0]);
+        DescriptorWriter(context,shadeProgram->compute(),frames[f].pathWaveShadeSet)
+          .buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
+          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
+          .buffer("vertices",activeScene->vertexBuffer).buffer("lights",lightBuffer)
+          .buffer("environmentDistribution",pathDistribution).buffer("specularAlbedo",pathAlbedoTable)
+          .buffer("guides",pathReconstruction?pathReconstruction->samples():pathReconstructionSamples)
+          .buffer("emissiveTriangles",pathEmissiveBuffer).buffer("statesA",pathWaveStatesA)
+          .buffer("statesB",pathWaveStatesB).buffer("counters",pathWaveCounters)
+          .buffer("waveControl",pathWaveControl).buffer("results",pathWaveResults)
+          .buffer("shadows",pathWaveShadows).buffer("hits",pathWaveHits).buffer("waveGuides",pathWaveGuides)
+          .buffer("restirResults",restirResults).buffer("restirGuides",restirGuides)
+          .apply();
+        if (fused) {
+          DescriptorWriter fw(context,shadeProgram->compute(),frames[f].pathWaveShadeSet);
+          if(software)fw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
+          else fw.accelerationStructure("scene",acceleration->topLevel);
+          fw.buffer("costs",pathWaveCosts).apply();
+        }
+        DescriptorWriter(context,shadeProgram->compute(),frames[f].pathWaveShadeSet)
+          .texture("environmentMap",environmentState->traceImage())
+          .textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          .sampler("environmentSampler",environmentState->linearSampler()).sampler("materialSampler",defaultSampler).apply();
+        frames[f].pathWaveShadowSet=pool->allocate(pipelineBackend ? pathWaveShadowRayPipeline->setLayout : waveShadowProgram->setLayouts[0]);
+        DescriptorWriter sw(context,pipelineBackend ? pathWaveShadowRayPipeline->shader(0) : waveShadowProgram->compute(),frames[f].pathWaveShadowSet);
+        sw.buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
+          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
+          .buffer("vertices",activeScene->vertexBuffer).buffer("counters",pathWaveCounters)
+          .buffer("waveControl",pathWaveControl).buffer("results",pathWaveResults).buffer("shadows",pathWaveShadows)
+          .buffer("costs",pathWaveCosts).buffer("waveGuides",pathWaveGuides);
+        if(software)sw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
+        else sw.accelerationStructure("scene",acceleration->topLevel);
+        sw.textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          .sampler("materialSampler",defaultSampler).apply();
+        frames[f].pathWaveResolveSet=pool->allocate(pathWaveResolveProgram->setLayouts[0]);
+        DescriptorWriter(context,pathWaveResolveProgram->compute(),frames[f].pathWaveResolveSet)
+          .buffer("uniforms",frames[f].pathUniforms).buffer("results",pathWaveResults)
+          .buffer("guides",pathReconstruction?pathReconstruction->samples():pathReconstructionSamples)
+          .buffer("waveControl",pathWaveControl).buffer("costs",pathWaveCosts).buffer("waveGuides",pathWaveGuides)
+          .storageTexture("accumulation",pathAccumulation.view).storageTexture("output",litColor[f].view)
+          .storageTexture("albedoAccumulation",pathAlbedoAccumulation.view)
+          .storageTexture("normalAccumulation",pathNormalAccumulation.view).apply();
+        continue;
+      }
+      const Shader &pathShader = pipelineBackend ? pathRayPipeline->shader(0) : program->compute();
+      VkDescriptorSet &pathSet = pipelineBackend ? frames[f].pathPipelineSet : frames[f].pathSet;
+      pathSet = pool->allocate(pipelineBackend ? pathRayPipeline->setLayout : program->setLayouts[0]);
+      DescriptorWriter writer(context, pathShader, pathSet);
+      writer
+          .buffer("uniforms", frames[f].pathUniforms)
+          .buffer("traceInstances", instanceRows)
+          .buffer("materials", materialBuffer)
+          .buffer("indices", activeScene->indexBuffer)
+          .buffer("vertices", activeScene->vertexBuffer)
+          .buffer("lights", lightBuffer)
+          .buffer("environmentDistribution", pathDistribution)
+          .buffer("specularAlbedo", pathAlbedoTable)
+          .buffer("emissiveTriangles", pathEmissiveBuffer)
+          .buffer("reconstructionSamples", pathReconstruction ? pathReconstruction->samples() : pathReconstructionSamples);
+      if (hybrid)
+        writer.buffer("hybridInverseViewProjection", frames[f].hybridInverseViewProjection);
+      else
+        writer.buffer("restirResults", restirResults).buffer("restirGuides", restirGuides);
+      if (software)
+        writer.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
+      else
+        writer.accelerationStructure("scene", acceleration->topLevel);
+      writer
+          .texture("environmentMap", environmentState->traceImage())
+          .storageTexture("accumulation", pathAccumulation.view)
+          .storageTexture("output", litColor[f].view)
+          .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+      if (!hybrid)
+        writer.storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
+              .storageTexture("normalAccumulation", pathNormalAccumulation.view);
+      if (hybrid)
+        writer.texture("hybridNormalRoughness", normalRoughness)
+              .texture("hybridBaseMetallic", gbufferBaseMetallic)
+              .texture("hybridGeometricDepth", gbufferGeometricCoverage)
+              .texture("hybridIdentity", gbufferIdentity);
+      writer
+          .sampler("environmentSampler", environmentState->linearSampler())
+          .sampler("materialSampler", defaultSampler)
+          .apply();
+      if (hybrid) {
+        frames[f].pathGuideExportSet = pool->allocate(pathGuideExportProgram->setLayouts[0]);
+        DescriptorWriter(context, pathGuideExportProgram->compute(), frames[f].pathGuideExportSet)
+            .buffer("samples", pathReconstruction ? pathReconstruction->samples() : pathReconstructionSamples)
+            .buffer("uniforms", frames[f].pathUniforms)
+            .storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
+            .storageTexture("normalAccumulation", pathNormalAccumulation.view)
+            .apply();
+      }
+    }
+    pathSetsGeneration = resourceGeneration;
+    pathSetsEnvironment = environmentState->version();
+    pathSetsBackend = backendKey;
+  }
+
+  // Samples: the accumulation key restarts them; the target stops them, and a frame past it
+  // only rewrites the mean into its own lit image.
+  if (accumulatedFrames == 0) gpuSamples = 0;
+  const std::uint32_t perFrame = static_cast<std::uint32_t>(std::max(1, settings.pathSamplesPerFrame));
+  const std::uint32_t target = static_cast<std::uint32_t>(std::max(0, settings.pathTargetSamples));
+  std::uint32_t thisFrame = perFrame;
+  if (target > 0) thisFrame = gpuSamples >= target ? 0u : std::min(perFrame, target - gpuSamples);
+  pt::PathUniforms uniforms = makePathUniforms(camera);
+  uniforms.counts.w = gpuSamples;
+  uniforms.image.w = static_cast<float>(thisFrame);
+  frame.pathUniforms.write(&uniforms, sizeof(uniforms));
+  gpuSamples += thisFrame;
+  freshSampleFrame[frameIndex] = thisFrame > 0;
+  stats.samples = gpuSamples;
+
+  // Stages this frame's tracing runs in. Pipeline wavefront keeps its init, shade and
+  // resolve stages in compute, so it uses both.
+  const VkPipelineStageFlags2 traceStages =
+      pipelineBackend ? (wavefront ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                   : VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR)
+                      : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  // The stage that writes the lit image last: the resolve in every wavefront mode.
+  const VkPipelineStageFlags2 litWriter = pipelineBackend && !wavefront ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
+                                                                         : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  if (!profiler) profiler = std::make_unique<GpuProfiler>(context);
+  profiler->begin(command, frameIndex);
+  profiler->setFresh(thisFrame > 0);
+  stats.traceGpuMilliseconds = static_cast<float>(profiler->latest().traceMilliseconds);
+  const bool profiling = settings.pathProfile;
+  profiler->mark(command, GpuStage::Setup);
+  // The accumulators were written by the last frame's dispatch. The transfer stage is a
+  // destination too: this frame's vkCmdUpdateBuffer of the wavefront and ReSTIR control
+  // words must follow the last frame's reads of them.
+  VkMemoryBarrier2 previous{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  previous.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                          context.rayTracingShaderStage() |
+                          VK_PIPELINE_STAGE_2_COPY_BIT;
+  previous.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                           VK_ACCESS_2_TRANSFER_READ_BIT;
+  previous.dstStageMask = traceStages | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  previous.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                           VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &previous;
+  vkCmdPipelineBarrier2(command, &dependency);
+
+  Image &lit = litColor[frameIndex];
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                      context.rayTracingShaderStage(),
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, traceStages, VK_ACCESS_2_SHADER_WRITE_BIT);
+  if (restir && thisFrame > 0u) recordRestir(command, frame, software, wideSoftware, pipelineBackend, uniforms);
+  if (wavefront) {
+    recordWavefront(command, frame, thisFrame, software, wideSoftware, pipelineBackend, profiling);
+  } else if (pipelineBackend) {
+    pathRayPipeline->trace(command, frame.pathPipelineSet, width, height);
+  } else {
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program->layout, 0, 1, &frame.pathSet, 0,
+                            nullptr);
+    vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
+  }
+  if (hybrid) {
+    VkMemoryBarrier2 guideBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    guideBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    guideBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    guideBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    guideBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo guideDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    guideDependency.memoryBarrierCount = 1;
+    guideDependency.pMemoryBarriers = &guideBarrier;
+    vkCmdPipelineBarrier2(command, &guideDependency);
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathGuideExportPipeline.handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathGuideExportProgram->layout,
+                            0, 1, &frame.pathGuideExportSet, 0, nullptr);
+    vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
+  }
+  transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, litWriter,
+                  VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  // Ends the trace interval: waits for the trace's last writes (the lit transition above).
+  profiler->mark(command, wavefront && profiling ? GpuStage::Resolve : GpuStage::Trace);
+  profiler->end(command);
+  if (pathReconstruction) pathReconstruction->record(command, frameIndex, lit, uniforms,
+      hashBytes(&resourceGeneration, sizeof(resourceGeneration), settingsKey()), gpuSamples, thisFrame > 0,
+      sceneScale() * 0.5f);
+}
+
+bool Renderer::restirActive() const {
+  return settings.pathDiEstimator == 1 && (settings.renderer == 2 || settings.renderer == 3 || settings.renderer == 5);
+}
+
+void Renderer::ensureRestirResources(bool active, bool guides, bool costs) {
+  const std::uint64_t pixels = active ? static_cast<std::uint64_t>(width) * height : 1u;
+  const std::uint64_t guidePixels = active && guides ? pixels : 1u, costPixels = active && costs ? pixels : 1u;
+  if (restirPixels == pixels && restirGuidePixels == guidePixels && restirCostPixels == costPixels) return;
+  // Submitted frames' descriptor sets name the old buffers: drain before replacing them.
+  if (restirPixels) context.waitIdle();
+  const VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  auto perPixel = [&](VkDeviceSize bytes, const char *name) {
+    return Buffer(context, pixels * bytes, storage, VMA_MEMORY_USAGE_AUTO, 0, name);
+  };
+  restirSurfaces[0] = perPixel(sizeof(pt::PtRestirSurface), "path.restir.surfaces.0");
+  restirSurfaces[1] = perPixel(sizeof(pt::PtRestirSurface), "path.restir.surfaces.1");
+  restirReservoirs = perPixel(sizeof(pt::PtReservoir), "path.restir.reservoirs");
+  restirFinals[0] = perPixel(sizeof(pt::PtReservoir), "path.restir.finals.0");
+  restirFinals[1] = perPixel(sizeof(pt::PtReservoir), "path.restir.finals.1");
+  restirShadows = perPixel(48, "path.restir.shadows");  // also the primary hits (24 bytes each)
+  restirResults = perPixel(48, "path.restir.results");
+  restirGuides = Buffer(context, guidePixels * 48, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.restir.guides");
+  restirCosts = Buffer(context, costPixels * 8, storage, VMA_MEMORY_USAGE_AUTO, 0, "path.restir.costs");
+  VkBufferUsageFlags counterUsage = storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  if (context.accelerationStructureSupported) counterUsage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  restirCounters = Buffer(context, 32 * sizeof(std::uint32_t), counterUsage, VMA_MEMORY_USAGE_AUTO, 0, "path.restir.counters");
+  restirControl = Buffer(context, 8 * sizeof(std::uint32_t), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VMA_MEMORY_USAGE_AUTO, 0, "path.restir.control");
+  restirCamera = Buffer(context, sizeof(pt::PtRestirCamera), storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VMA_MEMORY_USAGE_AUTO, 0, "path.restir.camera");
+  restirPixels = pixels;
+  restirGuidePixels = guidePixels;
+  restirCostPixels = costPixels;
+  restirHistory = false;
+  pathSetsGeneration = ~0u;
+  if (active) {
+    const double bytes = static_cast<double>(pixels) * 320.0 + static_cast<double>(guidePixels) * 48.0 +
+                         static_cast<double>(costPixels) * 8.0;
+    logInfo("ReSTIR DI buffers: {} pixels, {:.1f} MiB ({} bytes per pixel)", pixels, bytes / (1024.0 * 1024.0),
+            320 + (guides ? 48 : 0) + (costs ? 8 : 0));
+  }
+}
+
+// A ReSTIR DI frame: the backend's wavefront intersect stage at bounce 0 into
+// per-pixel hits, initial resampling with temporal reuse, spatial reuse with the final
+// reservoir's shadow record, and the backend's shadow stage adding the visible light to the
+// per-pixel results the path trace reads. History follows the reconstruction's reset rules.
+void Renderer::recordRestir(VkCommandBuffer command, FrameResources &frame, bool software, bool wideSoftware,
+                            bool pipelineBackend, const pt::PathUniforms &uniforms) {
+  const std::uint32_t pixels = width * height;
+  const std::uint32_t groups = (pixels + pt::kWavefrontGroup - 1u) / pt::kWavefrontGroup;
+  const std::uint32_t environmentVersion = environmentState->version();
+  std::uint64_t key = hashBytes(&resourceGeneration, sizeof(resourceGeneration), settingsKey());
+  key = hashBytes(&environmentVersion, sizeof(environmentVersion), key);
+  bool valid = restirHistory && key == restirHistoryKey && (uniforms.estimator.z & 1u) != 0u;
+  if (valid) {
+    const pt::PathUniforms &p = restirPreviousUniforms;
+    const float cut = sceneScale() * 0.5f;
+    if (pt::dot(pt::xyz(uniforms.cameraForward), pt::xyz(p.cameraForward)) < 0.85f ||
+        pt::length(pt::xyz(uniforms.cameraPosition) - pt::xyz(p.cameraPosition)) > cut ||
+        std::abs(pt::length(pt::xyz(uniforms.cameraRight)) - pt::length(pt::xyz(p.cameraRight))) > 1e-6f ||
+        std::abs(pt::length(pt::xyz(uniforms.cameraUp)) - pt::length(pt::xyz(p.cameraUp))) > 1e-6f ||
+        uniforms.lens.x != p.lens.x || uniforms.lens.y != p.lens.y)
+      valid = false;
+  }
+  pt::PtRestirCamera camera{};
+  camera.position = restirPreviousUniforms.cameraPosition;
+  camera.forward = restirPreviousUniforms.cameraForward;
+  camera.right = restirPreviousUniforms.cameraRight;
+  camera.up = restirPreviousUniforms.cameraUp;
+  camera.image = pt::uint4(width, height, valid ? 1u : 0u, uniforms.estimator.z);
+  // The shadow group (uint 16) holds this frame's shadow records: one per pixel.
+  std::array<std::uint32_t, 32> counters{};
+  counters[16] = groups; counters[17] = 1u; counters[18] = 1u;
+  counters[19] = pixels; counters[20] = 1u; counters[21] = 1u;
+  const std::array<std::uint32_t, 8> control{0u, pixels, 0u, pixels, 0u, 1u, 1u, 0u};
+  vkCmdUpdateBuffer(command, restirCamera.handle, 0, sizeof(camera), &camera);
+  vkCmdUpdateBuffer(command, restirCounters.handle, 0, sizeof(counters), counters.data());
+  vkCmdUpdateBuffer(command, restirControl.handle, 0, sizeof(control), control.data());
+
+  const VkPipelineStageFlags2 shaderStages =
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | (pipelineBackend ? context.rayTracingShaderStage() : VkPipelineStageFlags2{0});
+  auto barrier = [&]() {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = shaderStages | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = shaderStages;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(command, &d);
+  };
+  auto dispatch = [&](const Pipeline &pipeline, const Program &program, VkDescriptorSet set) {
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    vkCmdDispatch(command, groups, 1, 1);
+  };
+  barrier();
+  if (pipelineBackend) {
+    pathWaveIntersectRayPipeline->trace(command, frame.restirIntersectSet, pixels);
+  } else {
+    const Program &program = software ? (wideSoftware ? *pathWaveIntersectWideProgram : *pathWaveIntersectProgram)
+                                      : *pathWaveIntersectRtProgram;
+    const Pipeline &pipeline = software ? (wideSoftware ? pathWaveIntersectWidePipeline : pathWaveIntersectPipeline)
+                                        : pathWaveIntersectRtPipeline;
+    dispatch(pipeline, program, frame.restirIntersectSet);
+  }
+  barrier();
+  dispatch(pathRestirInitialPipeline, *pathRestirInitialProgram, frame.restirInitialSet[restirParity]);
+  barrier();
+  dispatch(pathRestirSpatialPipeline, *pathRestirSpatialProgram, frame.restirSpatialSet[restirParity]);
+  barrier();
+  if (pipelineBackend) {
+    pathWaveShadowRayPipeline->trace(command, frame.restirShadowSet, pixels);
+  } else {
+    const Program &program = software ? (wideSoftware ? *pathWaveShadowWideProgram : *pathWaveShadowProgram)
+                                      : *pathWaveShadowRtProgram;
+    const Pipeline &pipeline = software ? (wideSoftware ? pathWaveShadowWidePipeline : pathWaveShadowPipeline)
+                                        : pathWaveShadowRtPipeline;
+    dispatch(pipeline, program, frame.restirShadowSet);
+  }
+  barrier();
+  restirParity ^= 1u;
+  restirHistory = true;
+  restirHistoryKey = key;
+  restirPreviousUniforms = uniforms;
+}
+
+// Wavefront execution: the frame's pixels x S paths in whole-pixel batches. Per batch: for
+// every bounce an intersect, shade and shadow stage over GPU-resident queue counts, then one
+// resolve that adds the batch's pixels to the accumulators. Every stage boundary is a full
+// compute/ray/transfer/indirect barrier.
+void Renderer::recordWavefront(VkCommandBuffer command, FrameResources &frame, std::uint32_t thisFrame,
+                               bool software, bool wideSoftware, bool pipelineBackend, bool profiling) {
+  Program *intersectProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get()) : pathWaveIntersectRtProgram.get();
+  Program *shadowProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get()) : pathWaveShadowRtProgram.get();
+  Pipeline *intersectPipeline = pipelineBackend ? nullptr : software ? (wideSoftware ? &pathWaveIntersectWidePipeline : &pathWaveIntersectPipeline) : &pathWaveIntersectRtPipeline;
+  Pipeline *shadowPipeline = pipelineBackend ? nullptr : software ? (wideSoftware ? &pathWaveShadowWidePipeline : &pathWaveShadowPipeline) : &pathWaveShadowRtPipeline;
+  // Stages this backend's wavefront runs in: ray tracing only for pipeline launches.
+  const VkPipelineStageFlags2 shaderStages =
+      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | (pipelineBackend ? context.rayTracingShaderStage() : VkPipelineStageFlags2{0});
+  auto barrier = [&]() {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = shaderStages | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b.dstStageMask = shaderStages | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1;
+    d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(command, &d);
+  };
+  const bool indirectTrace = pipelineBackend && context.rayPipelineIndirectSupported;
+  const VkDeviceAddress counterAddress = indirectTrace ? pathWaveCounters.deviceAddress() : 0u;
+  // Counter group g (0, 1: continuation parity; 2: shadow) at uint 8g: dispatch x, y, z, then
+  // count, 1, 1 (the indirect trace dimensions), overflow, reserved.
+  auto intersect = [&](std::uint32_t parity) {
+    if (pipelineBackend) {
+      if (indirectTrace) pathWaveIntersectRayPipeline->traceIndirect(command, frame.pathWaveIntersectSet, counterAddress + parity * 32u + 12u);
+      else pathWaveIntersectRayPipeline->trace(command, frame.pathWaveIntersectSet, pathWaveCapacity);
+    } else {
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipeline->handle);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, intersectProgram->layout, 0, 1, &frame.pathWaveIntersectSet, 0, nullptr);
+      vkCmdDispatchIndirect(command, pathWaveCounters.handle, parity * 32u);
+    }
+  };
+  const bool fused = waveFusionActive();
+  const bool ownBvh = settings.renderer == 3, wideBvh = ownBvh && settings.pathBvhWidth != 0;
+  const Pipeline &fusedPipeline = !ownBvh ? pathWaveFusedRtPipeline : wideBvh ? pathWaveFusedWidePipeline : pathWaveFusedPipeline;
+  const Program *fusedProgram = !ownBvh ? pathWaveFusedRtProgram.get() : wideBvh ? pathWaveFusedWideProgram.get()
+                                                                          : pathWaveFusedProgram.get();
+  auto shade = [&](std::uint32_t parity) {
+    const bool subgroup = waveSubgroupAllocationActive();
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      fused ? fusedPipeline.handle :
+                      subgroup ? pathWaveShadePipeline.handle : pathWaveShadeAtomicPipeline.handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            (fused ? fusedProgram : subgroup ? pathWaveShadeProgram.get() : pathWaveShadeAtomicProgram.get())->layout,
+                            0, 1, &frame.pathWaveShadeSet, 0, nullptr);
+    vkCmdDispatchIndirect(command, pathWaveCounters.handle, parity * 32u);
+  };
+  auto shadow = [&]() {
+    if (pipelineBackend) {
+      if (indirectTrace) pathWaveShadowRayPipeline->traceIndirect(command, frame.pathWaveShadowSet, counterAddress + 64u + 12u);
+      else pathWaveShadowRayPipeline->trace(command, frame.pathWaveShadowSet, pathWaveCapacity);
+    } else {
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipeline->handle);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, shadowProgram->layout, 0, 1, &frame.pathWaveShadowSet, 0, nullptr);
+      vkCmdDispatchIndirect(command, pathWaveCounters.handle, 64u);
+    }
+  };
+  // Groups of 128 threads; a tiled group covers 128 / S whole pixels (path_wavefront_resolve).
+  auto resolve = [&](std::uint32_t pixels, std::uint32_t samples) {
+    const std::uint32_t pixelsPerGroup = samples > 0u && samples <= 128u ? 128u / samples : 128u;
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathWaveResolvePipeline.handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathWaveResolveProgram->layout, 0, 1, &frame.pathWaveResolveSet, 0, nullptr);
+    vkCmdDispatch(command, (pixels + pixelsPerGroup - 1u) / pixelsPerGroup, 1, 1);
+  };
+  const std::uint32_t pixels = width * height;
+  if (thisFrame == 0u) {
+    // Target reached: rewrite this frame's lit image from the accumulator.
+    const std::array<std::uint32_t, 8> control{0u, pathWaveCapacity, 0u, 0u, 0u, 1u, 0u, 0u};
+    vkCmdUpdateBuffer(command, pathWaveControl.handle, 0, sizeof(control), control.data());
+    barrier();
+    resolve(pixels, 0u);
+    barrier();
+    if (profiling) profiler->mark(command, GpuStage::Resolve);
+    return;
+  }
+  const std::uint32_t batchPaths = pt::wavefrontBatchPaths(pathWaveCapacity, thisFrame);
+  if (batchPaths == 0u) throw std::runtime_error("wavefront batch cannot hold one pixel's samples");
+  const std::uint64_t totalPaths = static_cast<std::uint64_t>(pixels) * thisFrame;
+  const std::uint32_t bounces = static_cast<std::uint32_t>(std::max(1, settings.pathBounces));
+  // Queue reservations are bounded by the capacity; a test-only limit below it provokes the
+  // overflow path, which must be reported, never silently absorbed.
+  const std::uint32_t queueCapacity = settings.pathWaveQueueLimit > 0
+      ? std::min(pathWaveCapacity, static_cast<std::uint32_t>(settings.pathWaveQueueLimit)) : pathWaveCapacity;
+  for (std::uint64_t base = 0; base < totalPaths; base += batchPaths) {
+    const std::uint32_t count = static_cast<std::uint32_t>(std::min<std::uint64_t>(batchPaths, totalPaths - base));
+    const std::uint32_t firstPixel = static_cast<std::uint32_t>(base / thisFrame);
+    const std::array<std::uint32_t, 32> counters{(count + pt::kWavefrontGroup - 1u) / pt::kWavefrontGroup, 1u, 1u, count, 1u, 1u, 0u, 0u,
+                                                 0u, 1u, 1u, 0u, 1u, 1u, 0u, 0u,
+                                                 0u, 1u, 1u, 0u, 1u, 1u, 0u, 0u,
+                                                 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    std::array<std::uint32_t, 8> control{0u, queueCapacity, static_cast<std::uint32_t>(base), count,
+                                         0u, thisFrame, 1u, firstPixel};
+    // The frame's overflow total (uint 24) is cleared by the first batch only.
+    vkCmdUpdateBuffer(command, pathWaveCounters.handle, 0, base == 0 ? 32u * 4u : 24u * 4u, counters.data());
+    vkCmdUpdateBuffer(command, pathWaveControl.handle, 0, sizeof(control), control.data());
+    barrier();
+    if (profiling) profiler->mark(command, GpuStage::Setup);
+    std::uint32_t parity = 0u;
+    for (std::uint32_t bounce = 0; bounce <= bounces; ++bounce) {
+      const std::uint32_t next = 1u - parity;
+      if (bounce > 0u) {
+        // The next continuation queue and the shadow queue start empty; the shadow queue
+        // follows group 1, so parity 0's reset is one write and parity 1's two.
+        const std::array<std::uint32_t, 8> empty{0u, 1u, 1u, 0u, 1u, 1u, 0u, 0u};
+        vkCmdUpdateBuffer(command, pathWaveCounters.handle, next * 32u, sizeof(empty), empty.data());
+        vkCmdUpdateBuffer(command, pathWaveCounters.handle, 64u, sizeof(empty), empty.data());
+        control[0] = parity;
+        control[4] = bounce;
+        vkCmdUpdateBuffer(command, pathWaveControl.handle, 0, sizeof(control), control.data());
+        barrier();
+        if (profiling) profiler->mark(command, GpuStage::Setup);
+      }
+      if (!fused) {
+        intersect(parity);
+        barrier();
+        if (profiling) profiler->mark(command, GpuStage::Intersect);
+      }
+      shade(parity);
+      barrier();
+      if (profiling) {
+        profiler->mark(command, GpuStage::Shade);
+        profiler->copyCounter(command, pathWaveCounters.handle, next * 32u + 12u, 0);
+        profiler->copyCounter(command, pathWaveCounters.handle, 64u + 12u, 1);
+      }
+      shadow();
+      barrier();
+      if (profiling) profiler->mark(command, GpuStage::Shadow);
+      parity = next;
+    }
+    resolve(count / thisFrame, thisFrame);
+    barrier();
+    if (profiling) profiler->mark(command, GpuStage::Resolve);
+  }
+  profiler->watchOverflow(command, pathWaveCounters.handle, 24u * 4u);
+}
+
+const GpuProfiler *Renderer::finishProfiling() {
+  if (!profiler) return nullptr;
+  profiler->finish();
+  stats.traceGpuMilliseconds = static_cast<float>(profiler->latest().traceMilliseconds);
+  return profiler.get();
+}
+
+void Renderer::recordCpuTrace(VkCommandBuffer command, const Camera &camera) {
+  if (!cpuTracer) cpuTracer = std::make_unique<pt::CpuTracer>(static_cast<unsigned>(std::max(0, settings.cpuThreads)));
+  if (!activeScene) return;
+  const std::array<std::uint32_t, 3> sceneKey{sceneVersion, environmentState->version(),
+                                               static_cast<std::uint32_t>(settings.cpuIntersector)};
+  if (!cpuScene || sceneKey != cpuSceneKey) {
+    buildCpuScene();
+    cpuSceneKey = sceneKey;
+    cpuTracer->setScene(cpuScene);
+    cpuStartedKey = 0;
+  }
+  // Anything the accumulation key sees restarts the tracer: the view, settings, targets, resources.
+  if (cpuStartedKey == 0 || accumulationKey != cpuStartedKey) {
+    pt::CpuFrame frame;
+    frame.uniforms = makePathUniforms(camera);
+    frame.materials.resize(activeScene->materials.size());
+    static_assert(sizeof(pt::Material) == sizeof(MaterialUniforms), "materials must share a layout");
+    static_assert(sizeof(pt::Light) == sizeof(LightRecord), "lights must share a layout");
+    for (std::size_t m = 0; m < activeScene->materials.size(); ++m)
+      std::memcpy(&frame.materials[m], &activeScene->materials[m].uniforms, sizeof(pt::Material));
+    frame.lights.resize(hostLights.size());
+    if (!hostLights.empty()) std::memcpy(frame.lights.data(), hostLights.data(), hostLights.size() * sizeof(pt::Light));
+    frame.width = width;
+    frame.height = height;
+    frame.targetSamples = static_cast<std::uint32_t>(std::max(0, settings.pathTargetSamples));
+    frame.intersector = settings.cpuIntersector == 1 && cpuScene->embree ? 1u :
+                        settings.cpuIntersector == 2 && cpuScene->wideAvx2 ? 2u : 0u;
+    frame.denoise = settings.pathDenoise && !settings.pathTemporal;
+    cpuTracer->start(std::move(frame));
+    cpuImage = {}; // old display may remain visible, but it cannot supply current SPP/guides/capture
+    cpuUploaded.fill(0);
+    cpuStartedKey = accumulationKey;
+  }
+
+  pt::CpuTracer::Image image;
+  const bool published = cpuTracer->latest(image, cpuImage.version, false);
+  freshSampleFrame[frameIndex] = published;
+  if (published) cpuImage = std::move(image);
+  if (published && settings.pathTemporal && !cpuImage.guides.empty()) {
+    const auto guideWidth = static_cast<std::uint32_t>(cpuImage.uniforms.image.x);
+    const auto guideHeight = static_cast<std::uint32_t>(cpuImage.uniforms.image.y);
+    if (!pathReconstruction || !pathReconstruction->fits(guideWidth, guideHeight)) {
+      context.waitIdle();
+      pathReconstruction.reset(); // release the old extent before allocating the new history
+      pathReconstruction = std::make_unique<PathReconstruction>(context, guideWidth, guideHeight);
+    }
+  }
+  stats.samples = cpuImage.samples;
+  stats.previewScale = cpuImage.previewScale;
+  stats.pathsPerSecond = cpuTracer->samplesPerSecond();
+
+  // This frame's lit image gets the latest mean; each of the frames in flight has its own.
+  Image &lit = litColor[frameIndex];
+  const bool fits = cpuImage.version != 0 && cpuImage.width == width && cpuImage.height == height;
+  if (fits && (cpuUploaded[frameIndex] != cpuImage.version || pathReconstruction)) {
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4 * sizeof(std::uint16_t);
+    Buffer &staging = cpuStaging[frameIndex];
+    if (!staging || staging.size < bytes)
+      staging = Buffer(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO,
+                       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                       "cpu.upload");
+    staging.write(cpuImage.half.data(), static_cast<std::size_t>(bytes));
+    transitionImage(command, lit, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(command, staging.handle, lit.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    cpuUploaded[frameIndex] = cpuImage.version;
+  } else if (lit.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    // Nothing traced yet into an image nothing has written: black, in the layout bloom reads.
+    transitionImage(command, lit, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(command, lit.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+    transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+  }
+  if (pathReconstruction && fits && !cpuImage.guides.empty()) {
+    if (published) pathReconstruction->upload(command, frameIndex, cpuImage.guides);
+    pathReconstruction->record(command, frameIndex, lit, cpuImage.uniforms,
+        hashBytes(&resourceGeneration, sizeof(resourceGeneration), settingsKey()), cpuImage.samples, published,
+        sceneScale() * 0.5f);
+  }
 }
 
 } // namespace basalt

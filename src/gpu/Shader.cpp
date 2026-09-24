@@ -3,6 +3,7 @@
 #include "core/Log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <utility>
@@ -27,6 +28,12 @@ const char *stageName(VkShaderStageFlagBits stage) {
   case VK_SHADER_STAGE_VERTEX_BIT: return "vertex";
   case VK_SHADER_STAGE_FRAGMENT_BIT: return "fragment";
   case VK_SHADER_STAGE_COMPUTE_BIT: return "compute";
+  case VK_SHADER_STAGE_RAYGEN_BIT_KHR: return "ray_generation";
+  case VK_SHADER_STAGE_MISS_BIT_KHR: return "miss";
+  case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: return "closest_hit";
+  case VK_SHADER_STAGE_ANY_HIT_BIT_KHR: return "any_hit";
+  case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: return "intersection";
+  case VK_SHADER_STAGE_CALLABLE_BIT_KHR: return "callable";
   default: throw Error("unsupported shader stage");
   }
 }
@@ -35,6 +42,8 @@ const char *stageName(VkShaderStageFlagBits stage) {
 
 const std::string &shaderDirectory() {
   static const std::string directory = [] {
+    // Diagnostics (tools/shader_stats.cpp) read another build's shaders.
+    if (const char *override = std::getenv("BASALT_SHADER_DIRECTORY")) return std::string(override);
     std::filesystem::path beside = std::filesystem::path(BASALT_SHADER_DIR);
     if (std::filesystem::exists(beside)) return beside.string();
     return std::string("shaders");

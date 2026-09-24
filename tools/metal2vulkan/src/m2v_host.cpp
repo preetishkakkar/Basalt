@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -207,6 +208,9 @@ Stage readStage(const std::string &reflectionPath, const std::string &stage, con
   const auto &contract = root.at("binding_contract");
   if (!contract.isObject() || contract.text("policy") != "set_per_stage_class_offset") throw std::runtime_error("unsupported reflection binding contract");
   const bool compute = stage == "compute";
+  // Ray stages store like kernels: writable buffers, storage images and texel atomics need no stage feature.
+  const bool storing = compute || isRayStage(stage);
+  // A ray stage binds set 0, shared by every stage of its pipeline (docs/RAY_PIPELINES.md).
   // A mesh or object entry binds in set 0, as a vertex entry does; only the fragment stage uses set 1.
   const std::uint32_t expectedSet = stage == "fragment" ? 1u : stage == "object" ? 2u : 0u;
   // A post-tessellation vertex entry binds in set 0, as a vertex entry does.
@@ -305,7 +309,7 @@ Stage readStage(const std::string &reflectionPath, const std::string &stage, con
       throw std::runtime_error("reflected buffer " + buffer.name + " violates the descriptor contract");
     // A fragment entry may store into a buffer (it declares fragmentStoresAndAtomics for it); the
     // vertex and mesh stages bind read-only buffers only (docs/RESOURCE_BINDINGS.md).
-    if (!buffer.readOnly && !compute && stage != "fragment")
+    if (!buffer.readOnly && !storing && stage != "fragment")
       throw std::runtime_error(stage + " buffer " + buffer.name + " is not read-only");
     if (const auto *fields = entryObject.find("fields"); fields && fields->isArray())
       for (const auto &field : fields->array) {
@@ -365,14 +369,14 @@ Stage readStage(const std::string &reflectionPath, const std::string &stage, con
             throw std::runtime_error("reflected multisampled textures require single readable 2D images");
           handle.storage = false;
         }
-        if (handle.dimension == "buffer" && (handle.view != "buffer" || handle.access == "sample" || handle.depth || handle.count != 1 || (stage != "compute" && handle.access != "read")))
+        if (handle.dimension == "buffer" && (handle.view != "buffer" || handle.access == "sample" || handle.depth || handle.count != 1 || (!storing && handle.access != "read")))
           throw std::runtime_error("reflected texel buffers require single readable textures or writable kernel textures");
         if (handle.dimension == "buffer" && handle.atomic &&
             (handle.access != "read_write" || (handle.component != "u32" && handle.component != "i32") ||
              handle.format != (handle.component == "u32" ? "r32uint" : "r32sint")))
           throw std::runtime_error("reflected atomic texel buffers require matching R32 integer read_write textures");
         if (handle.dimension != "buffer" && handle.atomic &&
-            (stage != "compute" || handle.count != 1 || handle.depth || handle.multisampled ||
+            (!storing || handle.count != 1 || handle.depth || handle.multisampled ||
              handle.access != "read_write" || (handle.component != "u32" && handle.component != "i32") ||
              handle.format != (handle.component == "u32" ? "r32uint" : "r32sint")))
           throw std::runtime_error("reflected atomic images require single matching R32 integer read_write kernel textures");
@@ -459,7 +463,8 @@ Stage readStage(const std::string &reflectionPath, const std::string &stage, con
     }
   if (!result.accelerationStructures.empty())
     for (const char *needed : {"rayQuery", "accelerationStructure"})
-      if (std::find(result.requiredFeatures.begin(), result.requiredFeatures.end(), needed) == result.requiredFeatures.end())
+      // A ray stage traces through the pipeline; only an inline query in it needs rayQuery.
+      if ((std::string(needed) != "rayQuery" || !isRayStage(stage)) && std::find(result.requiredFeatures.begin(), result.requiredFeatures.end(), needed) == result.requiredFeatures.end())
         throw std::runtime_error(std::string("a stage with acceleration structures must require ") + needed);
   if (const auto *queries = root.find("sample_queries"); queries && queries->isObject()) {
     result.sampleQueries.used = true;
@@ -714,6 +719,50 @@ Stage readStage(const std::string &reflectionPath, const std::string &stage, con
     if (std::find(result.requiredFeatures.begin(), result.requiredFeatures.end(), "bufferDeviceAddress") == result.requiredFeatures.end())
       throw std::runtime_error("reflected device-address table without the bufferDeviceAddress feature");
   }
+  if (isRayStage(stage)) {
+    // A ray stage: its interfaces and shader calls. A reflection from before the profile, or one that
+    // says a ray stage without the block, is refused rather than read as something else.
+    const auto *block = root.find("ray_pipeline");
+    if (!block || !block->isObject() || block->integer("version", 1) != 1 || block->integer("descriptor_set", 0) != 0)
+      throw std::runtime_error("reflection of ray stage " + entry + " lacks a version 1 ray_pipeline block");
+    auto &ray = result.rayPipeline;
+    ray.present = true;
+    ray.traces = block->flag("traces");
+    ray.executesCallables = block->flag("executes_callables");
+    ray.reportsIntersections = block->flag("reports_intersections");
+    ray.ignoresIntersections = block->flag("ignores_intersections");
+    ray.terminatesRays = block->flag("terminates_rays");
+    for (const auto &name : block->list("builtins")) {
+      if (name.kind != Json::Kind::String) throw std::runtime_error("reflection ray_pipeline builtins must be strings");
+      ray.builtins.push_back(name.string);
+    }
+    static const std::set<std::string> kinds{"payload", "incoming_payload", "callable_data", "incoming_callable_data", "hit_attribute", "shader_record"};
+    std::set<std::string> single;
+    for (const auto &described : block->list("interfaces")) {
+      if (!described.isObject()) throw std::runtime_error("reflection ray_pipeline interfaces must be objects");
+      RayInterface interface;
+      interface.kind = described.text("kind");
+      interface.name = described.text("name");
+      interface.fingerprint = described.text("fingerprint");
+      interface.readOnly = described.flag("read_only");
+      interface.packedBytes = static_cast<std::uint32_t>(described.integer("packed_bytes", 1 << 20));
+      interface.size = static_cast<std::uint32_t>(described.integer("size", 1 << 20));
+      interface.alignment = static_cast<std::uint32_t>(described.integer("alignment", 256));
+      if (!kinds.contains(interface.kind) || interface.fingerprint.size() != 16 || !interface.size)
+        throw std::runtime_error("reflected ray interface " + interface.name + " has an unknown kind or no fingerprint");
+      if (interface.kind != "payload" && interface.kind != "callable_data" && !single.insert(interface.kind).second)
+        throw std::runtime_error("reflection repeats the ray interface " + interface.kind);
+      for (const auto &field : described.list("fields")) {
+        if (!field.isObject()) throw std::runtime_error("reflected ray interface fields must be objects");
+        interface.fields.push_back({field.text("name"), field.text("type"), static_cast<std::uint32_t>(field.integer("offset", 1 << 20)),
+                                    static_cast<std::uint32_t>(field.integer("count", 1024)), static_cast<std::uint32_t>(field.integer("size", 1 << 20))});
+      }
+      if (interface.fields.empty()) throw std::runtime_error("reflected ray interface " + interface.name + " has no fields");
+      ray.interfaces.push_back(std::move(interface));
+    }
+    if (std::find(result.requiredFeatures.begin(), result.requiredFeatures.end(), "rayTracingPipeline") == result.requiredFeatures.end())
+      throw std::runtime_error("reflected ray stage " + entry + " does not require rayTracingPipeline");
+  } else if (root.find("ray_pipeline")) throw std::runtime_error("reflection of a " + stage + " entry carries a ray_pipeline block");
   if (const auto *names = root.find("nullable"); names && names->isArray()) {
     // Nullable resources: buffer pointer parameters (compute) or single textures (fragment); the word follows the plan block.
     for (const auto &name : names->array) result.nullable.push_back(name.string);
@@ -1230,6 +1279,11 @@ bool supportsProperty(VkPhysicalDevice physical, const std::string &name) {
     return (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) != 0 &&
            (subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0;
   // SIMD-group matrices keep one matrix row per lane of the first eight (docs/SUBGROUPS.md).
+  if (name == "subgroupInRayStages") {
+    constexpr VkShaderStageFlags ray = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                                       VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+    return (subgroup.supportedStages & ray) == ray;
+  }
   if (name == "subgroupWidth8") return subgroup.subgroupSize >= 8 && (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT);
   // The SIMD-group operation classes (docs/SUBGROUPS.md): a kernel that uses one needs the device to
   // report the class for the compute stage, which Vulkan requires of every device for the basic class.
@@ -1575,6 +1629,221 @@ Specialization functionConstantSpecialization(const Stage &stage, const std::vec
 
 std::array<VkSpecializationMapEntry, 3> workgroupSizeSpecialization() {
   return {VkSpecializationMapEntry{0, 0, 4}, VkSpecializationMapEntry{1, 4, 4}, VkSpecializationMapEntry{2, 8, 4}};
+}
+
+// ---------------------------------------------------------------- ray-tracing pipelines
+RayPipelineInterface rayPipelineInterface(const std::vector<Stage> &stages) {
+  RayPipelineInterface result;
+  result.maxHitAttributeSize = 8;
+  for (const auto &stage : stages)
+    for (const auto &interface : stage.rayPipeline.interfaces) {
+      if (interface.kind == "payload" || interface.kind == "incoming_payload" || interface.kind == "callable_data" ||
+          interface.kind == "incoming_callable_data")
+        result.maxPayloadSize = std::max(result.maxPayloadSize, interface.size);
+      if (interface.kind == "hit_attribute") result.maxHitAttributeSize = std::max(result.maxHitAttributeSize, interface.size);
+    }
+  return result;
+}
+void RetirementQueue::retire(std::uint64_t lastUse, std::function<void()> destroy) { items.emplace_back(lastUse, std::move(destroy)); }
+void RetirementQueue::completed(std::uint64_t frame) {
+  std::vector<std::pair<std::uint64_t, std::function<void()>>> kept;
+  for (auto &item : items) {
+    if (item.first <= frame) item.second();
+    else kept.push_back(std::move(item));
+  }
+  items = std::move(kept);
+}
+void RetirementQueue::flush() {
+  for (auto &item : items) item.second();
+  items.clear();
+}
+bool isRayStage(const std::string &stage) {
+  return stage == "ray_generation" || stage == "miss" || stage == "closest_hit" || stage == "any_hit" || stage == "intersection" || stage == "callable";
+}
+VkShaderStageFlagBits rayShaderStage(const std::string &stage) {
+  if (stage == "ray_generation") return VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+  if (stage == "miss") return VK_SHADER_STAGE_MISS_BIT_KHR;
+  if (stage == "closest_hit") return VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+  if (stage == "any_hit") return VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+  if (stage == "intersection") return VK_SHADER_STAGE_INTERSECTION_BIT_KHR;
+  if (stage == "callable") return VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+  throw std::runtime_error("not a ray-pipeline stage: " + stage);
+}
+
+std::vector<std::string> checkRayShaderGroups(const std::vector<Stage> &stages, const std::vector<RayShaderGroup> &groups) {
+  for (const auto &stage : stages)
+    if (!isRayStage(stage.stage) || !stage.rayPipeline.present) throw std::runtime_error("stage " + stage.entry + " is not a ray-pipeline stage");
+  // The payloads and callable data some stage sends: a receiver of anything else could never run.
+  std::set<std::string> sentPayloads, sentData;
+  for (const auto &stage : stages)
+    for (const auto &interface : stage.rayPipeline.interfaces) {
+      if (interface.kind == "payload") sentPayloads.insert(interface.fingerprint);
+      if (interface.kind == "callable_data") sentData.insert(interface.fingerprint);
+    }
+  for (const auto &stage : stages) {
+    if (const auto *incoming = stage.rayPipeline.find("incoming_payload"); incoming && !sentPayloads.contains(incoming->fingerprint))
+      throw std::runtime_error(stage.entry + " receives a payload (" + incoming->name + ") that no stage of the pipeline traces with");
+    if (const auto *incoming = stage.rayPipeline.find("incoming_callable_data"); incoming && !sentData.contains(incoming->fingerprint))
+      throw std::runtime_error(stage.entry + " receives callable data (" + incoming->name + ") that no stage of the pipeline passes");
+  }
+  auto slot = [&](std::uint32_t index, const char *role, const char *expected, std::size_t group) -> const Stage * {
+    if (index == VK_SHADER_UNUSED_KHR) return nullptr;
+    if (index >= stages.size()) throw std::runtime_error("shader group " + std::to_string(group) + " names stage " + std::to_string(index) + " of " + std::to_string(stages.size()));
+    if (stages[index].stage != expected)
+      throw std::runtime_error("shader group " + std::to_string(group) + "'s " + role + " slot holds " + stages[index].entry + ", a " + stages[index].stage + " stage");
+    return &stages[index];
+  };
+  std::vector<std::string> roles;
+  bool raygen = false;
+  for (std::size_t g = 0; g < groups.size(); ++g) {
+    const auto &group = groups[g];
+    const auto name = "shader group " + std::to_string(g);
+    if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR) {
+      if (group.closestHit != VK_SHADER_UNUSED_KHR || group.anyHit != VK_SHADER_UNUSED_KHR || group.intersection != VK_SHADER_UNUSED_KHR)
+        throw std::runtime_error(name + " is general, so it has no hit or intersection stage");
+      if (group.general >= stages.size()) throw std::runtime_error(name + " is general and names no stage");
+      const auto &kind = stages[group.general].stage;
+      if (kind != "ray_generation" && kind != "miss" && kind != "callable")
+        throw std::runtime_error(name + " is general, which holds a ray_generation, miss or callable stage, not " + kind);
+      roles.push_back(kind == "ray_generation" ? "raygen" : kind);
+      raygen |= kind == "ray_generation";
+      continue;
+    }
+    const bool procedural = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+    if (!procedural && group.type != VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR) throw std::runtime_error(name + " has an unknown type");
+    if (group.general != VK_SHADER_UNUSED_KHR) throw std::runtime_error(name + " is a hit group, so it has no general stage");
+    const auto *closest = slot(group.closestHit, "closest-hit", "closest_hit", g);
+    const auto *any = slot(group.anyHit, "any-hit", "any_hit", g);
+    const auto *intersection = slot(group.intersection, "intersection", "intersection", g);
+    if (procedural && !intersection) throw std::runtime_error(name + " is a procedural hit group without an intersection stage");
+    if (!procedural && intersection) throw std::runtime_error(name + " is a triangle hit group, which takes no intersection stage");
+    // Both hit stages of a group receive the same ray's payload and the same attributes.
+    const auto *closestPayload = closest ? closest->rayPipeline.find("incoming_payload") : nullptr;
+    const auto *anyPayload = any ? any->rayPipeline.find("incoming_payload") : nullptr;
+    if (closestPayload && anyPayload && closestPayload->fingerprint != anyPayload->fingerprint)
+      throw std::runtime_error(name + ": " + closest->entry + " and " + any->entry + " receive different payloads");
+    for (const auto *hitStage : {closest, any}) {
+      if (!hitStage) continue;
+      const auto *attributes = hitStage->rayPipeline.find("hit_attribute");
+      if (!attributes) continue;
+      if (procedural) {
+        const auto *reported = intersection->rayPipeline.find("hit_attribute");
+        if (!reported || reported->fingerprint != attributes->fingerprint)
+          throw std::runtime_error(name + ": " + hitStage->entry + " reads hit attributes " + intersection->entry + " does not report");
+      } else {
+        // A triangle reports its two barycentric weights: one float2, or two floats.
+        const bool pair = (attributes->fields.size() == 1 && attributes->fields[0].type == "f32x2" && attributes->fields[0].count == 1) ||
+                          (attributes->fields.size() == 1 && attributes->fields[0].type == "f32" && attributes->fields[0].count == 2) ||
+                          (attributes->fields.size() == 2 && attributes->fields[0].type == "f32" && attributes->fields[1].type == "f32" &&
+                           attributes->fields[0].count == 1 && attributes->fields[1].count == 1);
+        if (!pair) throw std::runtime_error(name + ": a triangle hit group's attributes are its two barycentric floats, which " + hitStage->entry + " does not read");
+      }
+    }
+    roles.push_back("hit");
+  }
+  if (!raygen) throw std::runtime_error("a ray pipeline needs a ray_generation group");
+  return roles;
+}
+
+std::vector<RayDescriptorBinding> rayDescriptorBindings(const std::vector<Stage> &stages) {
+  std::map<std::uint32_t, RayDescriptorBinding> merged;
+  for (const auto &stage : stages) {
+    const auto bit = rayShaderStage(stage.stage);
+    for (const auto &binding : descriptorBindings(stage)) {
+      if (binding.set != 0) throw std::runtime_error(stage.entry + " binds set " + std::to_string(binding.set) + "; a ray pipeline shares set 0");
+      auto [it, fresh] = merged.try_emplace(binding.binding, RayDescriptorBinding{binding.binding, binding.type, binding.count, 0});
+      if (!fresh && (it->second.type != binding.type || it->second.count != binding.count))
+        throw std::runtime_error("binding " + std::to_string(binding.binding) + " of " + stage.entry +
+                                 " disagrees in type or count with another stage of the pipeline");
+      it->second.stages |= bit;
+    }
+  }
+  std::vector<RayDescriptorBinding> result;
+  for (auto &[binding, entry] : merged) result.push_back(entry);
+  return result;
+}
+
+void checkRayRecursionDepth(const std::vector<Stage> &stages, std::uint32_t depth, const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &properties) {
+  std::uint32_t minimum = 1;
+  for (const auto &stage : stages)
+    if ((stage.stage == "closest_hit" || stage.stage == "miss") && stage.rayPipeline.traces) minimum = 2;
+  if (depth < minimum)
+    throw std::runtime_error("maxPipelineRayRecursionDepth " + std::to_string(depth) + " is below the " + std::to_string(minimum) +
+                             " the pipeline's tracing stages need");
+  if (depth > properties.maxRayRecursionDepth)
+    throw std::runtime_error("maxPipelineRayRecursionDepth " + std::to_string(depth) + " exceeds the device's maxRayRecursionDepth " +
+                             std::to_string(properties.maxRayRecursionDepth));
+}
+
+ShaderBindingTable buildShaderBindingTable(const std::vector<Stage> &stages, const std::vector<RayShaderGroup> &groups,
+                                           const VkPhysicalDeviceRayTracingPipelinePropertiesKHR &properties,
+                                           const std::vector<std::byte> &handles, const ShaderBindingRecord &raygen,
+                                           const std::vector<ShaderBindingRecord> &miss, const std::vector<ShaderBindingRecord> &hit,
+                                           const std::vector<ShaderBindingRecord> &callable) {
+  const auto roles = checkRayShaderGroups(stages, groups);
+  const std::uint64_t handleSize = properties.shaderGroupHandleSize, handleAlignment = properties.shaderGroupHandleAlignment,
+                      baseAlignment = properties.shaderGroupBaseAlignment;
+  if (!handleSize || !handleAlignment || !baseAlignment || (handleAlignment & (handleAlignment - 1)) || (baseAlignment & (baseAlignment - 1)))
+    throw std::runtime_error("the device's shader group handle size and alignments are not usable");
+  if (handles.size() != groups.size() * handleSize) throw std::runtime_error("expected one shader group handle per group");
+  auto align = [](std::uint64_t value, std::uint64_t alignment) {
+    if (value > UINT64_MAX - alignment) throw std::runtime_error("shader binding table size overflows");
+    return (value + alignment - 1) / alignment * alignment;
+  };
+  // The shader record bytes a group's stages read: the largest shader_record among them.
+  auto recordBytes = [&](std::uint32_t group) {
+    std::uint64_t bytes = 0;
+    for (const auto index : {groups[group].general, groups[group].closestHit, groups[group].anyHit, groups[group].intersection})
+      if (index != VK_SHADER_UNUSED_KHR)
+        if (const auto *record = stages[index].rayPipeline.find("shader_record")) bytes = std::max<std::uint64_t>(bytes, record->size);
+    return bytes;
+  };
+  auto check = [&](const std::vector<ShaderBindingRecord> &records, const char *role, const char *region) {
+    std::uint64_t data = 0;
+    for (const auto &record : records) {
+      if (record.group >= groups.size()) throw std::runtime_error(std::string(region) + " record names group " + std::to_string(record.group) + " of " + std::to_string(groups.size()));
+      if (roles[record.group] != role)
+        throw std::runtime_error(std::string(region) + " record names group " + std::to_string(record.group) + ", a " + roles[record.group] + " group");
+      if (record.data.size() < recordBytes(record.group))
+        throw std::runtime_error(std::string(region) + " record for group " + std::to_string(record.group) + " holds " + std::to_string(record.data.size()) +
+                                 " bytes of the " + std::to_string(recordBytes(record.group)) + "-byte shader record its stages read");
+      data = std::max<std::uint64_t>(data, record.data.size());
+    }
+    const auto stride = align(handleSize + data, handleAlignment);
+    if (stride > properties.maxShaderGroupStride)
+      throw std::runtime_error(std::string(region) + " records need a " + std::to_string(stride) + "-byte stride; the device allows " + std::to_string(properties.maxShaderGroupStride));
+    return stride;
+  };
+  const std::vector<ShaderBindingRecord> raygenRecords{raygen};
+  // The raygen region is one record whose size is its stride, and that stride is base-aligned.
+  const auto raygenStride = align(check(raygenRecords, "raygen", "raygen"), baseAlignment);
+  const auto missStride = check(miss, "miss", "miss"), hitStride = check(hit, "hit", "hit"), callableStride = check(callable, "callable", "callable");
+  ShaderBindingTable table;
+  std::uint64_t offset = 0;
+  auto region = [&](VkStridedDeviceAddressRegionKHR &target, std::uint64_t stride, std::size_t count) {
+    if (!count) return;
+    offset = align(offset, baseAlignment);
+    if (count > UINT64_MAX / stride) throw std::runtime_error("shader binding table size overflows");
+    target = {offset, stride, stride * count};
+    offset += stride * count;
+  };
+  region(table.raygen, raygenStride, 1);
+  region(table.miss, missStride, miss.size());
+  region(table.hit, hitStride, hit.size());
+  region(table.callable, callableStride, callable.size());
+  table.bytes.assign(static_cast<std::size_t>(offset), std::byte{0});
+  auto fill = [&](const VkStridedDeviceAddressRegionKHR &target, const std::vector<ShaderBindingRecord> &records) {
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      const auto at = static_cast<std::size_t>(target.deviceAddress + target.stride * i);
+      std::memcpy(table.bytes.data() + at, handles.data() + records[i].group * handleSize, static_cast<std::size_t>(handleSize));
+      if (!records[i].data.empty()) std::memcpy(table.bytes.data() + at + handleSize, records[i].data.data(), records[i].data.size());
+    }
+  };
+  fill(table.raygen, raygenRecords);
+  fill(table.miss, miss);
+  fill(table.hit, hit);
+  fill(table.callable, callable);
+  return table;
 }
 
 } // namespace m2v::host

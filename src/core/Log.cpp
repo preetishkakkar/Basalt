@@ -14,6 +14,7 @@ std::ofstream gFile;
 
 void openLogFile(const std::string &path) {
   std::lock_guard<std::mutex> lock(gMutex);
+  if (gFile.is_open()) gFile.close();
   gFile.open(path, std::ios::trunc);
 }
 
