@@ -23,8 +23,9 @@ interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
   procedural sky: an environment cube and a roughness-prefiltered specular
   chain baked on the GPU, and the diffuse irradiance projected onto nine
   spherical harmonic coefficients on the host, which costs the shaders no
-  texture at all. Loading a panorama points the sun at its brightest spot, so
-  the shadows agree with the picture.
+  texture at all. Loading a panorama moves its sun (or moon) out of the image
+  into the analytic sun, energy and all, so the rasteriser's shadows and the
+  path tracers light with the same sun; a panorama without one lights alone.
 - **Reflections** resolved in a compute pass from a small G-buffer the forward
   pass writes beside its colour: the prefiltered environment alone, a
   screen-space march with binary refinement that falls back to it, or a ray
@@ -40,7 +41,9 @@ interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
   size, which gives contact-hard, distance-soft penumbrae with no bias to tune.
   Every traced ray tests alpha-masked candidates against their texture, so a
   leaf shadows as a leaf and not as its quad.
-- **Ambient occlusion** from the material's map, or traced over the hemisphere.
+- **Ambient occlusion** from the material's map, or traced over the hemisphere:
+  contact occlusion over a short radius, or sky visibility, the share of the
+  environment each point sees, as the path tracers light it.
 - **Punctual lights** from the file, each casting a traced shadow, so a light
   behind a wall does not light through it. They are culled into a grid of
   cells every frame, tiles across the screen by slices in depth, so a pixel
@@ -221,15 +224,14 @@ Metal2Vulkan checkout.
 | `src/pt/` | The C++ side: the shim that gives MSVC the MSL types, the BVH builders and wide layouts, the environment and albedo tables, the CPU tracer, capture metadata and image files. |
 | `tests/` | The CTest manifest's programs and scripts: CPU transport tests, GPU oracles and image gates per backend, lifecycle and CLI rejection tests, and generated test scenes in `tests/data/`. |
 | `tools/` | The image comparison script, the benchmark harness and `shader-stats`. |
-| `docs/` | The user guide, the path tracer's plan, designs, results per milestone, performance guide and known issues. |
+| `docs/` | The screenshot above. |
 
 ## Known limitations
 
-- With an `.hdr` the path tracer's sun is whatever the environment holds; the
-  rasteriser adds its analytic sun on top, so the two differ there. With the
-  procedural sky both use the analytic sun, but the rasteriser also counts the
-  sky's painted disc in its ambient light, about ten per cent too bright, and
-  its ambient light ignores occlusion, which the path tracer does not.
+- The rasteriser's ambient light is unoccluded unless traced sky visibility is
+  on, and even then it misses light bounced between surfaces, which the path
+  tracers include. With the procedural sky it also counts the sky's painted
+  disc in its ambient light, about ten per cent too bright.
 - The rasteriser draws the base layer of transmissive and clearcoated
   materials only; the path tracers render both layers.
 
