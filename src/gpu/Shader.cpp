@@ -2,6 +2,8 @@
 
 #include "core/Log.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -44,8 +46,16 @@ const std::string &shaderDirectory() {
   static const std::string directory = [] {
     // Diagnostics (tools/shader_stats.cpp) read another build's shaders.
     if (const char *override = std::getenv("BASALT_SHADER_DIRECTORY")) return std::string(override);
-    std::filesystem::path beside = std::filesystem::path(BASALT_SHADER_DIR);
-    if (std::filesystem::exists(beside)) return beside.string();
+    std::filesystem::path built = std::filesystem::path(BASALT_SHADER_DIR);
+    if (std::filesystem::exists(built)) return built.string();
+    // A packaged build has no build tree: its shaders sit beside the executable, whatever the
+    // working directory it was started from.
+    wchar_t executable[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    if (length > 0 && length < MAX_PATH) {
+      const std::filesystem::path packaged = std::filesystem::path(executable).parent_path() / "shaders";
+      if (std::filesystem::exists(packaged)) return packaged.string();
+    }
     return std::string("shaders");
   }();
   return directory;
