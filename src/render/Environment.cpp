@@ -179,11 +179,13 @@ void Environment::setProceduralSky(Vec3 sunDirection, float turbidity, float int
   bake();
 }
 
-void Environment::load(const std::string &path) {
+void Environment::load(const std::string &path, bool extractSun) {
+  extracted = pt::EnvironmentSun{};
   if (path.empty()) {
     setProceduralSky(skySun, skyTurbidity, skyIntensity);
     return;
   }
+  extraction = extractSun;
   int width = 0, height = 0, channels = 0;
   float *pixels = stbi_loadf(path.c_str(), &width, &height, &channels, 4);
   if (!pixels) {
@@ -193,34 +195,19 @@ void Environment::load(const std::string &path) {
     return;
   }
   const std::size_t count = static_cast<std::size_t>(width) * height * 4;
-  const std::vector<float> texels(pixels, pixels + count);
+  std::vector<float> texels(pixels, pixels + count);
   stbi_image_free(pixels);
 
-  // Brightest texel on a blurred copy, so one hot pixel does not beat the sun; same mapping as equirectangularUV.
-  {
-    const int w = width, h = height;
-    float best = -1.0f;
-    int bestX = 0, bestY = 0;
-    const int step = std::max(1, w / 512);
-    for (int y = step; y < h - step; y += step) {
-      for (int x = step; x < w - step; x += step) {
-        float sum = 0.0f;
-        for (int dy = -step; dy <= step; dy += step)
-          for (int dx = -step; dx <= step; dx += step) {
-            const std::size_t index = (static_cast<std::size_t>(y + dy) * w + (x + dx)) * 4;
-            sum += texels[index] * 0.2126f + texels[index + 1] * 0.7152f + texels[index + 2] * 0.0722f;
-          }
-        if (sum > best) {
-          best = sum;
-          bestX = x;
-          bestY = y;
-        }
-      }
-    }
-    const float theta = (static_cast<float>(bestY) + 0.5f) / static_cast<float>(h) * kPi;
-    const float phi = ((static_cast<float>(bestX) + 0.5f) / static_cast<float>(w) - 0.5f) * 2.0f * kPi;
-    brightest = normalize({std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi)});
-  }
+  // The sun leaves the image before anything is baked from it, so neither the IBL nor the
+  // path-traced sky counts it a second time. Without extraction the brightest region still
+  // gives the direction the interface offers to point the sun at.
+  std::vector<float> probe;
+  if (!extractSun) probe = texels;
+  const pt::EnvironmentSun found = pt::extractEnvironmentSun(extractSun ? texels : probe,
+                                                             static_cast<std::uint32_t>(width),
+                                                             static_cast<std::uint32_t>(height));
+  if (extractSun) extracted = found;
+  brightest = normalize(Vec3{found.direction.x, found.direction.y, found.direction.z});
   uploadEquirectangular(texels, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
                         "environment.source");
   isProcedural = false;
@@ -229,6 +216,12 @@ void Environment::load(const std::string &path) {
   sourceName = std::filesystem::path(path).filename().string();
   bake();
   logInfo("environment: {} ({} by {})", sourceName, width, height);
+  if (extracted.found)
+    logInfo("environment sun extracted: {} texels, {:.2f} deg radius, irradiance {:.4g}, {:.1f}% of the light",
+            extracted.texels, extracted.angularRadius * 180.0f / kPi, pt::ptLuminance(extracted.irradiance),
+            extracted.share * 100.0f);
+  else if (extractSun)
+    logInfo("environment sun: none stands out from the sky; the image lights the scene alone");
 }
 
 void Environment::buildTraceDistribution(const std::vector<float> &texels, std::uint32_t width,

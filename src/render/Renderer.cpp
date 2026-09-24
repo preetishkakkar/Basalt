@@ -317,6 +317,16 @@ float Renderer::sceneScale() const {
   return activeScene && activeScene->bounds.valid() ? std::max(activeScene->bounds.radius(), 1e-3f) : 1.0f;
 }
 
+float Renderer::occlusionReach() const {
+  if (!activeScene || !activeScene->bounds.valid()) return sceneScale() * 2.0f;
+  Aabb traced = activeScene->bounds;
+  if (settings.groundPlane && activeScene->groundPrimitive >= 0)
+    traced.add(activeScene->primitives[static_cast<std::size_t>(activeScene->groundPrimitive)].worldBounds);
+  // The diagonal bounds the distance between any two traced points; a little over it keeps
+  // the far corner's own occluders inside the ray.
+  return std::max(length(traced.maximum - traced.minimum) * 1.01f, 1e-3f);
+}
+
 Vec3 Renderer::sunDirection() const {
   return normalize({std::cos(settings.sunElevation) * std::sin(settings.sunAzimuth),
                     std::sin(settings.sunElevation),
@@ -1276,7 +1286,9 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   uniforms.view = view;
   uniforms.inverseViewProjection = inverseViewProjection;
   uniforms.cameraPosition = Vec4(camera.position(), settings.exposure);
-  uniforms.sunDirection = Vec4(sunDirection(), 0.0f);
+  // An .hdr has no disc left in its cube: the sky draws the analytic one (sky.metal).
+  const bool analyticDisc = !environmentState->procedural() && settings.sunIntensity > 0.0f;
+  uniforms.sunDirection = Vec4(sunDirection(), analyticDisc ? std::cos(std::max(settings.sunAngularRadius, 1e-4f)) : 0.0f);
   uniforms.sunColor = Vec4(settings.sunColor, settings.sunIntensity);
   const float rayMask = settings.groundPlane ? 3.0f : 1.0f; // Bit one is the ground plane.
   uniforms.environment = {settings.iblIntensity, environmentState->prefilteredMipCount(), rayMask,
@@ -1289,7 +1301,8 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   uniforms.viewportAndLights = {static_cast<float>(width), static_cast<float>(height), visibleLights,
                                 static_cast<float>(settings.debugView)};
   const bool tracedShadows = traced && settings.shadowsEnabled && settings.shadowMode == 1;
-  const bool tracedOcclusion = traced && settings.occlusionMode == 1;
+  const bool tracedOcclusion = traced && (settings.occlusionMode == 1 || settings.occlusionMode == 2);
+  const bool skyVisibility = tracedOcclusion && settings.occlusionMode == 2;
 
   // Accumulate only while settings, view, targets and resources hold; never a debug view.
   std::uint64_t key = settingsKey();
@@ -1311,8 +1324,11 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   // Zero none, one the cascades, two a ray.
   const float shadowKind = !settings.shadowsEnabled ? 0.0f : (tracedShadows ? 2.0f : 1.0f);
   uniforms.rays = {shadowKind, static_cast<float>(std::max(1, settings.shadowSamples)),
-                   settings.sunAngularRadius, tracedOcclusion ? 1.0f : 0.0f};
-  uniforms.occlusion = {settings.occlusionRadius > 0.0f ? settings.occlusionRadius : scale * 0.05f,
+                   settings.sunAngularRadius, tracedOcclusion ? (skyVisibility ? 2.0f : 1.0f) : 0.0f};
+  // Contact occlusion fades over a short radius; sky visibility must see every occluder, so by
+  // default its rays span the whole traced scene.
+  const float automaticRadius = skyVisibility ? occlusionReach() : scale * 0.05f;
+  uniforms.occlusion = {settings.occlusionRadius > 0.0f ? settings.occlusionRadius : automaticRadius,
                         static_cast<float>(std::max(1, settings.occlusionSamples)), noiseFrame, scale};
   // The grid reaches as far as the scene does from this camera; a slice stretched to cover
   // what lies beyond would hold lights it should not.
@@ -2124,8 +2140,10 @@ pt::PathUniforms Renderer::makePathUniforms(const Camera &camera) {
                    static_cast<float>(environment.description.height), settings.drawSky ? 1.0f : 0.0f};
   const std::array<float, 4> &distribution = environmentState->traceDistributionInfo();
   u.distribution = {distribution[0], distribution[1], distribution[2], distribution[3]};
-  // With an .hdr the environment's own sun is the sun; the procedural sky's disc is analytic.
-  if (environmentState->procedural()) {
+  // The sun is always analytic: the procedural sky's disc is painted only into the raster
+  // sky, and an .hdr's own sun was moved out of the image into these settings when it was
+  // loaded (Environment::sun), so a zero intensity there means the image lights alone.
+  if (environmentState->procedural() || settings.sunIntensity > 0.0f) {
     const double radius = std::max(static_cast<double>(settings.sunAngularRadius), 1e-4);
     const double solidAngle = 2.0 * 3.14159265358979323846 * (1.0 - std::cos(radius));
     const Vec3 radiance = settings.sunColor * static_cast<float>(settings.sunIntensity / solidAngle);

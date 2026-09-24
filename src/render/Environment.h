@@ -4,6 +4,7 @@
 #include "gpu/Descriptors.h"
 #include "gpu/Pipeline.h"
 #include "gpu/Uploader.h"
+#include "pt/EnvironmentSun.h"
 
 #include <array>
 #include <memory>
@@ -16,8 +17,10 @@ public:
   Environment(const Context &context, Uploader &uploader);
   ~Environment();
 
-  // Loads an .hdr, or the procedural sky when empty or unreadable; rebakes either way.
-  void load(const std::string &path);
+  // Loads an .hdr, or the procedural sky when empty or unreadable; rebakes either way. With
+  // extractSun an .hdr's sun leaves every image baked from it (sky, IBL, path-traced
+  // environment) for sun(), which the renderers then light with analytically.
+  void load(const std::string &path, bool extractSun = true);
   void setProceduralSky(Vec3 sunDirection, float turbidity, float intensity);
 
   const Image &cube() const { return environmentCube; }
@@ -35,6 +38,9 @@ public:
   const std::array<float, 4> &traceDistributionInfo() const { return distributionInfo; }
   // Changes whenever the environment's images do.
   std::uint32_t version() const { return generation; }
+  // An .hdr's extracted sun; found is false for the procedural sky and for an image without one.
+  const pt::EnvironmentSun &sun() const { return extracted; }
+  bool sunExtractionEnabled() const { return extraction; }
   Vec3 brightestDirection() const { return brightest; }
   VkSampler linearSampler() const { return sampler; }
 
@@ -70,6 +76,8 @@ private:
   bool isProcedural = true;
   Vec3 skySun{0.3f, 0.6f, 0.4f};
   Vec3 brightest{0.0f, 1.0f, 0.0f};
+  pt::EnvironmentSun extracted;
+  bool extraction = true;
   float skyTurbidity = 3.0f;
   float skyIntensity = 1.0f;
 };

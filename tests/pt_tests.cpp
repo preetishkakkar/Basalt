@@ -8,6 +8,7 @@
 #include "temporal_fixture.h"
 #include "pt_fixture.h"
 #include "pt/ImageFile.h"
+#include "pt/EnvironmentSun.h"
 
 #include <array>
 #include <chrono>
@@ -2485,6 +2486,151 @@ PT_TEST(wavefront_capacity_plan_bounds) {
   if (planWavefront(1ull << 33, 1, 0, 0, rtx).error.empty()) return "a 33-bit pixel count was planned";
   budget.budgetBytes = 100;
   if (planWavefront(4, 1, 0, 1000, budget).error.empty()) return "guides larger than the budget were planned";
+  return {};
+}
+
+// Environment sun extraction (pt/EnvironmentSun.h). The images are built here from a direction
+// and an angular radius; the checks are the energy bookkeeping and the recovered geometry.
+struct SunImage {
+  uint width, height;
+  std::vector<float> rgba;
+};
+
+double sunTexelSolidAngle(uint y, uint width, uint height) {
+  const double theta = (y + 0.5) / height * 3.14159265358979323846;
+  return (2.0 * 3.14159265358979323846 / width) * (3.14159265358979323846 / height) * std::sin(theta);
+}
+
+std::array<double, 3> sunTexelDirection(uint x, uint y, uint width, uint height) {
+  const double pi = 3.14159265358979323846;
+  const double theta = (y + 0.5) / height * pi, phi = ((x + 0.5) / width - 0.5) * 2.0 * pi;
+  return {std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi)};
+}
+
+// A sky that brightens towards the zenith, plus discs of the given radiance and radius.
+struct SunDisc {
+  std::array<double, 3> direction;
+  double radiusDegrees;
+  std::array<float, 3> radiance;
+};
+SunImage sunImage(uint width, uint height, const std::vector<SunDisc> &discs) {
+  SunImage image{width, height, std::vector<float>(static_cast<std::size_t>(width) * height * 4)};
+  for (uint y = 0; y < height; ++y)
+    for (uint x = 0; x < width; ++x) {
+      const auto d = sunTexelDirection(x, y, width, height);
+      float *texel = &image.rgba[(static_cast<std::size_t>(y) * width + x) * 4];
+      const float sky = 0.1f + 0.2f * static_cast<float>(std::max(0.0, d[1]));
+      texel[0] = sky * 0.8f; texel[1] = sky * 0.9f; texel[2] = sky; texel[3] = 1.0f;
+      for (const SunDisc &disc : discs) {
+        const double c = d[0] * disc.direction[0] + d[1] * disc.direction[1] + d[2] * disc.direction[2];
+        if (c >= std::cos(disc.radiusDegrees * 3.14159265358979323846 / 180.0))
+          for (int k = 0; k < 3; ++k) texel[k] = disc.radiance[k];
+      }
+    }
+  return image;
+}
+
+std::array<double, 3> sunImagePower(const SunImage &image) {
+  std::array<double, 3> power{};
+  for (uint y = 0; y < image.height; ++y)
+    for (uint x = 0; x < image.width; ++x)
+      for (int k = 0; k < 3; ++k)
+        power[k] += image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4 + k] *
+                    sunTexelSolidAngle(y, image.width, image.height);
+  return power;
+}
+
+std::array<double, 3> sunUnit(double x, double y, double z) {
+  const double n = std::sqrt(x * x + y * y + z * z);
+  return {x / n, y / n, z / n};
+}
+
+double sunAngleDegrees(float3 a, std::array<double, 3> b) {
+  const double c = a.x * b[0] + a.y * b[1] + a.z * b[2];
+  return std::acos(std::clamp(c, -1.0, 1.0)) * 180.0 / 3.14159265358979323846;
+}
+
+// What leaves the image is what the disc carries, channel by channel; the direction and the
+// radius are the disc's.
+PT_TEST(environment_sun_moves_the_disc_energy) {
+  const std::array<double, 3> towards = sunUnit(0.4, 0.7, -0.3);
+  SunImage image = sunImage(1024, 512, {{towards, 2.0, {2000.0f, 1900.0f, 1700.0f}}});
+  const std::array<double, 3> before = sunImagePower(image);
+  const EnvironmentSun sun = extractEnvironmentSun(image.rgba, image.width, image.height);
+  if (!sun.found) return "the disc was not found";
+  const std::array<double, 3> after = sunImagePower(image);
+  const double irradiance[3] = {sun.irradiance.x, sun.irradiance.y, sun.irradiance.z};
+  for (int k = 0; k < 3; ++k)
+    if (std::abs((before[k] - after[k]) - irradiance[k]) > 1e-5 * irradiance[k])
+      return format("channel %.0f: the image lost %.9g but the sun carries %.9g", k, before[k] - after[k], irradiance[k]);
+  // A 2 degree disc of radiance 1900 (green) holds 1900 * 2 pi (1 - cos 2 deg); the sky behind
+  // it stays in the image.
+  const double expected = (1900.0 - 0.9 * (0.1 + 0.2 * towards[1])) * 2.0 * 3.14159265358979323846 *
+                          (1.0 - std::cos(2.0 * 3.14159265358979323846 / 180.0));
+  if (std::abs(irradiance[1] / expected - 1.0) > 0.03)
+    return format("green irradiance %.6g, expected about %.6g", irradiance[1], expected);
+  if (sunAngleDegrees(sun.direction, towards) > 0.1) return format("direction off by %.3f degrees", sunAngleDegrees(sun.direction, towards));
+  const double radius = sun.angularRadius * 180.0 / 3.14159265358979323846;
+  if (radius < 1.8 || radius > 2.2) return format("angular radius %.3f degrees, expected 2", radius);
+  for (std::size_t i = 0; i < image.rgba.size(); i += 4)
+    if (image.rgba[i + 1] > 1.0f) return "a disc texel is left in the image";
+  return {};
+}
+
+// No region stands out: the image is untouched, bit for bit, and there is no sun.
+PT_TEST(environment_sun_leaves_a_plain_sky_alone) {
+  SunImage image = sunImage(512, 256, {{sunUnit(0.0, 1.0, 0.0), 30.0, {0.35f, 0.4f, 0.45f}}});
+  const std::vector<float> original = image.rgba;
+  const EnvironmentSun sun = extractEnvironmentSun(image.rgba, image.width, image.height);
+  if (sun.found) return "a sun was found in a plain sky";
+  if (std::memcmp(original.data(), image.rgba.data(), original.size() * sizeof(float)) != 0)
+    return "the image changed";
+  if (sun.irradiance.x != 0.0f || sun.irradiance.y != 0.0f || sun.irradiance.z != 0.0f) return "a sunless result carries light";
+  return {};
+}
+
+// A sun on the image's left and right edge is one region: longitude wraps.
+PT_TEST(environment_sun_wraps_across_the_seam) {
+  const std::array<double, 3> towards = sunUnit(-1.0, 0.3, 0.0);  // phi = pi: u = 0 and 1
+  SunImage image = sunImage(1024, 512, {{towards, 1.5, {5000.0f, 5000.0f, 5000.0f}}});
+  const std::array<double, 3> before = sunImagePower(image);
+  const EnvironmentSun sun = extractEnvironmentSun(image.rgba, image.width, image.height);
+  if (!sun.found) return "the disc was not found";
+  if (sunAngleDegrees(sun.direction, towards) > 0.1) return format("direction off by %.3f degrees", sunAngleDegrees(sun.direction, towards));
+  const std::array<double, 3> after = sunImagePower(image);
+  if (std::abs((before[0] - after[0]) - sun.irradiance.x) > 1e-5 * sun.irradiance.x) return "energy was not conserved";
+  for (uint y = 0; y < image.height; ++y)
+    for (uint x : {0u, image.width - 1u})
+      if (image.rgba[(static_cast<std::size_t>(y) * image.width + x) * 4] > 1.0f)
+        return format("the disc is left at the seam, x %.0f", x);
+  return {};
+}
+
+// A lone hot texel far brighter than any one sun texel does not win over a sun a few texels
+// wide; the brightest neighbourhood does.
+PT_TEST(environment_sun_prefers_a_disc_to_a_hot_pixel) {
+  const std::array<double, 3> towards = sunUnit(0.2, 0.5, 0.8);
+  SunImage image = sunImage(2048, 1024, {{towards, 0.4, {3000.0f, 3000.0f, 3000.0f}}});
+  float *hot = &image.rgba[(static_cast<std::size_t>(300) * image.width + 100) * 4];
+  hot[0] = hot[1] = hot[2] = 20000.0f;
+  const EnvironmentSun sun = extractEnvironmentSun(image.rgba, image.width, image.height);
+  if (!sun.found) return "no sun was found";
+  if (sunAngleDegrees(sun.direction, towards) > 0.2) return format("the sun was placed %.2f degrees from the disc", sunAngleDegrees(sun.direction, towards));
+  if (hot[1] != 20000.0f) return "the hot texel was taken as the sun";
+  return {};
+}
+
+// The path tracer's disc: the extracted irradiance spread over the cone it samples.
+PT_TEST(environment_sun_uniforms_carry_the_irradiance) {
+  float4 direction, radiance;
+  environmentSunUniforms(float3(0.0f, 2.0f, 0.0f), float3(3.0f, 2.0f, 1.0f), 0.01f, direction, radiance);
+  if (std::abs(direction.y - 1.0f) > 1e-6f || std::abs(direction.w - std::cos(0.01f)) > 1e-7f) return "wrong cone";
+  const double solidAngle = 2.0 * 3.14159265358979323846 * (1.0 - std::cos(0.01));
+  if (std::abs(radiance.w / solidAngle - 1.0) > 1e-5) return "wrong solid angle";
+  if (std::abs(radiance.x * radiance.w / 3.0 - 1.0) > 1e-5 || std::abs(radiance.z * radiance.w - 1.0) > 1e-5)
+    return "radiance times solid angle is not the irradiance";
+  environmentSunUniforms(float3(0.0f, 1.0f, 0.0f), float3(0.0f), 0.01f, direction, radiance);
+  if (direction.w != 0.0f || radiance.w != 0.0f) return "a zero irradiance still made a sun";
   return {};
 }
 

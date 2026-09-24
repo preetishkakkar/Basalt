@@ -408,7 +408,7 @@ LoadedGltf loadGltf(const std::string &path, unsigned buildThreads) {
   return loaded;
 }
 
-void loadEnvironment(CpuScene &scene, const std::string &path) {
+void loadEnvironment(CpuScene &scene, const std::string &path, bool extractSun) {
   int width = 0, height = 0, channels = 0;
   float *pixels = stbi_loadf(path.c_str(), &width, &height, &channels, 4);
   if (!pixels) throw std::runtime_error("cannot decode HDR environment: " + path);
@@ -423,6 +423,9 @@ void loadEnvironment(CpuScene &scene, const std::string &path) {
   stbi_image_free(pixels);
   for (float value : scene.environment.texels)
     if (!std::isfinite(value)) throw std::runtime_error("HDR environment contains non-finite values: " + path);
+  scene.environmentSun = extractSun
+      ? extractEnvironmentSun(scene.environment.texels, scene.environment.width, scene.environment.height)
+      : EnvironmentSun{};
   buildEnvironmentDistribution(scene.environment.texels.data(), scene.environment.width,
                                scene.environment.height, scene.distribution, scene.distributionInfo);
 }

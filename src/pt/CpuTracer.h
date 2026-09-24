@@ -6,6 +6,7 @@
 #include "pt/BvhVariants.h"
 #include "pt/Denoiser.h"
 #include "pt/Embree.h"
+#include "pt/EnvironmentSun.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -28,6 +29,7 @@ struct CpuScene {
   HostEnvironment environment;
   std::vector<float> distribution;      // the environment distribution
   float4 distributionInfo;              // columns, rows, integral, present
+  EnvironmentSun environmentSun;        // what loadEnvironment moved out of the image
   std::vector<float> specularAlbedo;    // buildSpecularAlbedoTable()
   std::vector<PtEmissiveTriangle> emissiveTriangles;
   Bvh bvh;

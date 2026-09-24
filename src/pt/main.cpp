@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
   try {
     if (argc < 2 || std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
       std::cerr << "usage: basalt-pt-cli scene.gltf --output image.pfm|image.exr [--spp N] [--width N] [--height N] "
-                   "[--bounces N] [--seed N] [--threads N] [--environment file.hdr] "
+                   "[--bounces N] [--seed N] [--threads N] [--environment file.hdr] [--environment-sun extract|keep] "
                    "[--intersector own|embree|avx2] [--denoised-output image.pfm] "
                    "[--aperture R] [--focus-distance D] [--texture-filter level0|raycone] "
                    "[--di-estimator nee|restir] [--restir-reuse none|temporal|spatial|both] "
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     std::string environmentPath, denoisedPath;
     uint spp = 64, width = 640, height = 360, bounces = 8, seed = 0, threads = 0;
     float aperture = 0.0f, focusDistance = 0.0f;
-    bool rayCones = false;
+    bool rayCones = false, extractSun = true;
     int restir = 0, restirReuse = -1;
     uint restirCandidates = 0;
     // Whole decimal numbers only: "-1" and "12abc" are errors, not 4294967295 and 12.
@@ -80,6 +80,11 @@ int main(int argc, char **argv) {
       } else if (option == "--environment") {
         if (++i >= argc) throw std::runtime_error("--environment requires a path");
         environmentPath = argv[i];
+      } else if (option == "--environment-sun") {
+        if (++i >= argc) throw std::runtime_error("--environment-sun requires extract or keep");
+        const std::string name = argv[i];
+        if (name != "extract" && name != "keep") throw std::runtime_error("--environment-sun requires extract or keep");
+        extractSun = name == "extract";
       } else if (option == "--denoised-output") {
         if (++i >= argc) throw std::runtime_error("--denoised-output requires a path");
         denoisedPath = argv[i];
@@ -131,7 +136,7 @@ int main(int argc, char **argv) {
 
     const auto loadStart = std::chrono::steady_clock::now();
     pt::LoadedGltf loaded = pt::loadGltf(scenePath, threads);
-    if (!environmentPath.empty()) pt::loadEnvironment(loaded.scene, environmentPath);
+    if (!environmentPath.empty()) pt::loadEnvironment(loaded.scene, environmentPath, extractSun);
     if (intersector == "embree") {
       if (!pt::EmbreeScene::available()) throw std::runtime_error("this build has no Embree");
       loaded.scene.embree = std::make_shared<pt::EmbreeScene>(loaded.scene);
@@ -162,6 +167,8 @@ int main(int argc, char **argv) {
     u.path = float4(static_cast<float>(bounces), kRouletteStartBounce, 0.0f, 0.0f);
     u.environment = float4(1.0f, 1.0f, 1.0f, 1.0f);
     u.distribution = loaded.scene.distributionInfo;
+    const pt::EnvironmentSun &sun = loaded.scene.environmentSun;
+    pt::environmentSunUniforms(sun.direction, sun.irradiance, sun.angularRadius, u.sunDirection, u.sunRadiance);
     u.counts = pt::uint4(static_cast<uint>(loaded.frame.lights.size()), 7u, seed, 0u);
     u.emissive = pt::uint4(static_cast<uint>(loaded.scene.emissiveTriangles.size()), 0u, 0u, 0u);
     // Thin lens: the focus defaults to the scene centre's depth.
@@ -227,6 +234,14 @@ int main(int argc, char **argv) {
     m.measurements = {{"load_seconds", loadSeconds}, {"render_seconds", renderSeconds},
                       {"denoise_seconds", denoiseSeconds}};
     m.notes = {{"camera_eye", std::to_string(eye.x) + " " + std::to_string(eye.y) + " " + std::to_string(eye.z)}};
+    if (!environmentPath.empty()) {
+      m.notes.push_back({"environment_sun", !extractSun ? "kept in the image" : sun.found ? "extracted" : "none found"});
+      if (sun.found) {
+        m.measurements.push_back({"environment_sun_irradiance", pt::ptLuminance(sun.irradiance)});
+        m.measurements.push_back({"environment_sun_radius_degrees", sun.angularRadius * 180.0 / 3.14159265358979323846});
+        m.measurements.push_back({"environment_sun_share", sun.share});
+      }
+    }
     if (!writeCaptureMetadata(outputPath + ".json", m))
       throw std::runtime_error("could not write " + outputPath + ".json");
     std::cout << "wrote " << outputPath << " (" << width << 'x' << height << ", " << spp << " spp, "

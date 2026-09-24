@@ -39,7 +39,7 @@ if(BASALT_CPU_ONLY)
   add_library(basalt-pt STATIC
     src/pt/Tracing.cpp src/pt/Bvh.cpp src/pt/BvhVariants.cpp src/pt/BvhAvx2.cpp src/pt/Tables.cpp src/pt/CpuTracer.cpp
     src/pt/Embree.cpp src/pt/Denoiser.cpp src/pt/Gltf.cpp src/pt/CaptureMetadata.cpp src/pt/WavefrontPlan.cpp
-    src/pt/ImageFile.cpp)
+    src/pt/ImageFile.cpp src/pt/EnvironmentSun.cpp)
   target_include_directories(basalt-pt PUBLIC src shaders)
   target_include_directories(basalt-pt PRIVATE third_party/cgltf third_party/stb)
   target_compile_definitions(basalt-pt PUBLIC NOMINMAX)
@@ -94,6 +94,9 @@ if(BASALT_CPU_ONLY)
     add_test(NAME pt-exr-captures COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/exr_captures.py"
       --pt-cli "$<TARGET_FILE:basalt-pt-cli>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf"
       --output-dir "${CMAKE_CURRENT_BINARY_DIR}/exr-captures")
+    add_test(NAME pt-environment-sun COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_sun.py"
+      "$<TARGET_FILE:basalt-pt-cli>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/raycone.gltf"
+      "${CMAKE_CURRENT_BINARY_DIR}/environment-sun")
   endif()
   add_test(NAME pt-headless-invalid-backend COMMAND basalt-pt-cli
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf" --intersector invalid)
@@ -278,6 +281,7 @@ add_library(basalt-pt STATIC
   src/pt/Gltf.cpp
   src/pt/CaptureMetadata.cpp
   src/pt/ImageFile.cpp
+  src/pt/EnvironmentSun.cpp
   src/pt/WavefrontPlan.cpp)
 target_include_directories(basalt-pt PUBLIC src shaders)
 target_include_directories(basalt-pt PRIVATE third_party/cgltf third_party/stb)
@@ -420,6 +424,11 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
     --exe "$<TARGET_FILE:basalt>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/mirrored.gltf"
     --output-dir "${CMAKE_CURRENT_BINARY_DIR}/sidedness")
   set_tests_properties(gpu-sidedness-tests PROPERTIES SKIP_RETURN_CODE 77)
+  # The rasteriser's traced occlusion modes, read through the occlusion debug view.
+  add_test(NAME gpu-raster-occlusion-tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/raster_occlusion.py"
+    --exe "$<TARGET_FILE:basalt>" --output-dir "${CMAKE_CURRENT_BINARY_DIR}/raster-occlusion")
+  set_tests_properties(gpu-raster-occlusion-tests PROPERTIES SKIP_RETURN_CODE 77)
   add_test(NAME gpu-v7-render-tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/v7_conformance.py"
     --exe "$<TARGET_FILE:basalt>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/v7_materials.gltf"
@@ -440,6 +449,10 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
     --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf"
     --output-dir "${CMAKE_CURRENT_BINARY_DIR}/exr-captures")
   set_tests_properties(exr-capture-tests PROPERTIES SKIP_RETURN_CODE 77)
+  # An .hdr's sun moved into the analytic disc lights the scene as it did from the image.
+  add_test(NAME pt-environment-sun COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/environment_sun.py"
+    "$<TARGET_FILE:basalt-pt-cli>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/raycone.gltf"
+    "${CMAKE_CURRENT_BINARY_DIR}/environment-sun")
   add_test(NAME gpu-ray-pipeline-unavailable-renderer COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_capture_error.py"
     --exe "$<TARGET_FILE:basalt>" --output-dir "${CMAKE_CURRENT_BINARY_DIR}/negative-cli"
@@ -459,6 +472,8 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
   basalt_negative_cli(unknown-argument "unknown or incomplete argument" --rendrer gpu)
   basalt_negative_cli(missing-value "unknown or incomplete argument" --renderer gpu --seed)
   basalt_negative_cli(unknown-renderer "unknown renderer" --renderer photon)
+  basalt_negative_cli(unknown-ao-mode "--ao takes 0" --renderer raster --ao 3)
+  basalt_negative_cli(unknown-environment-sun "unknown environment sun mode" --environment-sun always)
   basalt_negative_cli(zero-bounces "--bounces needs an integer" --renderer gpu-bvh --bounces 0)
   basalt_negative_cli(malformed-spf "--spf needs an integer" --renderer gpu-bvh --spf 4x)
   basalt_negative_cli(gpu-intersector "--intersector requires --renderer cpu" --renderer gpu-bvh --intersector embree)

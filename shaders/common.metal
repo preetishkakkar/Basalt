@@ -15,14 +15,15 @@ struct FrameUniforms {
   float4x4 view;
   float4x4 inverseViewProjection;
   float4 cameraPosition;  // xyz eye in world space, w exposure
-  float4 sunDirection;    // xyz unit vector towards the sun, w angular softness
+  float4 sunDirection;    // xyz unit vector towards the sun, w cosine of the disc the sky draws (0: none)
   float4 sunColor;        // rgb radiance, w intensity multiplier
   float4 environment;     // x IBL intensity, y prefiltered mip count, z ray instance mask, w time
   float4 shadowParameters;// x depth bias, y normal bias, z texel world size, w softness
   float4 cascadeSplits;   // view-space far distance of each cascade
   float4 viewportAndLights; // xy target size, z light count, w debug view
   float4 rays;            // x shadow mode (0 none, 1 cascades, 2 traced), y traced shadow samples,
-                          // z sun angular radius, w ambient occlusion mode (0 texture, 1 traced)
+                          // z sun angular radius, w ambient occlusion mode (0 texture, 1 traced
+                          // contact, 2 traced sky visibility)
   float4 occlusion;       // x traced occlusion radius, y traced occlusion samples, z noise frame (0 when still), w scene radius
   float4 options;         // x punctual lights cast traced shadows, y near plane, z far plane, w lights are clustered
   float4 clusters;        // x tiles across, y tiles down, z depth slices, w lights a cell can hold

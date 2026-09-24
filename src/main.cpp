@@ -165,6 +165,7 @@ struct Application {
   // Turns the camera every frame, so a capture exercises reprojection.
   float spinPerFrame = 0.0f;
   bool fixedSun = false;  // --sun: keep it where it was put
+  bool extractEnvironmentSun = true;  // --environment-sun: an .hdr's sun becomes the analytic one
   // The size the copy was taken at; the swapchain may have been rebuilt since.
   VkExtent2D captureExtent{};
   bool exitAfterCapture = false;
@@ -200,6 +201,10 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
     return false;
   }
   m.environment = initialEnvironmentPath;
+  if (!initialEnvironmentPath.empty() && !renderer.environment().procedural()) {
+    const pt::EnvironmentSun &sun = renderer.environment().sun();
+    m.notes.push_back({"environment_sun", !extractEnvironmentSun ? "kept in the image" : sun.found ? "extracted" : "none found"});
+  }
   m.device = context.properties.deviceName;
   m.driverVersion = context.properties.driverVersion;
   m.apiVersion = context.properties.apiVersion;
@@ -280,6 +285,11 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
       {"wavefront_queue_bytes", static_cast<double>(stats.wavefrontQueueBytes)},
       {"validation_enabled", context.validationEnabled ? 1.0 : 0.0},
   };
+  if (const pt::EnvironmentSun &sun = renderer.environment().sun(); sun.found) {
+    m.measurements.push_back({"environment_sun_irradiance", pt::ptLuminance(sun.irradiance)});
+    m.measurements.push_back({"environment_sun_radius_degrees", sun.angularRadius * 180.0 / 3.14159265358979323846});
+    m.measurements.push_back({"environment_sun_share", sun.share});
+  }
   if (const GpuProfiler *profile = active >= 2 ? renderer.finishProfiling() : nullptr) {
     m.series.push_back({"fresh_trace_gpu_ms", profile->traceSeries()});
     const GpuProfile &latest = profile->latest();
@@ -438,10 +448,34 @@ void Application::writeCapture() {
   }
 }
 
-static void alignSunToEnvironment(Renderer &renderer) {
-  const Vec3 direction = renderer.environment().brightestDirection();
-  renderer.settings.sunAzimuth = std::atan2(direction.x, direction.z);
-  renderer.settings.sunElevation = std::asin(std::clamp(direction.y, -1.0f, 1.0f));
+// The sun an .hdr gave up when it was loaded (Environment::sun) becomes the renderers' sun:
+// its direction (unless keepDirection), colour, irradiance and angular radius. An image
+// without one leaves no sun, so it lights the scene alone in every renderer.
+static void adoptEnvironmentSun(Renderer &renderer, bool keepDirection) {
+  RenderSettings &settings = renderer.settings;
+  const Environment &environment = renderer.environment();
+  if (!keepDirection) {
+    const Vec3 direction = environment.brightestDirection();
+    settings.sunAzimuth = std::atan2(direction.x, direction.z);
+    settings.sunElevation = std::asin(std::clamp(direction.y, -1.0f, 1.0f));
+  }
+  const pt::EnvironmentSun &sun = environment.sun();
+  const float peak = std::max(sun.irradiance.x, std::max(sun.irradiance.y, sun.irradiance.z));
+  if (!sun.found || !(peak > 0.0f)) {
+    settings.sunIntensity = 0.0f;
+    return;
+  }
+  settings.sunColor = {sun.irradiance.x / peak, sun.irradiance.y / peak, sun.irradiance.z / peak};
+  settings.sunIntensity = peak;
+  settings.sunAngularRadius = sun.angularRadius;
+}
+
+// The procedural sky's own sun, for when an .hdr's (or its absence) is left behind.
+static void restoreDefaultSun(RenderSettings &settings) {
+  const RenderSettings defaults;
+  settings.sunColor = defaults.sunColor;
+  settings.sunIntensity = defaults.sunIntensity;
+  settings.sunAngularRadius = defaults.sunAngularRadius;
 }
 
 void Application::drawInterface() {
@@ -631,7 +665,8 @@ void Application::drawInterface() {
                            renderer.cpuThreadCount());
     }
     ImGui::TextDisabled(renderer.environment().procedural() ? "Sun: analytic, the sky's own disc left out"
-                                                            : "Sun: whatever the environment holds");
+                        : settings.sunIntensity > 0.0f ? "Sun: analytic, moved out of the environment"
+                                                       : "Sun: none; the environment lights alone");
   }
 
   if (ImGui::CollapsingHeader("Frame", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -713,6 +748,15 @@ void Application::drawInterface() {
 
     Environment &environment = renderer.environment();
     ImGui::TextWrapped("Environment: %s", environment.name().c_str());
+    if (!environment.procedural()) {
+      const pt::EnvironmentSun &sun = environment.sun();
+      if (sun.found)
+        ImGui::TextDisabled("Its sun: %.2f deg across, %.1f%% of its light, now the sun above",
+                            degrees(sun.angularRadius) * 2.0f, sun.share * 100.0f);
+      else
+        ImGui::TextDisabled(environment.sunExtractionEnabled() ? "No sun stands out in it: it lights alone"
+                                                               : "Its sun stays in the image (--environment-sun keep)");
+    }
     bool skyChanged = false;
     if (environment.procedural()) {
       skyChanged |= ImGui::SliderFloat("Haze", &settings.skyTurbidity, 1.0f, 10.0f);
@@ -722,17 +766,18 @@ void Application::drawInterface() {
       const std::string path = openFileDialog(window.handle(), L"Radiance HDR\0*.hdr\0All files\0*.*\0\0",
                                               L"Open an environment map");
       if (!path.empty()) {
-        environment.load(path);
+        environment.load(path, environment.sunExtractionEnabled());
         renderer.environmentChanged();
-        alignSunToEnvironment(renderer);
+        adoptEnvironmentSun(renderer, false);
       }
     }
-    if (!environment.procedural() && ImGui::Button("Point the sun at the environment's light", ImVec2(-1, 0)))
-      alignSunToEnvironment(renderer);
+    if (!environment.procedural() && ImGui::Button("Reset the sun to the environment's", ImVec2(-1, 0)))
+      adoptEnvironmentSun(renderer, false);
     if (ImGui::Button("Back to the procedural sky", ImVec2(-1, 0))) {
       if (!environment.procedural()) {
         environment.load("");
         renderer.environmentChanged();
+        restoreDefaultSun(settings);
       }
       skyChanged = true;
     }
@@ -769,13 +814,22 @@ void Application::drawInterface() {
 
   if (ImGui::CollapsingHeader("Ambient occlusion")) {
     ImGui::BeginDisabled(!traced);
-    ImGui::Combo("Occlusion method", &settings.occlusionMode, "Material map\0Ray traced\0");
+    ImGui::Combo("Occlusion method", &settings.occlusionMode,
+                 "Material map\0Ray traced contact\0Ray traced sky visibility\0");
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("Contact: darkens creases, fading over a short radius.\n"
+                        "Sky visibility: the share of the sky each point sees, as the path tracers light it;\n"
+                        "matches them under an environment without a strong sun.");
     tracedNote();
-    if (traced && settings.occlusionMode == 1) {
+    if (traced && (settings.occlusionMode == 1 || settings.occlusionMode == 2)) {
       ImGui::SliderInt("Rays per pixel##ao", &settings.occlusionSamples, 1, 16);
-      ImGui::SliderFloat("Radius", &settings.occlusionRadius, 0.0f, 10.0f, "%.2f (0 = automatic)",
-                         ImGuiSliderFlags_Logarithmic);
+      const bool sky = settings.occlusionMode == 2;
+      const float automatic = sky ? renderer.occlusionReach() : renderer.sceneScale() * 0.05f;
+      char format[64];
+      std::snprintf(format, sizeof(format), "%%.2f (0 = automatic, %.2f)", automatic);
+      ImGui::SliderFloat(sky ? "Reach" : "Radius", &settings.occlusionRadius, 0.0f,
+                         std::max(10.0f, automatic * 2.0f), format, ImGuiSliderFlags_Logarithmic);
     }
   }
 
@@ -874,8 +928,8 @@ void Application::run(const std::string &initialScene, const std::string &initia
   ui = std::make_unique<UiPass>(context, uploader, swapchain.format());
 
   if (!initialEnvironment.empty()) {
-    renderer.environment().load(initialEnvironment);
-    if (!fixedSun) alignSunToEnvironment(renderer);
+    renderer.environment().load(initialEnvironment, extractEnvironmentSun);
+    adoptEnvironmentSun(renderer, fixedSun);
   }
   // The procedural sky was baked for the default sun; a sun given on the command line needs its own.
   if (fixedSun) renderer.rebakeProceduralSky();
@@ -1039,6 +1093,7 @@ void Application::run(const std::string &initialScene, const std::string &initia
 constexpr const char *kUsage =
     "basalt [model.gltf|model.glb] [environment.hdr] [options]\n"
     "\n"
+    "Environment: --environment-sun extract|keep (an .hdr's sun becomes the analytic sun, or stays in the image)\n"
     "Capture: --screenshot FILE.png  --pfm FILE (.pfm or .exr)  --denoised-pfm FILE  --albedo-pfm FILE\n"
     "         --normal-pfm FILE  --frame N  --spp N  --log FILE  --size WxH  --view YAW PITCH D  --spin DEG\n"
     "         --no-ui  --no-vsync  --no-validation  --device NAME\n"
@@ -1050,7 +1105,7 @@ constexpr const char *kUsage =
     "         --restir-candidates N  --hybrid-comparison traced|raster|difference|split|spp  --gpu-profile\n"
     "         --wavefront-capacity N  --wavefront-allocation auto|subgroup|atomic  --wavefront-fusion auto|on|off\n"
     "         --wavefront-queue-limit N (tests only)  --at-frame N KEY=VALUE  --switch-path-execution-frame N\n"
-    "Rasteriser: --shadows 0|1|2  --ao 0|1  --reflections 0|1|2  --aa 0|1|2  --taa-feedback F  --sun AZ EL\n"
+    "Rasteriser: --shadows 0|1|2  --ao 0|1|2  --ao-radius R  --reflections 0|1|2  --aa 0|1|2  --taa-feedback F  --sun AZ EL\n"
     "         --ground R M  --ground-color R G B  --ground-preset N  --lights N  --light-shadows 0|1\n"
     "         --clustered 0|1  --debug N  --wireframe\n"
     "\n"
@@ -1072,12 +1127,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
   long long seed = -1;
   int debugView = 0;
   int shadowMode = -1, occlusionMode = -1, reflectionMode = -1;
+  float occlusionRadius = -1.0f;
   float groundRoughness = -1.0f, groundMetallic = 0.0f;
   basalt::Vec3 groundColor{-1.0f, -1.0f, -1.0f};
   int groundPreset = -1;
   int antialiasing = -1;
   float spin = 0.0f;
   float sunAzimuth = -1000.0f, sunElevation = -1000.0f;
+  int environmentSun = 1;
   float feedback = -1.0f;
   int testLights = -1;
   int lightShadows = -1;
@@ -1324,7 +1381,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       } else if (argument == "--shadows" && i + 1 < count) {
         shadowMode = _wtoi(arguments[++i]); // 0 none, 1 cascaded, 2 traced
       } else if (argument == "--ao" && i + 1 < count) {
-        occlusionMode = _wtoi(arguments[++i]); // 0 material map, 1 traced
+        occlusionMode = _wtoi(arguments[++i]); // 0 material map, 1 traced contact, 2 traced sky visibility
+        if (occlusionMode < 0 || occlusionMode > 2) {
+          basalt::logError("--ao takes 0 (material map), 1 (traced contact) or 2 (traced sky visibility)");
+          argumentError = true;
+        }
+      } else if (argument == "--ao-radius" && i + 1 < count) {
+        occlusionRadius = static_cast<float>(_wtof(arguments[++i]));
+        if (!(occlusionRadius >= 0.0f)) {
+          basalt::logError("--ao-radius needs a non-negative distance (0 = automatic)");
+          argumentError = true;
+        }
       } else if (argument == "--reflections" && i + 1 < count) {
         reflectionMode = _wtoi(arguments[++i]); // 0 environment, 1 screen space, 2 traced
       } else if (argument == "--ground" && i + 2 < count) {
@@ -1342,6 +1409,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
         testLights = _wtoi(arguments[++i]);
       } else if (argument == "--light-shadows" && i + 1 < count) {
         lightShadows = _wtoi(arguments[++i]) != 0;
+      } else if (argument == "--environment-sun" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        environmentSun = name == "extract" ? 1 : name == "keep" ? 0 : -2;
+        if (environmentSun == -2) {
+          basalt::logError("unknown environment sun mode {}: extract or keep", name);
+          argumentError = true;
+        }
       } else if (argument == "--sun" && i + 2 < count) {
         sunAzimuth = static_cast<float>(_wtof(arguments[++i]));
         sunElevation = static_cast<float>(_wtof(arguments[++i]));
@@ -1398,7 +1472,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       throw std::runtime_error("the selected renderer requires Vulkan ray queries on the selected device");
     if (rendererKind == 5 && !application.context.rayPipelineSupported)
       throw std::runtime_error("the selected renderer requires VK_KHR_ray_tracing_pipeline on the selected device");
-    if ((shadowMode == 2 || occlusionMode == 1 || reflectionMode == 2) && !application.context.rayTracingSupported)
+    if ((shadowMode == 2 || occlusionMode >= 1 || reflectionMode == 2) && !application.context.rayTracingSupported)
       throw std::runtime_error("traced shadows, occlusion or reflections require Vulkan ray queries on the selected device");
     if (rendererKind == 1 && intersector == 1 && !pt::EmbreeScene::available())
       throw std::runtime_error("the requested Embree intersector is unavailable in this build");
@@ -1479,6 +1553,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       application.renderer.settings.shadowMode = shadowMode > 1 ? 1 : 0;
     }
     if (occlusionMode >= 0) application.renderer.settings.occlusionMode = occlusionMode;
+    if (occlusionRadius >= 0.0f) application.renderer.settings.occlusionRadius = occlusionRadius;
     if (reflectionMode >= 0) application.renderer.settings.reflectionMode = reflectionMode;
     if (antialiasing >= 0) application.renderer.settings.antialiasing = antialiasing;
     application.spinPerFrame = spin;
@@ -1509,6 +1584,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       application.camera.pitch = basalt::radians(view[1]);
       application.viewDistanceScale = view[2];
     }
+    application.extractEnvironmentSun = environmentSun != 0;
     application.run(scene, environment);
     if (application.context.sawValidationError)
       throw std::runtime_error("Vulkan validation reported an error during rendering");

@@ -231,10 +231,22 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
                                     frame.cascadeSplits, frame.shadowParameters, cascade);
   }
 #ifdef BASALT_RAY_TRACING
-  // Traced occlusion, min'd with the material's map.
+  // Traced occlusion, min'd with the material's map. Contact mode fades an occluder by its
+  // distance over a short radius. Sky-visibility mode counts a cosine-weighted ray as open only
+  // if it leaves the model: the share of the environment the diffuse term can see, which is
+  // what a path tracer's environment lighting sees. Its radius spans the scene and any hit ends
+  // it. The ground plane is not an occluder there: the environment's own lower half already
+  // stands for the ground in the irradiance this scales, as the lit plane does in a path tracer.
   if (frame.rays.w > 0.5f) {
+    const bool skyVisibility = frame.rays.w > 1.5f;
     const uint samples = max(uint(frame.occlusion.y), 1u);
     const float radius = max(frame.occlusion.x, sceneScale * 1e-2f);
+    intersection_params occlusionParams;
+    uint occlusionMask = rayMask;
+    if (skyVisibility) {
+      occlusionParams.accept_any_intersection(true);
+      occlusionMask = max(rayMask & ~kRayMaskGround, kRayMaskScene);
+    }
     float open = 0.0f;
     for (uint i = 0u; i < samples; ++i) {
       const float2 xi = float2(fract(noise + float(i) * 0.618034f),
@@ -242,8 +254,8 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
                                      rotation.y));
       const float3 direction = cosineSampleHemisphere(geometricNormal, xi);
       ray probe(rayOrigin, direction, sceneScale * 1e-3f, radius);
-      // Closest-hit, not accept-any: the falloff needs the nearest occluder.
-      intersection_query<triangle_data, instancing> query(probe, scene, rayMask);
+      // Contact mode needs the nearest occluder for its falloff; sky visibility, any.
+      intersection_query<triangle_data, instancing> query(probe, scene, occlusionMask, occlusionParams);
       while (query.next()) {
         if (query.get_candidate_intersection_type() == intersection_type::triangle &&
             candidateIsSolid(query.get_candidate_instance_id(), query.get_candidate_primitive_id(),
@@ -251,9 +263,8 @@ fragment ForwardOutput FORWARD_FRAGMENT(Varyings input [[stage_in]],
                              indices, vertices, maps, tableSampler))
           query.commit_triangle_intersection();
       }
-      open += query.get_committed_intersection_type() == intersection_type::none
-                  ? 1.0f
-                  : saturate(query.get_committed_distance() / radius);
+      if (query.get_committed_intersection_type() == intersection_type::none) open += 1.0f;
+      else if (!skyVisibility) open += saturate(query.get_committed_distance() / radius);
     }
     occlusion = min(occlusion, open / float(samples));
   }

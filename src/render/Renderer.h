@@ -52,7 +52,7 @@ struct RenderSettings {
   float shadowDistance = 0.0f; // Zero means the whole scene.
   bool freezeCascades = false;
 
-  int occlusionMode = 0; // 0 texture, 1 traced
+  int occlusionMode = 0; // 0 texture, 1 traced contact (fades with distance), 2 traced sky visibility
   int occlusionSamples = 4;
   float occlusionRadius = 0.0f; // Zero means a fraction of the scene's radius.
 
@@ -181,6 +181,11 @@ public:
   const GpuProfiler *finishProfiling();
   Vec3 sunDirection() const;
   void rebakeProceduralSky();
+  // The model's bounding radius; traced effects scale their offsets and radii by it.
+  float sceneScale() const;
+  // How far an occluder of anything traced can be: the diagonal of the model and, when it is
+  // drawn, the ground plane together.
+  float occlusionReach() const;
   // Every material set holds the environment cubes and must be rewritten.
   void environmentChanged() { rebuildSceneResources(); }
   void applyGroundMaterial();
@@ -216,7 +221,6 @@ private:
   void recordReflections(VkCommandBuffer command);
   void recordBloom(VkCommandBuffer command);
   void recordPost(VkCommandBuffer command, std::uint32_t imageIndex);
-  float sceneScale() const;
   std::uint64_t settingsKey() const;
   void buildLights();
   void buildHitTextureTable(Scene &scene, std::vector<VkImageView> &views, std::vector<std::uint32_t> &slots,

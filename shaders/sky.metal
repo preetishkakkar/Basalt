@@ -35,9 +35,15 @@ fragment SkyOutput sky_fragment(SkyVaryings input [[stage_in]],
                                 sampler clampSampler [[sampler(0)]]) {
   const float4 far = frame.inverseViewProjection * float4(input.ndc, 1.0e-6f, 1.0f);
   const float3 direction = normalize(far.xyz / far.w - frame.cameraPosition.xyz);
-  const float3 radiance = environmentCube.sample(clampSampler, direction, level(0.0f)).rgb;
+  float3 radiance = environmentCube.sample(clampSampler, direction, level(0.0f)).rgb * frame.environment.x;
+  // The analytic sun of an .hdr it was extracted from: its irradiance spread over the disc,
+  // whose solid angle 4 pi sin^2(r / 2) keeps its precision for a sub-degree radius.
+  if (frame.sunDirection.w > 0.0f && dot(direction, normalize(frame.sunDirection.xyz)) >= frame.sunDirection.w) {
+    const float halfRadius = sin(max(frame.rays.z, 1e-4f) * 0.5f);
+    radiance += frame.sunColor.rgb * frame.sunColor.w / max(4.0f * kPi * halfRadius * halfRadius, 1e-12f);
+  }
   SkyOutput out;
-  out.color = float4(radiance * frame.environment.x, 1.0f);
+  out.color = float4(radiance, 1.0f);
   out.normalRoughness = float4(0.0f, 0.0f, 0.0f, 1.0f);
   out.reflectionWeight = float4(0.0f);
   out.baseMetallic = float4(0.0f);
