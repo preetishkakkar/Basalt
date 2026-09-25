@@ -21,6 +21,34 @@
 
 namespace basalt {
 
+class GpuLbvhBuilder;
+class GpuBvhCollapser;
+
+// Software GPU BVH builders, as RenderSettings::pathBvhBuilder numbers them; the names are
+// --bvh-builder's and the capture metadata's.
+inline constexpr const char *kBvhBuilderNames[] = {"cpu-sah", "gpu-serial", "gpu-lbvh", "gpu-ploc"};
+inline constexpr int kBvhBuilderCount = static_cast<int>(sizeof(kBvhBuilderNames) / sizeof(kBvhBuilderNames[0]));
+inline const char *bvhBuilderName(int builder) {
+  return builder >= 0 && builder < kBvhBuilderCount ? kBvhBuilderNames[builder] : "unknown";
+}
+
+// What the last software BVH build measured, for the metadata and the interface.
+struct SoftwareBvhReport {
+  int builder = 0;
+  double buildMilliseconds = 0.0;     // the builder alone: CPU wall time, or the GPU build's
+  double collapseMilliseconds = 0.0;  // binary to quantized wide conversion; 0 for binary
+  double topCost = 0.0, bottomCost = 0.0;              // SAH cost of the binary tree
+  double layoutTopCost = 0.0, layoutBottomCost = 0.0;  // of the traversed layout (the wide tree when wide)
+  std::uint32_t layoutNodes = 0;                       // nodes of the traversed layout
+  std::vector<double> stageMilliseconds;               // GPU builders: kGpuBvhStageNames order
+  std::uint32_t plocIterations = 0;                    // gpu-ploc: merge iterations that merged
+  // Animated scenes: the per-frame updates (a GPU LBVH refit and/or TLAS rebuild, then the wide
+  // re-emit or collapse; a full build for the other builders or --bvh-update rebuild).
+  std::uint32_t refits = 0, topRebuilds = 0, fullBuilds = 0;
+  std::vector<double> updateMilliseconds;     // wall clock per update, readbacks included
+  std::vector<double> updateGpuMilliseconds;  // the update's kernels
+};
+
 struct RenderSettings {
   float sunAzimuth = radians(40.0f);
   float sunElevation = radians(35.0f);
@@ -93,7 +121,13 @@ struct RenderSettings {
   bool pathDenoise = false;   // Intel Open Image Denoise over the image on screen
   bool pathTemporal = false;  // traced temporal/a-trous display reconstruction; raw capture stays raw
   int pathBvhDiagnostic = 0;  // software GPU only: 0 shaded, 1 node visits, 2 triangle tests
-  int pathBvhBuilder = 0;     // software GPU only: 0 CPU SAH, 1 GPU LBVH
+  int pathBvhUpdate = 0;      // software GPU only: 0 on change (animated: refit / TLAS rebuild), 1 full build every frame,
+                              // 2 on change, animated: refit only (moved instances refit the TLAS instead of rebuilding it)
+  int animate = 0;            // software GPU only, synthetic seeded motion per frame: 0 off, 1 instances, 2 vertices, 3 both
+  int pathWideStack = 0;      // wide kernels' traversal stack: 0 auto (96 in the megakernel, where it is faster; 64 in the
+                              // wavefront stages unless the tree needs 96), 1 always 96, 2 64 unless the tree needs 96
+  int pathBvhBuilder = 0;     // software GPU only: kBvhBuilderNames (0 CPU SAH, 1 serial GPU LBVH, 2 parallel GPU LBVH,
+                              // 3 parallel GPU PLOC)
   int pathBvhWidth = 0;       // software GPU only: 0 binary, 1 quantized BVH4, 2 quantized BVH8
   int pathExecution = 0;      // GPU tracer: 0 megakernel (iterative raygen for the ray pipeline), 1 wavefront queues
   int pathWaveCapacity = 0;   // wavefront: paths per batch; 0 automatic (pt::kWavefrontDefaultPaths within device limits)
@@ -203,6 +237,9 @@ public:
     if (settings.renderer == 3) return softwareBvhVersion == sceneVersion ? &softwareBvhStatistics : nullptr;
     return nullptr;
   }
+  const SoftwareBvhReport *softwareBvh() const {
+    return settings.renderer == 3 && softwareBvhVersion == sceneVersion ? &softwareBvhReport : nullptr;
+  }
   unsigned cpuThreadCount() const { return cpuTracer ? cpuTracer->threads() : 0u; }
   std::string denoiserStatus() const { return cpuTracer ? cpuTracer->denoiserStatus() : std::string(); }
   std::uint32_t denoisedSamples() const { return cpuImage.denoisedSamples; }
@@ -233,6 +270,10 @@ private:
   void recordPathComparison(VkCommandBuffer command);
   void buildCpuScene();
   void buildSoftwareBvh();
+  void recordSoftwareBvhUpdate(VkCommandBuffer command, bool moved, bool warped);
+  void checkSoftwareBvhFrame(std::uint32_t slot);
+  void selectWideStack(bool deep);
+  void animateScene(VkCommandBuffer command, bool inFrame);
   void ensureEmissiveTriangles();
   pt::PathUniforms makePathUniforms(const Camera &camera);
   struct FrameResources;
@@ -433,11 +474,45 @@ private:
   Buffer softwareBvhNodes, softwareBvhTriangles;
   Buffer softwareTraceInstanceBuffer;  // the builder's instance rows, read only by own-BVH sets
   pt::BvhStatistics softwareBvhStatistics{};
+  SoftwareBvhReport softwareBvhReport{};
+  std::unique_ptr<GpuLbvhBuilder> gpuLbvhBuilder;  // made on first use
+  std::unique_ptr<GpuBvhCollapser> gpuBvhCollapser;  // made on first use
   std::uint32_t softwareBvhVersion = ~0u;
   int softwareBvhBuilder = -1;
   int softwareBvhWidth = -1;
   VkDeviceSize softwareBvhScratchBytes = 0, softwareBvhOutputBytes = 0;
   std::uint32_t softwareBvhRadixPasses = 0, softwareBvhMaximumStack = 0;
+  // A GPU LBVH kept for updates (animated scenes): its binary nodes (the traced nodes unless
+  // wide), their count and the tree's depth, and the animation versions it reflects.
+  bool softwareBvhUpdatable = false;
+  // Animated GPU LBVH: updates recorded into each frame's command buffer (nothing waits). Wide
+  // layouts collapse in frame from the binary tree's rows (softwareBinaryRows, binary roots)
+  // into the traced rows. Each frame slot's update is timed and its status checked when the slot
+  // comes round again.
+  bool softwareBvhInFrame = false;
+  Buffer softwareBinaryRows;
+  VkQueryPool updateTimestamps = VK_NULL_HANDLE;
+  std::array<bool, kFramesInFlight> updateRecorded{};
+  // The wide tree's traversal stack bound, and whether the wide kernels are the deep-stack ones
+  // (PT_WIDE_BVH_STACK_DEEP), which a bound above 64 needs.
+  std::uint32_t softwareWideStack = 0;
+  bool wideStackNeeded = false;  // some tree since the last fresh build needed the deep stack
+  bool wideStackDeep = false;
+  Buffer softwareBvhBinaryNodes;
+  std::uint32_t softwareBvhBinaryCount = 0, softwareBvhDepth = 0;
+  std::uint32_t softwareBvhGeometry = 0, softwareBvhTransforms = 0;
+  // --animate: the rest pose (instance transforms, their world centres, the vertices), the
+  // frame counter and the versions of the moved geometry and transforms.
+  std::uint32_t animationVersion = ~0u, animationFrame = 0, animationGeometry = 0, animationTransforms = 0;
+  std::vector<Mat4> animationRest;
+  std::vector<Vec3> animationCentres;
+  float animationSize = 1.0f;
+  Buffer animationRestVertices;
+  std::array<Buffer, kFramesInFlight> animationControls;  // in-frame warps: each frame's wave
+  std::array<VkDescriptorSet, kFramesInFlight> animationSets{};
+  std::unique_ptr<DescriptorPool> animationPool;
+  std::unique_ptr<Program> animateProgram;
+  Pipeline animatePipeline;
   Buffer pathReconstructionSamples;
   std::unique_ptr<PathReconstruction> pathReconstruction;
   std::unique_ptr<GpuProfiler> profiler;  // GPU tracers: trace timing, stage marks on request

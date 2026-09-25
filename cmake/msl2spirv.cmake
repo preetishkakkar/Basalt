@@ -3,12 +3,12 @@
 # where the rest of the bundle already lives. A copy already in the tree is used
 # as it stands, so a locally built compiler is never overwritten.
 
-set(BASALT_MSL2SPIRV_VERSION "1.0.1"
+set(BASALT_MSL2SPIRV_VERSION "1.0.2"
     CACHE STRING "Version of msl2spirv to fetch")
 set(BASALT_MSL2SPIRV_URL
     "https://github.com/preetishkakkar/Basalt/releases/download/msl2spirv-${BASALT_MSL2SPIRV_VERSION}/msl2spirv-${BASALT_MSL2SPIRV_VERSION}-windows-x64.zip"
     CACHE STRING "Release asset holding msl2spirv.exe")
-set(BASALT_MSL2SPIRV_SHA256 "41a2f20a2d98444ecc1084b8721c1b14fd7c31d65193c1602e1accf8b7376f45"
+set(BASALT_MSL2SPIRV_SHA256 "212f182a7373f1a36a6cecac804907061bdbfc3dd2f7706f04c08c8357fbea5d"
     CACHE STRING "SHA-256 of that asset; the download is rejected without a match")
 option(BASALT_DOWNLOAD_MSL2SPIRV "Fetch msl2spirv when the tree has no copy" ON)
 

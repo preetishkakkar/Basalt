@@ -79,6 +79,8 @@ bool writeCaptureMetadata(const std::string &path, const CaptureMetadata &m) {
       << ", \"ray_query\": " << boolean(m.rayQuery) << ", \"ray_pipeline\": " << boolean(m.rayPipeline) << "}"
       << ",\n  \"backend\": {\"renderer\": " << quote(m.renderer) << ", \"intersector\": " << quote(m.intersector)
       << ", \"builder\": " << quote(m.builder) << ", \"bvh_layout\": " << quote(m.bvhLayout)
+      << ", \"bvh_update\": " << quote(m.bvhUpdate) << ", \"animation\": " << quote(m.animation)
+      << ", \"wide_stack\": " << quote(m.wideStack)
       << ", \"execution\": " << quote(m.execution) << ", \"cpu_threads\": " << m.cpuThreads << "}"
       << ",\n  \"integrator\": {\"spp\": " << m.spp << ", \"target_spp\": " << m.targetSpp
       << ", \"samples_per_dispatch\": " << m.samplesPerDispatch << ", \"bounces\": " << m.bounces

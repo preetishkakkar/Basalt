@@ -85,6 +85,9 @@ public:
   template <class T> void nameObject(T handle, VkObjectType type, const std::string &name) const {
     setName(reinterpret_cast<std::uint64_t>(handle), type, name);
   }
+  // A named command range for GPU profilers and debuggers (VK_EXT_debug_utils); no-ops without it.
+  void beginLabel(VkCommandBuffer command, const char *name) const;
+  void endLabel(VkCommandBuffer command) const;
 
 private:
   VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;

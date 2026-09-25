@@ -15,4 +15,11 @@ void simdgroup_barrier(mem_flags flags, memory_order order = memory_order_seq_cs
   __attribute__((annotate("msl.sync:simdgroup_barrier")));
 void atomic_thread_fence(mem_flags flags, memory_order order, thread_scope scope = thread_scope_device)
   __attribute__((annotate("msl.atomic:atomic_thread_fence")));
+// An msl2spirv extension (not in Apple's MSL; docs/SHARED_MEMORY.md): the invocations whose `lane`
+// equals `source` store `value` at `*slot`, a threadgroup barrier, every invocation reads `*slot`,
+// a second barrier. The result is workgroup-uniform, so branches and loop exits on it may contain
+// barriers. Portable sources define the same store/barrier/load/barrier sequence when
+// __METAL2VULKAN__ is not defined.
+template <typename T> T threadgroup_broadcast(T value, uint lane, uint source, threadgroup T *slot)
+  __attribute__((annotate("msl.sync:threadgroup_broadcast")));
 }

@@ -4,6 +4,7 @@
 #include "gpu/Swapchain.h"
 #include "gpu/Uploader.h"
 #include "platform/Window.h"
+#include "render/GpuBvhBuilder.h"
 #include "render/Renderer.h"
 #include "render/UiPass.h"
 #include "scene/Camera.h"
@@ -36,6 +37,16 @@ int rendererFromName(const std::string &name) {
   return name == "raster" ? 0 : name == "cpu" ? 1 : (name == "gpu" || name == "gpu-rt") ? 2 :
          (name == "gpu-bvh" || name == "gpu-software") ? 3 : name == "hybrid" ? 4 :
          (name == "gpu-pipeline" || name == "ray-pipeline") ? 5 : -2;
+}
+
+// --bvh-builder names (kBvhBuilderNames) and their aliases; -2 is unknown. "gpu" names the
+// fastest GPU builder available.
+int bvhBuilderFromName(const std::string &name) {
+  if (name == "cpu" || name == "cpu-sah") return 0;
+  if (name == "gpu-serial") return 1;
+  if (name == "gpu" || name == "gpu-lbvh") return 2;
+  if (name == "gpu-ploc") return 3;
+  return -2;
 }
 
 // A lifecycle transition applied before recording frame `frame` (--at-frame).
@@ -171,6 +182,7 @@ struct Application {
   bool exitAfterCapture = false;
   float viewDistanceScale = 1.0f;
   Buffer captureBuffer;
+  std::vector<double> frameWallMilliseconds;  // every frame's wall time, for the capture metadata
 
   ~Application() { context.waitIdle(); }
 
@@ -218,11 +230,16 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
                   active == 3 ? "software-bvh-compute" : active == 5 ? "driver-built-hardware-as" :
                   active == 4 ? "raster-primary-hardware-ray-query" : active == 2 ? "hardware-ray-query" : "not-applicable";
   m.builder = active == 1 ? (s.cpuIntersector == 1 ? "embree" : "cpu-binned-sah") :
-              active == 3 ? (s.pathBvhBuilder == 1 ? "gpu-lbvh" : "cpu-binned-sah") :
+              active == 3 ? (s.pathBvhBuilder == 3 ? "gpu-parallel-ploc" : s.pathBvhBuilder == 2 ? "gpu-parallel-lbvh" :
+                            s.pathBvhBuilder == 1 ? "gpu-serial-lbvh" : "cpu-binned-sah") :
               active == 0 ? "not-applicable" : "driver";
   m.bvhLayout = active == 3 ? (s.pathBvhWidth == 1 ? "quantized-bvh4" : s.pathBvhWidth == 2 ? "quantized-bvh8" : "binary-float") :
                 active == 1 ? (s.cpuIntersector == 2 ? "quantized-bvh8" : s.cpuIntersector == 1 ? "embree" : "binary-float") :
                 "not-applicable";
+  m.bvhUpdate = active == 3 ? (s.pathBvhUpdate == 1 ? "rebuild-every-frame" : s.pathBvhUpdate == 2 ? "refit" : "on-change")
+                            : "not-applicable";
+  m.wideStack = active == 3 && s.pathBvhWidth != 0 ? (s.pathWideStack == 1 ? "deep" : s.pathWideStack == 2 ? "shallow" : "auto") : "not-applicable";
+  m.animation = active == 3 && s.animate != 0 ? (s.animate == 1 ? "instances" : s.animate == 2 ? "vertices" : "both") : "off";
   m.execution = active == 1 ? "cpu-tiles" : active == 0 ? "not-applicable" : active == 4 ? "hybrid-megakernel" :
                 active == 5 ? (wavefront ? "wavefront-ray-pipeline" : "iterative-raygen") :
                 wavefront ? "wavefront" : "megakernel";
@@ -285,11 +302,38 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
       {"wavefront_queue_bytes", static_cast<double>(stats.wavefrontQueueBytes)},
       {"validation_enabled", context.validationEnabled ? 1.0 : 0.0},
   };
+  if (const SoftwareBvhReport *bvh = active == 3 ? renderer.softwareBvh() : nullptr) {
+    const pt::BvhStatistics *statistics = renderer.cpuBvh();
+    m.notes.push_back({"bvh_builder", bvhBuilderName(bvh->builder)});
+    m.measurements.push_back({"bvh_build_ms", bvh->buildMilliseconds});
+    m.measurements.push_back({"bvh_collapse_ms", bvh->collapseMilliseconds});
+    m.measurements.push_back({"bvh_sah_cost", bvh->bottomCost});
+    m.measurements.push_back({"bvh_sah_cost_tlas", bvh->topCost});
+    m.measurements.push_back({"bvh_layout_sah_cost", bvh->layoutBottomCost});
+    m.measurements.push_back({"bvh_layout_sah_cost_tlas", bvh->layoutTopCost});
+    m.measurements.push_back({"bvh_layout_nodes", static_cast<double>(bvh->layoutNodes)});
+    if (bvh->builder == 3) m.measurements.push_back({"bvh_ploc_iterations", static_cast<double>(bvh->plocIterations)});
+    if (statistics) {
+      m.measurements.push_back({"bvh_nodes", static_cast<double>(statistics->topNodes + statistics->bottomNodes)});
+      m.measurements.push_back({"bvh_depth_tlas", static_cast<double>(statistics->topDepth)});
+      m.measurements.push_back({"bvh_depth_blas", static_cast<double>(statistics->bottomDepth)});
+    }
+    for (std::size_t i = 0; i < bvh->stageMilliseconds.size() && i < kGpuBvhStageCount; ++i)
+      m.measurements.push_back({std::string("bvh_stage_ms_") + kGpuBvhStageNames[i], bvh->stageMilliseconds[i]});
+    if (!bvh->updateMilliseconds.empty()) {
+      m.measurements.push_back({"bvh_refits", static_cast<double>(bvh->refits)});
+      m.measurements.push_back({"bvh_tlas_rebuilds", static_cast<double>(bvh->topRebuilds)});
+      m.measurements.push_back({"bvh_full_rebuilds", static_cast<double>(bvh->fullBuilds)});
+      m.series.push_back({"bvh_update_ms", bvh->updateMilliseconds});
+      m.series.push_back({"bvh_update_gpu_ms", bvh->updateGpuMilliseconds});
+    }
+  }
   if (const pt::EnvironmentSun &sun = renderer.environment().sun(); sun.found) {
     m.measurements.push_back({"environment_sun_irradiance", pt::ptLuminance(sun.irradiance)});
     m.measurements.push_back({"environment_sun_radius_degrees", sun.angularRadius * 180.0 / 3.14159265358979323846});
     m.measurements.push_back({"environment_sun_share", sun.share});
   }
+  m.series.push_back({"frame_wall_ms", frameWallMilliseconds});
   if (const GpuProfiler *profile = active >= 2 ? renderer.finishProfiling() : nullptr) {
     m.series.push_back({"fresh_trace_gpu_ms", profile->traceSeries()});
     const GpuProfile &latest = profile->latest();
@@ -332,12 +376,11 @@ void Application::applyScheduledAction(const ScheduledAction &action) {
   } else if (action.key == "temporal") {
     s.pathTemporal = v == "on";
   } else if (action.key == "builder") {
-    s.pathBvhBuilder = v == "gpu" ? 1 : 0;
-    if (s.pathBvhBuilder == 1 && s.pathBvhWidth != 0)
-      throw std::runtime_error("the GPU LBVH builder produces the binary layout only");
+    const int builder = bvhBuilderFromName(v);
+    if (builder == -2) throw std::runtime_error("unknown scheduled BVH builder " + v);
+    s.pathBvhBuilder = builder;
   } else if (action.key == "layout") {
     s.pathBvhWidth = v == "bvh4" ? 1 : v == "bvh8" ? 2 : 0;
-    if (s.pathBvhWidth != 0) s.pathBvhBuilder = 0;  // as the interface does
   } else if (action.key == "spf") {
     s.pathSamplesPerFrame = std::max(1, std::atoi(v.c_str()));
   } else if (action.key == "yaw") {
@@ -562,26 +605,21 @@ void Application::drawInterface() {
       ImGui::TreePop();
     }
     if (settings.renderer == 3) {
-      const char *builders[] = {"CPU binned SAH", "GPU stable LBVH (binary only)"};
-      if (ImGui::BeginCombo("BVH builder", builders[std::clamp(settings.pathBvhBuilder, 0, 1)])) {
-        for (int choice = 0; choice < 2; ++choice) {
-          // The GPU builder emits the binary layout only; wide layouts need CPU SAH.
-          const bool available = choice == 0 || settings.pathBvhWidth == 0;
-          ImGui::BeginDisabled(!available);
-          if (ImGui::Selectable(builders[choice], settings.pathBvhBuilder == choice) && available)
-            settings.pathBvhBuilder = choice;
-          ImGui::EndDisabled();
-          if (!available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("The GPU LBVH builder produces binary nodes; choose the binary layout first");
-        }
+      const char *builders[] = {"CPU binned SAH", "GPU serial LBVH", "GPU parallel LBVH", "GPU parallel PLOC"};
+      static_assert(std::size(builders) == static_cast<std::size_t>(kBvhBuilderCount));
+      if (ImGui::BeginCombo("BVH builder", builders[std::clamp(settings.pathBvhBuilder, 0, kBvhBuilderCount - 1)])) {
+        for (int choice = 0; choice < kBvhBuilderCount; ++choice)
+          if (ImGui::Selectable(builders[choice], settings.pathBvhBuilder == choice)) settings.pathBvhBuilder = choice;
         ImGui::EndCombo();
       }
-      if (ImGui::Combo("BVH layout", &settings.pathBvhWidth,
-                       "Binary float bounds\0BVH4 quantized bounds\0BVH8 quantized bounds\0") &&
-          settings.pathBvhWidth != 0)
-        settings.pathBvhBuilder = 0;
-      if (settings.pathBvhWidth != 0)
-        ImGui::TextDisabled("Wide layouts currently use the CPU SAH builder");
+      ImGui::Combo("BVH layout", &settings.pathBvhWidth,
+                   "Binary float bounds\0BVH4 quantized bounds\0BVH8 quantized bounds\0");
+      if (ImGui::Combo("Animation", &settings.animate, "Off\0Instances\0Vertices\0Both\0") && settings.animate != 0)
+        settings.pathTemporal = false;
+      if (settings.animate != 0 && ImGui::IsItemHovered())
+        ImGui::SetTooltip("Synthetic motion for measuring BVH updates; a GPU parallel LBVH refits or rebuilds its TLAS");
+      if (settings.pathBvhWidth != 0 && ImGui::IsItemHovered())
+        ImGui::SetTooltip("GPU builders collapse their tree to this layout on the GPU");
       if (ImGui::Combo("BVH diagnostic", &settings.pathBvhDiagnostic,
                        "Shaded\0Node visits\0Triangle tests\0") && settings.pathBvhDiagnostic != 0)
         settings.pathTemporal = false;
@@ -654,12 +692,12 @@ void Application::drawInterface() {
       ImGui::TextDisabled("%s, %u samples", denoiserState.empty() ? "starting" : denoiserState.c_str(), renderer.denoisedSamples());
     }
     if (const pt::BvhStatistics *bvh = renderer.cpuBvh()) {
-      if (settings.renderer == 3)
-        ImGui::TextWrapped("GPU BVH (%s): %u instances, %u triangles, %u + %u nodes, built %s in %.0f ms",
+      if (const SoftwareBvhReport *report = renderer.softwareBvh())
+        ImGui::TextWrapped("GPU BVH (%s, %s): %u instances, %u triangles, %u + %u nodes, SAH %.1f + %.1f, built in %.1f ms",
                            settings.pathBvhWidth == 1 ? "quantized BVH4" : settings.pathBvhWidth == 2 ? "quantized BVH8" : "binary",
-                           bvh->instances, bvh->triangles, bvh->topNodes, bvh->bottomNodes,
-                           settings.pathBvhBuilder == 1 ? "by GPU LBVH" : "on CPU (SAH)", bvh->milliseconds);
-      else
+                           bvhBuilderName(report->builder), bvh->instances, bvh->triangles, bvh->topNodes, bvh->bottomNodes,
+                           report->layoutTopCost, report->layoutBottomCost, report->buildMilliseconds);
+      else if (settings.renderer != 3)
         ImGui::TextWrapped("BVH: %u instances, %u triangles, %u + %u nodes, built in %.0f ms on %u threads",
                            bvh->instances, bvh->triangles, bvh->topNodes, bvh->bottomNodes, bvh->milliseconds,
                            renderer.cpuThreadCount());
@@ -949,6 +987,7 @@ void Application::run(const std::string &initialScene, const std::string &initia
     const auto now = std::chrono::high_resolution_clock::now();
     const float delta = std::chrono::duration<float>(now - previous).count();
     previous = now;
+    if (framesRendered > 0) frameWallMilliseconds.push_back(delta * 1000.0);
     frameMilliseconds = frameMilliseconds * 0.9f + delta * 1000.0f * 0.1f;
     frameHistory[frameCursor] = frameMilliseconds;
     frameCursor = (frameCursor + 1) % IM_ARRAYSIZE(frameHistory);
@@ -1099,8 +1138,9 @@ constexpr const char *kUsage =
     "         --no-ui  --no-vsync  --no-validation  --device NAME\n"
     "Renderer: --renderer raster|cpu|gpu|gpu-bvh|gpu-pipeline|hybrid\n"
     "Path tracing: --bounces N  --strategy 0|1|2  --seed N  --spf N  --threads N  --intersector own|embree|avx2\n"
-    "         --denoise  --path-execution megakernel|wavefront  --bvh-builder cpu|gpu  --bvh-width binary|bvh4|bvh8\n"
-    "         --bvh-cost off|nodes|triangles  --path-temporal  --texture-filter level0|raycone\n"
+    "         --denoise  --path-execution megakernel|wavefront  --bvh-builder cpu|gpu|gpu-serial|gpu-lbvh|gpu-ploc  --bvh-width binary|bvh4|bvh8\n"
+    "         --bvh-cost off|nodes|triangles  --bvh-update on-change|rebuild|refit  --animate off|instances|vertices|both\n"
+    "         --wide-stack auto|deep|shallow  --path-temporal  --texture-filter level0|raycone\n"
     "         --aperture R  --focus-distance D  --di-estimator nee|restir  --restir-reuse none|temporal|spatial|both\n"
     "         --restir-candidates N  --hybrid-comparison traced|raster|difference|split|spp  --gpu-profile\n"
     "         --wavefront-capacity N  --wavefront-allocation auto|subgroup|atomic  --wavefront-fusion auto|on|off\n"
@@ -1156,6 +1196,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
   int bvhDiagnostic = -1;
   int bvhBuilder = -1;
   int bvhWidth = -1;
+  int bvhUpdate = -1;
+  int animate = -1;
+  int wideStack = -1;
   int pathExecution = -1;
   int pathExecutionSwitchFrame = -1;
   int hybridComparison = -1;
@@ -1327,9 +1370,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
         deviceSelection = std::filesystem::path(arguments[++i]).string();
       } else if (argument == "--bvh-builder" && i + 1 < count) {
         const std::string name = std::filesystem::path(arguments[++i]).string();
-        bvhBuilder = name == "cpu" ? 0 : name == "gpu" ? 1 : -2;
+        bvhBuilder = basalt::bvhBuilderFromName(name);
         if (bvhBuilder == -2) {
-          basalt::logError("unknown BVH builder {}: cpu or gpu", name);
+          basalt::logError("unknown BVH builder {}: cpu, gpu, gpu-serial, gpu-lbvh or gpu-ploc", name);
           argumentError = true;
         }
       } else if (argument == "--bvh-width" && i + 1 < count) {
@@ -1338,6 +1381,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
                    name == "8" || name == "bvh8" ? 2 : -2;
         if (bvhWidth == -2) {
           basalt::logError("unknown BVH width {}: binary, 4/bvh4 or 8/bvh8", name);
+          argumentError = true;
+        }
+      } else if (argument == "--bvh-update" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        bvhUpdate = name == "on-change" ? 0 : name == "rebuild" ? 1 : name == "refit" ? 2 : -2;
+        if (bvhUpdate == -2) {
+          basalt::logError("unknown BVH update {}: on-change, rebuild or refit", name);
+          argumentError = true;
+        }
+      } else if (argument == "--wide-stack" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        wideStack = name == "auto" ? 0 : name == "deep" ? 1 : name == "shallow" ? 2 : -2;
+        if (wideStack == -2) {
+          basalt::logError("unknown wide stack {}: auto, deep or shallow", name);
+          argumentError = true;
+        }
+      } else if (argument == "--animate" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        animate = name == "off" ? 0 : name == "instances" ? 1 : name == "vertices" ? 2 : name == "both" ? 3 : -2;
+        if (animate == -2) {
+          basalt::logError("unknown animation {}: off, instances, vertices or both", name);
           argumentError = true;
         }
       } else if (argument == "--path-execution" && i + 1 < count) {
@@ -1486,8 +1550,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       throw std::runtime_error("--bvh-builder requires --renderer gpu-bvh");
     if (bvhWidth >= 0 && rendererKind != 3)
       throw std::runtime_error("--bvh-width requires --renderer gpu-bvh");
-    if (bvhWidth > 0 && bvhBuilder == 1)
-      throw std::runtime_error("quantized wide BVHs currently require --bvh-builder cpu");
+    if (bvhUpdate >= 0 && rendererKind != 3)
+      throw std::runtime_error("--bvh-update requires --renderer gpu-bvh");
+    if (wideStack >= 0 && rendererKind != 3)
+      throw std::runtime_error("--wide-stack requires --renderer gpu-bvh");
+    if (animate > 0 && rendererKind != 3)
+      throw std::runtime_error("--animate requires --renderer gpu-bvh");
+    if (animate > 0 && pathTemporal)
+      throw std::runtime_error("--animate cannot be combined with --path-temporal: its history assumes a still scene");
     if (hybridComparison >= 0 && rendererKind != 4)
       throw std::runtime_error("--hybrid-comparison requires --renderer hybrid");
     if (pathExecution == 1 && rendererKind != 2 && rendererKind != 3 && rendererKind != 5)
@@ -1539,6 +1609,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     if (bvhDiagnostic >= 0) application.renderer.settings.pathBvhDiagnostic = bvhDiagnostic;
     if (bvhBuilder >= 0) application.renderer.settings.pathBvhBuilder = bvhBuilder;
     if (bvhWidth >= 0) application.renderer.settings.pathBvhWidth = bvhWidth;
+    if (bvhUpdate >= 0) application.renderer.settings.pathBvhUpdate = bvhUpdate;
+    if (animate >= 0) application.renderer.settings.animate = animate;
+    if (wideStack >= 0) application.renderer.settings.pathWideStack = wideStack;
     if (pathExecution >= 0) application.renderer.settings.pathExecution = pathExecution;
     if (hybridComparison >= 0) application.renderer.settings.pathComparison = hybridComparison;
     // A capture that waits for N samples lets the tracer stop there.

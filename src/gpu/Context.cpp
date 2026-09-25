@@ -460,6 +460,23 @@ VkFormat Context::selectFormat(const std::vector<VkFormat> &candidates,
   throw Error("no candidate format supports the requested features on this device");
 }
 
+void Context::beginLabel(VkCommandBuffer command, const char *name) const {
+  if (!debugUtils) return;
+  static auto begin = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+      vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT"));
+  if (!begin) return;
+  VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+  label.pLabelName = name;
+  begin(command, &label);
+}
+
+void Context::endLabel(VkCommandBuffer command) const {
+  if (!debugUtils) return;
+  static auto end = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+      vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT"));
+  if (end) end(command);
+}
+
 void Context::setName(std::uint64_t handle, VkObjectType type, const std::string &name) const {
   if (!debugUtils || !device) return;
   static auto setNameEXT = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(

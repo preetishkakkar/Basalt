@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -490,7 +491,604 @@ struct SamplerOwner {
   }
 };
 
-int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool rayPipeline) {
+struct DownloadedTree {
+  std::vector<pt::float4> nodes, triangles;
+  std::vector<pt::TraceInstance> instances;
+};
+
+DownloadedTree downloadTree(Uploader &uploader, const GpuBvhBuildResult &build) {
+  DownloadedTree tree;
+  const std::vector<std::uint8_t> nodes = uploader.readBuffer(build.nodes, build.nodes.size);
+  const std::vector<std::uint8_t> triangles = uploader.readBuffer(build.triangles, build.triangles.size);
+  tree.nodes.resize(nodes.size() / sizeof(pt::float4));
+  // Only the published triangles: an empty scene's one-element buffer is never written.
+  tree.triangles.resize(static_cast<std::size_t>(build.statistics.triangles) * 3u);
+  std::memcpy(tree.nodes.data(), nodes.data(), nodes.size());
+  std::memcpy(tree.triangles.data(), triangles.data(), tree.triangles.size() * sizeof(pt::float4));
+  tree.instances = build.instances;
+  return tree;
+}
+
+bool sameBits(const pt::float4 &a, const pt::float4 &b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
+
+// Two published binary trees are the same tree when, walked from the same roots, every
+// child slot matches bitwise (bounds, count, and the data of leaves) and interior children
+// match recursively. Interior node numbering is not compared. "" when identical.
+std::string compareTrees(const DownloadedTree &a, const DownloadedTree &b) {
+  if (a.nodes.size() != b.nodes.size()) return "node arrays differ in size";
+  if (a.triangles.size() != b.triangles.size()) return "triangle arrays differ in size";
+  for (std::size_t i = 0; i < a.triangles.size(); ++i)
+    if (!sameBits(a.triangles[i], b.triangles[i])) return "triangle float4 " + std::to_string(i) + " differs";
+  if (a.instances.size() != b.instances.size()) return "instance counts differ";
+  struct Pair { pt::uint na, nb; };
+  std::vector<Pair> stack{{0u, 0u}};
+  for (std::size_t i = 0; i < a.instances.size(); ++i) {
+    if (a.instances[i].triangleOffset != b.instances[i].triangleOffset) return "instance triangle offsets differ";
+    stack.push_back({a.instances[i].blasRoot, b.instances[i].blasRoot});
+  }
+  std::size_t visited = 0;
+  const std::size_t nodeCount = a.nodes.size() / 4u;
+  while (!stack.empty()) {
+    const Pair pair = stack.back();
+    stack.pop_back();
+    if (pair.na >= nodeCount || pair.nb >= nodeCount) return "a child index is outside the node array";
+    if (++visited > nodeCount) return "a tree revisits nodes";
+    for (pt::uint side = 0; side < 2u; ++side) {
+      const pt::float4 &lowA = a.nodes[pair.na * 4u + side * 2u], &highA = a.nodes[pair.na * 4u + side * 2u + 1u];
+      const pt::float4 &lowB = b.nodes[pair.nb * 4u + side * 2u], &highB = b.nodes[pair.nb * 4u + side * 2u + 1u];
+      const pt::uint countA = pt::as_type<pt::uint>(highA.w), countB = pt::as_type<pt::uint>(highB.w);
+      const pt::uint dataA = pt::as_type<pt::uint>(lowA.w), dataB = pt::as_type<pt::uint>(lowB.w);
+      if (!sameBits(highA, highB) || countA != countB ||
+          std::memcmp(&lowA, &lowB, 3 * sizeof(float)) != 0)
+        return "nodes " + std::to_string(pair.na) + " / " + std::to_string(pair.nb) + " differ in child " +
+               std::to_string(side) + "'s bounds or count";
+      const bool interior = countA == 0u && dataA != 0xFFFFFFFFu;
+      if (interior) stack.push_back({dataA, dataB});
+      else if (dataA != dataB)
+        return "nodes " + std::to_string(pair.na) + " / " + std::to_string(pair.nb) + " differ in leaf data";
+    }
+  }
+  return {};
+}
+
+// A published binary tree is well formed: walked from its roots, every node is reached once and
+// all are reached; an interior child's slot bounds its node's children; every bottom-level leaf
+// is one triangle of its instance, each once, inside its slot's bounds; every top-level leaf is
+// one instance, each once. "" when well formed.
+std::string checkTree(const DownloadedTree &tree) {
+  const std::size_t nodeCount = tree.nodes.size() / 4u, triangleCount = tree.triangles.size() / 3u;
+  const std::size_t instanceCount = tree.instances.size();
+  std::vector<std::uint8_t> reached(nodeCount, 0u), triangleSeen(triangleCount, 0u), instanceSeen(instanceCount, 0u);
+  // Each instance's triangles: from its offset to the next larger offset (or the end).
+  std::vector<pt::uint> offsets;
+  for (const pt::TraceInstance &instance : tree.instances) offsets.push_back(instance.triangleOffset);
+  std::sort(offsets.begin(), offsets.end());
+  auto triangleEnd = [&](pt::uint first) {
+    const auto next = std::upper_bound(offsets.begin(), offsets.end(), first);
+    return next == offsets.end() ? static_cast<pt::uint>(triangleCount) : *next;
+  };
+  // Subnormal coordinates (of the point and of the box) compare as zero: devices may flush them
+  // in the builders' box arithmetic (Vulkan's default float controls), and every GPU builder's
+  // boxes then do.
+  auto inside = [](const pt::float4 &low, const pt::float4 &high, float x, float y, float z) {
+    auto f = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? 0.0f : v; };
+    return f(low.x) <= f(x) && f(x) <= f(high.x) && f(low.y) <= f(y) && f(y) <= f(high.y) && f(low.z) <= f(z) &&
+           f(z) <= f(high.z);
+  };
+  struct Entry { pt::uint node; std::int64_t instance; };  // instance -1: the TLAS
+  std::vector<Entry> stack{{0u, -1}};
+  for (std::size_t i = 0; i < instanceCount; ++i) stack.push_back({tree.instances[i].blasRoot, std::int64_t(i)});
+  std::size_t visited = 0;
+  while (!stack.empty()) {
+    const Entry entry = stack.back();
+    stack.pop_back();
+    if (entry.node >= nodeCount) return "a child index is outside the node array";
+    if (reached[entry.node]++ != 0u) return "node " + std::to_string(entry.node) + " is reached twice";
+    ++visited;
+    for (pt::uint side = 0; side < 2u; ++side) {
+      const pt::float4 &low = tree.nodes[entry.node * 4u + side * 2u], &high = tree.nodes[entry.node * 4u + side * 2u + 1u];
+      const pt::uint data = pt::as_type<pt::uint>(low.w), count = pt::as_type<pt::uint>(high.w);
+      const std::string where = "node " + std::to_string(entry.node) + " child " + std::to_string(side);
+      if (data == 0xFFFFFFFFu) {
+        if (count != 0u) return where + " is empty with a count";
+        continue;
+      }
+      if (count == 0u) {
+        if (data >= nodeCount) return where + " points outside the node array";
+        for (pt::uint inner = 0; inner < 2u; ++inner) {
+          const pt::float4 &innerLow = tree.nodes[data * 4u + inner * 2u];
+          const pt::float4 &innerHigh = tree.nodes[data * 4u + inner * 2u + 1u];
+          if (pt::as_type<pt::uint>(innerLow.w) == 0xFFFFFFFFu) continue;
+          if (!inside(low, high, innerLow.x, innerLow.y, innerLow.z) ||
+              !inside(low, high, innerHigh.x, innerHigh.y, innerHigh.z))
+            return where + " does not bound its node's children";
+        }
+        stack.push_back({data, entry.instance});
+        continue;
+      }
+      if (count != 1u) return where + " is a leaf of " + std::to_string(count) + " primitives";
+      if (entry.instance < 0) {
+        if (data >= instanceCount || instanceSeen[data]++ != 0u) return where + " is a missing or repeated instance";
+        continue;
+      }
+      const pt::uint first = tree.instances[std::size_t(entry.instance)].triangleOffset;
+      if (data < first || data >= triangleEnd(first) || triangleSeen[data]++ != 0u)
+        return where + " is a triangle outside its instance or a repeated one";
+      for (pt::uint vertex = 0; vertex < 3u; ++vertex) {
+        const pt::float4 &position = tree.triangles[data * 3u + vertex];
+        if (!inside(low, high, position.x, position.y, position.z)) {
+          char values[256];
+          std::snprintf(values, sizeof(values), " (%a %a %a outside %a %a %a .. %a %a %a)", position.x, position.y,
+                        position.z, low.x, low.y, low.z, high.x, high.y, high.z);
+          return where + " does not bound its triangle" + values;
+        }
+      }
+    }
+  }
+  if (visited != nodeCount) return "only " + std::to_string(visited) + " of " + std::to_string(nodeCount) + " nodes are reached";
+  for (std::size_t i = 0; i < triangleCount; ++i)
+    if (triangleSeen[i] == 0u) return "triangle " + std::to_string(i) + " is in no leaf";
+  for (std::size_t i = 0; i < instanceCount; ++i)
+    if (instanceSeen[i] == 0u) return "instance " + std::to_string(i) + " is in no leaf";
+  return {};
+}
+
+// The parallel builder's radix sort against std::stable_sort on (hi, lo): exact equality,
+// over sizes around the 1024-key tile and with many duplicate keys.
+void runSortTest(Uploader &uploader, GpuLbvhBuilder &builder) {
+  std::mt19937 random(20260924u);
+  const std::uint32_t sizes[] = {0u, 1u, 2u, 1000u, 1023u, 1024u, 1025u, 4097u, 300000u};
+  const std::uint32_t segmentCounts[] = {1u, 7u, 300u};
+  for (const std::uint32_t count : sizes) {
+    for (const std::uint32_t segments : segmentCounts) {
+      std::vector<std::uint32_t> lo(count), hi(count), values(count);
+      for (std::uint32_t i = 0; i < count; ++i) {
+        // Few distinct low keys (heavy duplication) mixed with full 30-bit codes.
+        lo[i] = (i % 3u == 0u) ? static_cast<std::uint32_t>(random() % 16u) : static_cast<std::uint32_t>(random() & 0x3FFFFFFFu);
+        hi[i] = static_cast<std::uint32_t>(random() % segments);
+        values[i] = i;
+      }
+      std::vector<std::uint32_t> order(count);
+      for (std::uint32_t i = 0; i < count; ++i) order[i] = i;
+      std::stable_sort(order.begin(), order.end(), [&](std::uint32_t x, std::uint32_t y) {
+        return hi[x] != hi[y] ? hi[x] < hi[y] : lo[x] < lo[y];
+      });
+      const std::uint32_t highPasses = segments > 1u ? (static_cast<std::uint32_t>(std::bit_width(segments - 1u)) + 7u) / 8u : 0u;
+      std::vector<std::uint32_t> gpuLo = lo, gpuHi = hi, gpuValues = values;
+      builder.sortTriples(uploader, gpuLo, gpuHi, gpuValues, highPasses);
+      for (std::uint32_t i = 0; i < count; ++i)
+        if (gpuValues[i] != order[i] || gpuLo[i] != lo[order[i]] || gpuHi[i] != hi[order[i]])
+          throw Error("GPU radix sort differs from std::stable_sort at " + std::to_string(i) + " of " +
+                      std::to_string(count) + " keys, " + std::to_string(segments) + " segments");
+    }
+  }
+  std::printf("PASS: GPU radix sort equals std::stable_sort (0 to 300000 keys, 1 to 300 segments)\n");
+}
+
+// The GPU collapse of a resident binary tree against pt::buildWideBvh of the same tree: the
+// nodes byte for byte, the bottom levels' roots and the traversal stack bound.
+GpuWideCollapseResult checkCollapse(Uploader &uploader, GpuBvhCollapser &collapser, const Buffer &resident,
+                                    const std::vector<pt::float4> &binaryNodes,
+                                    const std::vector<pt::TraceInstance> &instances, std::uint32_t width,
+                                    const std::string &what, const pt::BvhStatistics &statistics) {
+  pt::Bvh binary;
+  binary.nodes = binaryNodes;
+  const pt::WideBvh reference = pt::buildWideBvh(binary, instances, width);
+  GpuWideCollapseResult gpu = collapser.collapse(
+      uploader, resident, static_cast<std::uint32_t>(binaryNodes.size() / 4u), instances, width,
+      statistics.topDepth + statistics.bottomDepth);
+  const std::string label = "GPU BVH" + std::to_string(width) + " collapse of the " + what;
+  if (gpu.nodeCount != reference.nodes.size())
+    throw Error(label + " published " + std::to_string(gpu.nodeCount) + " nodes, the host " +
+                std::to_string(reference.nodes.size()));
+  const std::vector<std::uint8_t> bytes = uploader.readBuffer(gpu.nodes, gpu.nodes.size);
+  for (std::size_t n = 0; n < reference.nodes.size(); ++n) {
+    std::uint32_t words[40]{}, expected[40]{};
+    std::memcpy(words, bytes.data() + n * sizeof(pt::QuantizedWideNode), sizeof(words));
+    std::memcpy(expected, &reference.nodes[n], sizeof(expected));
+    for (std::uint32_t w = 0; w < 40u; ++w)
+      if (words[w] != expected[w]) {
+        char why[160];
+        std::snprintf(why, sizeof(why), " differs from the host at node %zu word %u: %08x, host %08x", n, w,
+                      words[w], expected[w]);
+        throw Error(label + why);
+      }
+  }
+  for (std::size_t i = 0; i < instances.size(); ++i)
+    if (gpu.instances[i].blasRoot != reference.instances[i].blasRoot)
+      throw Error(label + " numbered bottom level " + std::to_string(i) + "'s root differently");
+  if (gpu.maximumStack != reference.maximumStack)
+    throw Error(label + " bounds the traversal stack by " + std::to_string(gpu.maximumStack) + ", the host by " +
+                std::to_string(reference.maximumStack));
+  std::printf("PASS: %s publishes buildWideBvh's nodes byte for byte (%u nodes, %u levels, stack %u, "
+              "%u dispatches, GPU %.3f ms: gather %.3f, size %.3f, emit %.3f)\n", label.c_str(), gpu.nodeCount,
+              gpu.levels, gpu.maximumStack, gpu.dispatches, gpu.gpuMilliseconds, gpu.gatherMilliseconds,
+              gpu.sizeMilliseconds, gpu.emitMilliseconds);
+  return gpu;
+}
+
+// Boxes that stress the collapse's float rule: a plane on y = 0 (exact zeros, flat boxes, equal
+// areas), subnormal and signed-zero coordinates, and magnitudes whose areas overflow to
+// infinity, over four instances.
+void makeCollapseFixture(Fixture &fixture) {
+  const std::uint32_t material = addMaterial(fixture, AlphaMode::Opaque, 1.0f);
+  std::mt19937 random(4242u);
+  std::vector<Vec3> positions;
+  std::vector<std::uint32_t> indices;
+  auto triangle = [&](Vec3 a, Vec3 b, Vec3 c) {
+    const auto base = static_cast<std::uint32_t>(positions.size());
+    positions.insert(positions.end(), {a, b, c});
+    indices.insert(indices.end(), {base, base + 1u, base + 2u});
+  };
+  auto flush = [&](const Mat4 &model, const char *name) {
+    addMesh(fixture, positions, indices, material, model, name);
+    positions.clear();
+    indices.clear();
+  };
+  for (std::uint32_t z = 0; z < 48u; ++z)
+    for (std::uint32_t x = 0; x < 48u; ++x) {
+      const auto x0 = static_cast<float>(x), z0 = static_cast<float>(z);
+      triangle({x0, 0.0f, z0}, {x0 + 1.0f, 0.0f, z0}, {x0, 0.0f, z0 + 1.0f});
+    }
+  flush(Mat4{}, "collapse plane");
+  std::uniform_int_distribution<std::uint32_t> fraction(0u, 0x7FFFFFu);
+  auto tiny = [&] {
+    std::uint32_t bits = fraction(random) >> (random() % 24u);
+    if ((random() & 1u) != 0u) bits |= 0x80000000u;
+    return std::bit_cast<float>(bits);
+  };
+  for (std::uint32_t t = 0; t < 2000u; ++t)
+    triangle({tiny(), tiny(), tiny()}, {tiny(), tiny(), tiny()}, {tiny(), tiny(), tiny()});
+  flush(Mat4{}, "collapse subnormals");
+  std::uniform_real_distribution<float> mantissa(1.0f, 2.0f);
+  auto spread = [&] {
+    const float value = std::ldexp(mantissa(random), static_cast<int>(random() % 94u) - 30);
+    return (random() & 1u) != 0u ? -value : value;
+  };
+  for (std::uint32_t t = 0; t < 1500u; ++t)
+    triangle({spread(), spread(), spread()}, {spread(), spread(), spread()}, {spread(), spread(), spread()});
+  const std::vector<Vec3> spreadPositions = positions;
+  const std::vector<std::uint32_t> spreadIndices = indices;
+  flush(Mat4{}, "collapse magnitudes");
+  positions = spreadPositions;
+  indices = spreadIndices;
+  flush(transform(0.7f, {0.5f, 0.5f, 0.5f}, {5.0f, 0.0f, 0.0f}), "collapse magnitudes, moved");
+}
+
+void uploadFixture(Fixture &fixture, Uploader &uploader, const Context &context, const char *name) {
+  fixture.scene.vertexCount = static_cast<std::uint32_t>(fixture.vertices.size());
+  fixture.scene.indexCount = static_cast<std::uint32_t>(fixture.indices.size());
+  fixture.scene.triangleCount = fixture.scene.indexCount / 3;
+  fixture.scene.vertexBuffer = uploader.createBuffer(fixture.vertices.data(), fixture.vertices.size() * sizeof(Vertex),
+      geometryBufferUsage(context, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), std::string(name) + ".vertices");
+  fixture.scene.indexBuffer = uploader.createBuffer(fixture.indices.data(),
+      fixture.indices.size() * sizeof(std::uint32_t),
+      geometryBufferUsage(context, VK_BUFFER_USAGE_INDEX_BUFFER_BIT), std::string(name) + ".indices");
+}
+
+pt::BvhStatistics buildOnCpu(const Fixture &fixture, TraceScene &trace, pt::Bvh &bvh) {
+  std::vector<float> vertices(fixture.vertices.size() * pt::kVertexFloats);
+  std::memcpy(vertices.data(), fixture.vertices.data(), fixture.vertices.size() * sizeof(Vertex));
+  std::vector<std::uint32_t> triangleCounts;
+  triangleCounts.reserve(trace.primitives.size());
+  for (const std::uint32_t primitive : trace.primitives)
+    triangleCounts.push_back(fixture.scene.primitives[primitive].indexCount / 3);
+  return pt::buildBvh(vertices, fixture.indices, trace.instances, triangleCounts, bvh,
+                      std::max(1u, std::thread::hardware_concurrency()));
+}
+
+// A GPU build's binary nodes, as published.
+std::vector<pt::float4> downloadBinaryNodes(Uploader &uploader, const GpuBvhBuildResult &build) {
+  std::vector<pt::float4> nodes(static_cast<std::size_t>(build.status.nodes) * 4u);
+  const std::vector<std::uint8_t> bytes = uploader.readBuffer(build.nodes, nodes.size() * sizeof(pt::float4));
+  std::memcpy(nodes.data(), bytes.data(), bytes.size());
+  return nodes;
+}
+
+std::vector<std::uint8_t> downloadAll(Uploader &uploader, const Buffer &buffer) {
+  return uploader.readBuffer(buffer, buffer.size);
+}
+
+// Three meshes over four instances, for the refit test: a plane, a sphere-like soup and a
+// strip, two instances of the soup.
+void makeRefitFixture(Fixture &fixture) {
+  const std::uint32_t material = addMaterial(fixture, AlphaMode::Opaque, 1.0f);
+  std::mt19937 random(777u);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  std::vector<Vec3> positions;
+  std::vector<std::uint32_t> indices;
+  auto triangle = [&](Vec3 a, Vec3 b, Vec3 c) {
+    const auto base = static_cast<std::uint32_t>(positions.size());
+    positions.insert(positions.end(), {a, b, c});
+    indices.insert(indices.end(), {base, base + 1u, base + 2u});
+  };
+  auto flush = [&](const Mat4 &model, const char *name) {
+    addMesh(fixture, positions, indices, material, model, name);
+  };
+  for (std::uint32_t z = 0; z < 32u; ++z)
+    for (std::uint32_t x = 0; x < 32u; ++x) {
+      const float x0 = static_cast<float>(x) * 0.25f - 4.0f, z0 = static_cast<float>(z) * 0.25f - 4.0f;
+      triangle({x0, -1.0f, z0}, {x0 + 0.25f, -1.0f, z0}, {x0, -1.0f, z0 + 0.25f});
+      triangle({x0 + 0.25f, -1.0f, z0}, {x0 + 0.25f, -1.0f, z0 + 0.25f}, {x0, -1.0f, z0 + 0.25f});
+    }
+  flush(Mat4{}, "refit plane");
+  positions.clear();
+  indices.clear();
+  for (std::uint32_t t = 0; t < 3000u; ++t) {
+    const Vec3 centre{unit(random), unit(random), unit(random)};
+    const Vec3 a{centre.x + 0.05f * unit(random), centre.y + 0.05f * unit(random), centre.z + 0.05f * unit(random)};
+    const Vec3 b{centre.x + 0.05f * unit(random), centre.y + 0.05f * unit(random), centre.z + 0.05f * unit(random)};
+    triangle(centre, a, b);
+  }
+  flush(transform(0.3f, {1.0f, 1.0f, 1.0f}, {-1.5f, 0.0f, 0.0f}), "refit soup");
+  flush(transform(-0.8f, {0.7f, 1.2f, 0.7f}, {1.5f, 0.2f, 0.5f}), "refit soup, second");
+  positions.clear();
+  indices.clear();
+  for (std::uint32_t t = 0; t < 400u; ++t) {
+    const float x = static_cast<float>(t) * 0.02f - 4.0f;
+    triangle({x, 0.0f, -2.0f}, {x + 0.02f, 0.5f, -2.0f}, {x, 1.0f, -2.1f});
+  }
+  flush(Mat4{}, "refit strip");
+}
+
+// The parallel LBVH's updates. A refit of unchanged geometry republishes the build byte for
+// byte; a TLAS rebuild after instances move is a fresh build of the moved scene byte for byte;
+// after the vertices warp too, the refit tree finds the same closest hits as a fresh build
+// (host traversal of both); a refit and a TLAS rebuild back restore the first build exactly.
+const char *topologyName(GpuBvhTopology topology) {
+  return topology == GpuBvhTopology::Ploc ? "PLOC" : "LBVH";
+}
+
+void runRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder &builder, GpuBvhTopology topology) {
+  GpuLbvhBuilder reference(context);  // fresh builds, leaving `builder`'s kept scratch alone
+  Fixture fixture;
+  makeRefitFixture(fixture);
+  uploadFixture(fixture, uploader, context, "refit");
+  const std::vector<std::uint32_t> slots(fixture.scene.materials.size(), 0u);
+  const TraceScene trace = buildTraceScene(fixture.scene, slots);
+  GpuBvhBuildResult built = builder.build(uploader, fixture.scene, trace, true, topology);
+  std::vector<std::uint8_t> nodes = downloadAll(uploader, built.nodes);
+  const std::vector<std::uint8_t> triangles = downloadAll(uploader, built.triangles);
+  GpuBvhUpdateResult same = builder.refit(uploader, fixture.scene, trace, built.nodes, built.triangles);
+  if (downloadAll(uploader, built.nodes) != nodes || downloadAll(uploader, built.triangles) != triangles)
+    throw Error("a GPU LBVH refit of unchanged geometry is not the build byte for byte");
+  // What a TLAS rebuild publishes: a fresh build of the scene, except that the top level is
+  // always an LBVH over the instances (a fresh LBVH build's top-level nodes, which come first).
+  auto afterTopRebuild = [&](const Fixture &scene, const TraceScene &sceneTrace, GpuBvhBuildResult &fresh) {
+    fresh = reference.build(uploader, scene.scene, sceneTrace, false, topology);
+    std::vector<std::uint8_t> expected = downloadAll(uploader, fresh.nodes);
+    if (topology != GpuBvhTopology::Lbvh) {
+      const GpuBvhBuildResult lbvh = reference.build(uploader, scene.scene, sceneTrace);
+      const std::vector<std::uint8_t> top = downloadAll(uploader, lbvh.nodes);
+      const std::size_t topBytes = std::size_t(lbvh.statistics.topNodes) * 4u * sizeof(pt::float4);
+      std::memcpy(expected.data(), top.data(), topBytes);
+    }
+    return expected;
+  };
+  if (topology != GpuBvhTopology::Lbvh) {
+    // The first scene with its top level rebuilt: the state the updates below return to.
+    builder.rebuildTopLevel(uploader, fixture.scene, trace, built.nodes, built.triangles);
+    GpuBvhBuildResult fresh;
+    nodes = afterTopRebuild(fixture, trace, fresh);
+    if (downloadAll(uploader, built.nodes) != nodes)
+      throw Error("a GPU TLAS rebuild of an unmoved PLOC build is not its bottom levels under an LBVH top level");
+  }
+
+  // Move instances only: the TLAS rebuild is what a fresh build of the moved scene publishes.
+  Fixture turned;
+  makeRefitFixture(turned);
+  turned.scene.primitives[1].transform = transform(1.4f, {1.0f, 1.0f, 1.0f}, {-2.5f, 0.3f, 1.0f});
+  turned.scene.primitives[2].transform = transform(0.4f, {0.7f, 1.2f, 0.7f}, {3.0f, 0.2f, -1.5f});
+  turned.scene.primitives[3].transform = transform(0.0f, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 4.0f});
+  uploadFixture(turned, uploader, context, "refit.turned");
+  const TraceScene turnedTrace = buildTraceScene(turned.scene, slots);
+  const GpuBvhUpdateResult top = builder.rebuildTopLevel(uploader, turned.scene, turnedTrace, built.nodes,
+                                                          built.triangles);
+  {
+    GpuBvhBuildResult freshTurned;
+    if (downloadAll(uploader, built.nodes) != afterTopRebuild(turned, turnedTrace, freshTurned) ||
+        downloadAll(uploader, built.triangles) != downloadAll(uploader, freshTurned.triangles))
+      throw Error("a GPU LBVH TLAS rebuild is not a fresh build of the moved scene byte for byte");
+    for (std::size_t i = 0; i < top.instances.size(); ++i)
+      if (std::memcmp(&top.instances[i], &freshTurned.instances[i], sizeof(pt::TraceInstance)) != 0)
+        throw Error("a GPU LBVH TLAS rebuild published different instance rows");
+  }
+
+  // Warp the vertices (a per-vertex displacement, so boxes change unevenly) and move instances.
+  Fixture moved;
+  makeRefitFixture(moved);
+  for (Vertex &vertex : moved.vertices) {
+    Vec3 &p = vertex.position;
+    p = {p.x + 0.15f * std::sin(3.0f * p.y), p.y * 1.3f + 0.1f * std::cos(2.0f * p.x), p.z - 0.2f * p.x};
+  }
+  moved.scene.primitives[1].transform = transform(0.9f, {1.0f, 1.0f, 1.0f}, {-1.0f, 0.4f, 0.3f});
+  moved.scene.primitives[2].transform = transform(-0.2f, {0.9f, 0.9f, 1.3f}, {2.0f, -0.3f, 0.0f});
+  uploadFixture(moved, uploader, context, "refit.moved");
+  const TraceScene movedTrace = buildTraceScene(moved.scene, slots);
+  const GpuBvhUpdateResult refitted = builder.refit(uploader, moved.scene, movedTrace, built.nodes, built.triangles);
+  std::vector<pt::float4> refitNodes(built.nodes.size / sizeof(pt::float4)), refitTriangles(built.triangles.size / sizeof(pt::float4));
+  std::memcpy(refitNodes.data(), downloadAll(uploader, built.nodes).data(), built.nodes.size);
+  std::memcpy(refitTriangles.data(), downloadAll(uploader, built.triangles).data(), built.triangles.size);
+  const std::vector<pt::TraceInstance> refitInstances = refitted.instances;
+
+  // Back to the first geometry and transforms: a refit (the TLAS keeps the turned topology) and a
+  // TLAS rebuild restore the first build.
+  builder.refit(uploader, fixture.scene, trace, built.nodes, built.triangles);
+  builder.rebuildTopLevel(uploader, fixture.scene, trace, built.nodes, built.triangles);
+  if (downloadAll(uploader, built.nodes) != nodes || downloadAll(uploader, built.triangles) != triangles)
+    throw Error("a GPU LBVH refit and TLAS rebuild back to the first scene are not the first build byte for byte");
+
+  GpuBvhBuildResult fresh = reference.build(uploader, moved.scene, movedTrace, false, topology);
+  std::vector<pt::float4> freshNodes(fresh.nodes.size / sizeof(pt::float4)), freshTriangles(fresh.triangles.size / sizeof(pt::float4));
+  std::memcpy(freshNodes.data(), downloadAll(uploader, fresh.nodes).data(), fresh.nodes.size);
+  std::memcpy(freshTriangles.data(), downloadAll(uploader, fresh.triangles).data(), fresh.triangles.size);
+
+  std::vector<pt::Material> materials;
+  for (const Material &material : moved.scene.materials) materials.push_back(convertMaterial(material.uniforms));
+  const pt::HostTextures textures;
+  const auto *vertices = reinterpret_cast<const float *>(moved.vertices.data());
+  std::mt19937 random(31337u);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  std::uint32_t hits = 0;
+  for (std::uint32_t r = 0; r < 20000u; ++r) {
+    const pt::float3 origin(unit(random) * 5.0f, unit(random) * 3.0f + 1.0f, unit(random) * 5.0f);
+    const pt::float3 target(unit(random) * 2.5f, unit(random) * 1.5f, unit(random) * 2.5f);
+    const pt::float3 direction = pt::normalize(target - origin);
+    const pt::PtHit a = pt::ptTraceBvh(refitNodes.data(), refitTriangles.data(), refitInstances.data(), materials.data(),
+                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
+                                       pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit b = pt::ptTraceBvh(freshNodes.data(), freshTriangles.data(), fresh.instances.data(), materials.data(),
+                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
+                                       pt::float2(-1.0f, 0.0f), 0u);
+    // The same closest distance (a different triangle only at an exact tie).
+    if (a.found != b.found || (a.found != 0u && a.t != b.t))
+      throw Error("the refit GPU LBVH and a fresh build of the moved scene disagree on ray " + std::to_string(r));
+    hits += a.found;
+  }
+  std::printf("PASS: %s: GPU refit republishes an unchanged tree byte for byte, matches a fresh build's hits on "
+              "moved geometry (%u of 20000 rays hit) and refits back exactly (GPU %.3f ms: extents %.3f, fit %.3f, "
+              "emit %.3f; %u dispatches)\n", topologyName(topology), hits, refitted.gpuMilliseconds, refitted.stageMilliseconds[0],
+              refitted.stageMilliseconds[4], refitted.stageMilliseconds[5], refitted.dispatches);
+  // In-frame updates: the same work recorded into a command buffer, the rows read from a device
+  // buffer, publishes what the synchronous updates do.
+  auto recorded = [&](const Fixture &scene, const TraceScene &sceneTrace, bool top) {
+    std::vector<pt::TraceInstance> rows = builder.updateRows(scene.scene, sceneTrace);
+    Buffer rowBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                             "refit.frame-rows");
+    uploader.runImmediate([&](VkCommandBuffer command) {
+      if (top) builder.recordRebuildTopLevel(command, scene.scene, rowBuffer, built.nodes, built.triangles, 1u);
+      else builder.recordRefit(command, scene.scene, rowBuffer, built.nodes, built.triangles, 1u);
+    });
+    const std::string error = builder.frameError(1u);
+    if (!error.empty()) throw Error("an in-frame update reported: " + error);
+  };
+  builder.refit(uploader, moved.scene, movedTrace, built.nodes, built.triangles);
+  const std::vector<std::uint8_t> movedNodes = downloadAll(uploader, built.nodes);
+  const std::vector<std::uint8_t> movedTriangles = downloadAll(uploader, built.triangles);
+  builder.refit(uploader, fixture.scene, trace, built.nodes, built.triangles);
+  recorded(moved, movedTrace, false);
+  if (downloadAll(uploader, built.nodes) != movedNodes || downloadAll(uploader, built.triangles) != movedTriangles)
+    throw Error("an in-frame GPU LBVH refit differs from the synchronous refit");
+  recorded(fixture, trace, false);
+  if (downloadAll(uploader, built.nodes) != nodes || downloadAll(uploader, built.triangles) != triangles)
+    throw Error("an in-frame GPU LBVH refit back is not the first build byte for byte");
+  recorded(turned, turnedTrace, true);
+  {
+    GpuBvhBuildResult freshTurned;
+    if (downloadAll(uploader, built.nodes) != afterTopRebuild(turned, turnedTrace, freshTurned))
+      throw Error("an in-frame GPU LBVH TLAS rebuild is not a fresh build of the moved scene byte for byte");
+  }
+  std::printf("PASS: %s: in-frame GPU refit and TLAS rebuild (recorded, rows from a device buffer, status read "
+              "afterwards) publish what the synchronous updates do\n", topologyName(topology));
+  std::printf("PASS: %s: GPU TLAS rebuild is a fresh build of the moved scene byte for byte, under an LBVH top level "
+              "(GPU %.3f ms: instances %.3f, morton %.3f, sort %.3f, topology %.3f, fit %.3f, number and emit %.3f; "
+              "%u dispatches)\n", topologyName(topology), top.gpuMilliseconds, top.stageMilliseconds[0], top.stageMilliseconds[1], top.stageMilliseconds[2],
+              top.stageMilliseconds[3], top.stageMilliseconds[4], top.stageMilliseconds[5], top.dispatches);
+  (void)same;
+}
+
+// A wide refit: the kept collapse re-emitted after the LBVH refit to moved and warped geometry
+// finds the same closest hits as the refit binary tree (host traversal of both), and an
+// unchanged re-emit republishes the collapse byte for byte.
+void runWideRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder &builder, GpuBvhCollapser &collapser,
+                      std::uint32_t width, GpuBvhTopology topology) {
+  Fixture fixture;
+  makeRefitFixture(fixture);
+  uploadFixture(fixture, uploader, context, "wide-refit");
+  const std::vector<std::uint32_t> slots(fixture.scene.materials.size(), 0u);
+  const TraceScene trace = buildTraceScene(fixture.scene, slots);
+  GpuBvhBuildResult built = builder.build(uploader, fixture.scene, trace, true, topology);
+  GpuWideCollapseResult wide = collapser.collapse(uploader, built.nodes, built.status.nodes, built.instances, width,
+                                                  built.statistics.topDepth + built.statistics.bottomDepth, true);
+  const std::vector<std::uint8_t> first = downloadAll(uploader, wide.nodes);
+  collapser.reemit(uploader, built.nodes, wide.nodes);
+  if (downloadAll(uploader, wide.nodes) != first)
+    throw Error("an unchanged wide re-emit is not the collapse byte for byte");
+
+  // In frame: the collapse recorded with nothing read back publishes the same nodes (in its
+  // larger output) and writes the traced rows' wide roots.
+  Buffer frameNodes(context, VkDeviceSize(built.status.nodes) * sizeof(pt::QuantizedWideNode),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO, 0,
+                    "wide-refit.frame-nodes");
+  collapser.prepareFrames(uploader, built.nodes, built.status.nodes, built.instances, width, frameNodes);
+  const VkBufferUsageFlags rowUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  Buffer binaryRows = uploader.createBuffer(built.instances.data(), built.instances.size() * sizeof(pt::TraceInstance),
+                                            rowUsage, "wide-refit.binary-rows");
+  Buffer tracedRows = uploader.createBuffer(built.instances.data(), built.instances.size() * sizeof(pt::TraceInstance),
+                                            rowUsage, "wide-refit.traced-rows");
+  auto frameBytes = [&](std::size_t bytes) {
+    std::vector<std::uint8_t> all = downloadAll(uploader, frameNodes);
+    all.resize(bytes);
+    return all;
+  };
+  uploader.runImmediate([&](VkCommandBuffer command) { collapser.recordCollapse(command, binaryRows, tracedRows, 2u); });
+  if (const std::string error = collapser.frameError(2u); !error.empty()) throw Error(error);
+  if (frameBytes(first.size()) != first)
+    throw Error("an in-frame wide collapse differs from the synchronous collapse");
+  {
+    std::vector<pt::TraceInstance> rows(built.instances.size());
+    std::memcpy(rows.data(), downloadAll(uploader, tracedRows).data(), rows.size() * sizeof(pt::TraceInstance));
+    for (std::size_t i = 0; i < rows.size(); ++i)
+      if (rows[i].blasRoot != wide.instances[i].blasRoot)
+        throw Error("an in-frame wide collapse wrote a different bottom-level root");
+  }
+
+  Fixture moved;
+  makeRefitFixture(moved);
+  for (Vertex &vertex : moved.vertices) {
+    Vec3 &p = vertex.position;
+    p = {p.x + 0.15f * std::sin(3.0f * p.y), p.y * 1.3f + 0.1f * std::cos(2.0f * p.x), p.z - 0.2f * p.x};
+  }
+  moved.scene.primitives[1].transform = transform(0.9f, {1.0f, 1.0f, 1.0f}, {-1.0f, 0.4f, 0.3f});
+  uploadFixture(moved, uploader, context, "wide-refit.moved");
+  const TraceScene movedTrace = buildTraceScene(moved.scene, slots);
+  const GpuBvhUpdateResult refitted = builder.refit(uploader, moved.scene, movedTrace, built.nodes, built.triangles);
+  const GpuWideCollapseResult reemitted = collapser.reemit(uploader, built.nodes, wide.nodes);
+  uploader.runImmediate([&](VkCommandBuffer command) { collapser.recordReemit(command, binaryRows, tracedRows, 3u); });
+  if (const std::string error = collapser.frameError(3u); !error.empty()) throw Error(error);
+  if (frameBytes(first.size()) != downloadAll(uploader, wide.nodes))
+    throw Error("an in-frame wide re-emit differs from the synchronous re-emit");
+
+  std::vector<pt::float4> binaryNodes(built.nodes.size / sizeof(pt::float4)), triangles(built.triangles.size / sizeof(pt::float4));
+  std::memcpy(binaryNodes.data(), downloadAll(uploader, built.nodes).data(), built.nodes.size);
+  std::memcpy(triangles.data(), downloadAll(uploader, built.triangles).data(), built.triangles.size);
+  pt::WideBvh wideTree;
+  wideTree.width = width;
+  wideTree.nodes.resize(wide.nodes.size / sizeof(pt::QuantizedWideNode));
+  std::memcpy(wideTree.nodes.data(), downloadAll(uploader, wide.nodes).data(), wide.nodes.size);
+  wideTree.triangles = triangles;
+  wideTree.instances = refitted.instances;
+  for (std::size_t i = 0; i < wideTree.instances.size(); ++i) wideTree.instances[i].blasRoot = wide.instances[i].blasRoot;
+
+  std::vector<pt::Material> materials;
+  for (const Material &material : moved.scene.materials) materials.push_back(convertMaterial(material.uniforms));
+  const pt::HostTextures textures;
+  const auto *vertices = reinterpret_cast<const float *>(moved.vertices.data());
+  std::mt19937 random(4711u);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  std::uint32_t hits = 0;
+  for (std::uint32_t r = 0; r < 20000u; ++r) {
+    const pt::float3 origin(unit(random) * 5.0f, unit(random) * 3.0f + 1.0f, unit(random) * 5.0f);
+    const pt::float3 target(unit(random) * 2.5f, unit(random) * 1.5f, unit(random) * 2.5f);
+    const pt::float3 direction = pt::normalize(target - origin);
+    const pt::PtHit a = pt::traceWideBvh(wideTree, materials.data(), moved.indices.data(), vertices, textures, origin,
+                                         direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit b = pt::ptTraceBvh(binaryNodes.data(), triangles.data(), refitted.instances.data(), materials.data(),
+                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
+                                       pt::float2(-1.0f, 0.0f), 0u);
+    if (a.found != b.found || (a.found != 0u && a.t != b.t))
+      throw Error("the re-emitted BVH" + std::to_string(width) + " and the refit binary tree disagree on ray " +
+                  std::to_string(r));
+    hits += a.found;
+  }
+  std::printf("PASS: BVH%u in-frame collapse and re-emit (recorded, nothing read back) publish the synchronous "
+              "ones' nodes and bottom-level roots\n", width);
+  std::printf("PASS: BVH%u re-emit after a GPU LBVH refit matches the refit tree's hits (%u of 20000 rays hit; "
+              "GPU %.3f ms, %u dispatches)\n", width, hits, reemitted.gpuMilliseconds, reemitted.dispatches);
+}
+
+int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide, bool wavefront, bool rayPipeline) {
   Window window("Basalt GPU ray oracle", 64, 64, false);
   Context context(window, true);
   if (rayPipeline && !context.rayPipelineSupported) {
@@ -509,6 +1107,81 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
   int result = 0;
   {
     Uploader uploader(context);
+    std::unique_ptr<GpuLbvhBuilder> lbvhBuilder;
+    if (lbvh || ploc) lbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
+    const GpuBvhTopology topology = ploc ? GpuBvhTopology::Ploc : GpuBvhTopology::Lbvh;
+    // The builder under test; with --gpu-lbvh every build is also the serial builder's tree.
+    // With --gpu-ploc every build is well formed, the same bytes when repeated, and publishes
+    // the serial builder's triangles (the same Morton order) and instance rows.
+    auto buildOnGpu = [&](const Scene &scene, const TraceScene &trace, const char *what) {
+      if (ploc) {
+        GpuBvhBuildResult built = lbvhBuilder->build(uploader, scene, trace, false, topology);
+        const GpuBvhBuildResult again = lbvhBuilder->build(uploader, scene, trace, false, topology);
+        const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace);
+        const DownloadedTree tree = downloadTree(uploader, built), serialTree = downloadTree(uploader, serial);
+        const std::string malformed = checkTree(tree);
+        if (!malformed.empty()) throw Error(std::string("PLOC tree is malformed on the ") + what + ": " + malformed);
+        if (downloadAll(uploader, again.nodes) != downloadAll(uploader, built.nodes))
+          throw Error(std::string("two PLOC builds of the ") + what + " publish different nodes");
+        if (tree.triangles.size() != serialTree.triangles.size() ||
+            std::memcmp(tree.triangles.data(), serialTree.triangles.data(), tree.triangles.size() * sizeof(pt::float4)) != 0)
+          throw Error(std::string("PLOC triangles differ from the serial builder's on the ") + what);
+        for (std::size_t i = 0; i < tree.instances.size(); ++i)
+          if (std::memcmp(&tree.instances[i], &serialTree.instances[i], sizeof(pt::TraceInstance)) != 0)
+            throw Error(std::string("PLOC instance rows differ from the serial builder's on the ") + what);
+        std::printf("PASS: parallel PLOC builds a well-formed, repeatable tree on the %s (depth %u + %u, SAH %.4g vs "
+                    "LBVH %.4g, %u merge iterations, %u dispatches, GPU %.3f ms)\n", what, built.statistics.topDepth,
+                    built.statistics.bottomDepth, built.statistics.sahCost, serial.statistics.sahCost,
+                    built.status.plocIterations, built.status.dispatches,
+                    [&] { double sum = 0.0; for (double v : built.stageMilliseconds) sum += v; return sum; }());
+        return built;
+      }
+      if (!lbvh) return buildGpuBvh(context, uploader, scene, trace);
+      GpuBvhBuildResult parallel = lbvhBuilder->build(uploader, scene, trace);
+      const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace);
+      const DownloadedTree parallelTree = downloadTree(uploader, parallel), serialTree = downloadTree(uploader, serial);
+      const std::string difference = compareTrees(parallelTree, serialTree);
+      if (!difference.empty())
+        throw Error(std::string("parallel LBVH differs from the serial builder on the ") + what + ": " + difference);
+      // The serial numbering too: the published nodes are the serial builder's, byte for byte.
+      if (parallelTree.nodes.size() != serialTree.nodes.size() ||
+          std::memcmp(parallelTree.nodes.data(), serialTree.nodes.data(), parallelTree.nodes.size() * sizeof(pt::float4)) != 0)
+        throw Error(std::string("parallel LBVH nodes are not byte-identical to the serial builder's on the ") + what);
+      if (parallel.statistics.topDepth != serial.statistics.topDepth ||
+          parallel.statistics.bottomDepth != serial.statistics.bottomDepth ||
+          std::abs(parallel.statistics.sahCost - serial.statistics.sahCost) > 1e-9 * serial.statistics.sahCost)
+        throw Error(std::string("parallel LBVH depth or cost differs from the serial builder on the ") + what);
+      std::printf("PASS: parallel LBVH publishes the serial builder's nodes byte for byte on the %s (depth %u + %u, %u fit levels, "
+                  "%u dispatches, GPU %.3f ms)\n", what, parallel.statistics.topDepth, parallel.statistics.bottomDepth,
+                  parallel.status.fitIterations, parallel.status.dispatches,
+                  [&] { double sum = 0.0; for (double v : parallel.stageMilliseconds) sum += v; return sum; }());
+      return parallel;
+    };
+    if (lbvh) runSortTest(uploader, *lbvhBuilder);
+    if ((lbvh || ploc) && wide == 0u) runRefitTest(context, uploader, *lbvhBuilder, topology);
+    std::unique_ptr<GpuBvhCollapser> collapser;
+    if (wide != 0u) collapser = std::make_unique<GpuBvhCollapser>(context);
+    if ((lbvh || ploc) && wide != 0u) runWideRefitTest(context, uploader, *lbvhBuilder, *collapser, wide, topology);
+    // The collapse on the adversarial fixture's tree, built by the builder under test.
+    if (wide != 0u) {
+      Fixture collapseFixture;
+      makeCollapseFixture(collapseFixture);
+      uploadFixture(collapseFixture, uploader, context, "collapse");
+      TraceScene collapseTrace = buildTraceScene(collapseFixture.scene,
+                                                 std::vector<std::uint32_t>(collapseFixture.scene.materials.size(), 0u));
+      if (gpuBuilder) {
+        const GpuBvhBuildResult built = buildOnGpu(collapseFixture.scene, collapseTrace, "collapse fixture");
+        checkCollapse(uploader, *collapser, built.nodes, downloadBinaryNodes(uploader, built), built.instances, wide,
+                      "GPU-built collapse fixture", built.statistics);
+      } else {
+        pt::Bvh collapseBvh;
+        const pt::BvhStatistics collapseStatistics = buildOnCpu(collapseFixture, collapseTrace, collapseBvh);
+        Buffer resident = uploader.createBuffer(collapseBvh.nodes.data(), collapseBvh.nodes.size() * sizeof(pt::float4),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "collapse.bvh.nodes");
+        checkCollapse(uploader, *collapser, resident, collapseBvh.nodes, collapseTrace.instances, wide,
+                      "CPU-built collapse fixture", collapseStatistics);
+      }
+    }
     if (gpuBuilder) {
       Scene emptyScene;
       const Vertex dummyVertex{};
@@ -520,7 +1193,7 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
       emptyScene.indexBuffer = uploader.createBuffer(&dummyIndex, sizeof(dummyIndex),
           geometryBufferUsage(context, VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "empty.indices");
       const TraceScene emptyTrace;
-      GpuBvhBuildResult empty = buildGpuBvh(context, uploader, emptyScene, emptyTrace);
+      GpuBvhBuildResult empty = buildOnGpu(emptyScene, emptyTrace, "empty scene");
       if (empty.statistics.instances != 0 || empty.statistics.triangles != 0 ||
           empty.statistics.topNodes != 1 || empty.statistics.topDepth != 1)
         throw Error("GPU LBVH empty-scene publication contract failed");
@@ -557,7 +1230,10 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
           stress.indices.size() * sizeof(std::uint32_t),
           geometryBufferUsage(context, VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "stress.indices");
       const TraceScene stressTrace = buildTraceScene(stress.scene, std::vector<std::uint32_t>(1, 0u));
-      const GpuBvhBuildResult stressBuild = buildGpuBvh(context, uploader, stress.scene, stressTrace);
+      const GpuBvhBuildResult stressBuild = buildOnGpu(stress.scene, stressTrace, "stress fixture");
+      if (wide != 0u)
+        checkCollapse(uploader, *collapser, stressBuild.nodes, downloadBinaryNodes(uploader, stressBuild),
+                      stressBuild.instances, wide, "GPU-built stress fixture", stressBuild.statistics);
       if (stressBuild.statistics.triangles != stressTriangles ||
           stressBuild.statistics.topDepth + stressBuild.statistics.bottomDepth > PT_BVH_STACK)
         throw Error("GPU LBVH stress fixture failed its count or depth contract");
@@ -566,34 +1242,32 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
     }
     Fixture fixture;
     makeFixture(fixture);
-    fixture.scene.vertexCount = static_cast<std::uint32_t>(fixture.vertices.size());
-    fixture.scene.indexCount = static_cast<std::uint32_t>(fixture.indices.size());
-    fixture.scene.triangleCount = fixture.scene.indexCount / 3;
-    fixture.scene.vertexBuffer = uploader.createBuffer(
-        fixture.vertices.data(), fixture.vertices.size() * sizeof(Vertex),
-        geometryBufferUsage(context, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), "oracle.vertices");
-    fixture.scene.indexBuffer = uploader.createBuffer(
-        fixture.indices.data(), fixture.indices.size() * sizeof(std::uint32_t),
-        geometryBufferUsage(context, VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "oracle.indices");
+    uploadFixture(fixture, uploader, context, "oracle");
 
     std::vector<std::uint32_t> slots(fixture.scene.materials.size(), 0u);
     TraceScene trace = buildTraceScene(fixture.scene, slots);
     pt::Bvh bvh;
+    pt::BvhStatistics cpuStatistics{};
     pt::WideBvh wideBvh;
     std::unique_ptr<GpuBvhBuildResult> gpuBuild;
     if (gpuBuilder) {
-      gpuBuild = std::make_unique<GpuBvhBuildResult>(buildGpuBvh(context, uploader, fixture.scene, trace));
+      gpuBuild = std::make_unique<GpuBvhBuildResult>(buildOnGpu(fixture.scene, trace, "oracle fixture"));
       trace.instances = gpuBuild->instances;
-    } else if (software) {
-      std::vector<float> vertices(fixture.vertices.size() * pt::kVertexFloats);
-      std::memcpy(vertices.data(), fixture.vertices.data(), fixture.vertices.size() * sizeof(Vertex));
-      std::vector<std::uint32_t> triangleCounts;
-      triangleCounts.reserve(trace.primitives.size());
-      for (const std::uint32_t primitive : trace.primitives)
-        triangleCounts.push_back(fixture.scene.primitives[primitive].indexCount / 3);
-      pt::buildBvh(vertices, fixture.indices, trace.instances, triangleCounts, bvh,
-                   std::max(1u, std::thread::hardware_concurrency()));
       if (wide != 0u) {
+        // The corpus below traverses the GPU collapse of the GPU-built tree.
+        GpuWideCollapseResult collapsed =
+            checkCollapse(uploader, *collapser, gpuBuild->nodes, downloadBinaryNodes(uploader, *gpuBuild),
+                          gpuBuild->instances, wide, "GPU-built oracle fixture", gpuBuild->statistics);
+        gpuBuild->nodes = std::move(collapsed.nodes);
+        trace.instances = gpuBuild->instances = collapsed.instances;
+      }
+    } else if (software) {
+      cpuStatistics = buildOnCpu(fixture, trace, bvh);
+      if (wide != 0u) {
+        Buffer resident = uploader.createBuffer(bvh.nodes.data(), bvh.nodes.size() * sizeof(pt::float4),
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "oracle.binary.nodes");
+        checkCollapse(uploader, *collapser, resident, bvh.nodes, trace.instances, wide, "CPU-built oracle fixture",
+                      cpuStatistics);
         wideBvh = pt::buildWideBvh(bvh, trace.instances, wide);
         trace.instances = wideBvh.instances;
       }
@@ -656,6 +1330,35 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
                                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "oracle.bvh.triangles");
       }
     }
+    if (software) {
+      // The GPU cost kernel against the host walk of the same published tree; the CPU
+      // builder's own statistic is a third, independent account of the binary cost.
+      const std::size_t nodeStride = wide != 0u ? sizeof(pt::QuantizedWideNode) : 4u * sizeof(pt::float4);
+      const auto nodeCount = static_cast<std::uint32_t>(bvhNodeBuffer.size / nodeStride);
+      const pt::LayoutCost measured = gpuBvhSahCost(context, uploader, bvhNodeBuffer, nodeCount, trace.instances, wide != 0u);
+      pt::LayoutCost reference;
+      if (gpuBuilder && wide != 0u) {
+        const std::vector<std::uint8_t> bytes = uploader.readBuffer(bvhNodeBuffer, bvhNodeBuffer.size);
+        std::vector<pt::QuantizedWideNode> nodes(bytes.size() / sizeof(pt::QuantizedWideNode));
+        std::memcpy(nodes.data(), bytes.data(), bytes.size());
+        reference = pt::wideLayoutCost(nodes, trace.instances);
+      } else if (gpuBuilder) {
+        const std::vector<std::uint8_t> bytes = uploader.readBuffer(bvhNodeBuffer, bvhNodeBuffer.size);
+        std::vector<pt::float4> nodes(bytes.size() / sizeof(pt::float4));
+        std::memcpy(nodes.data(), bytes.data(), bytes.size());
+        reference = pt::binaryLayoutCost(nodes, trace.instances);
+        if (gpuBuild->statistics.sahCost != measured.bottom)
+          throw Error("the GPU builder's published SAH cost is not its tree's");
+      } else {
+        reference = wide != 0u ? pt::wideLayoutCost(wideBvh.nodes, trace.instances) : pt::binaryLayoutCost(bvh.nodes, trace.instances);
+      }
+      auto close = [](double a, double b) { return std::abs(a - b) <= 1e-4 * std::max(std::abs(b), 1e-30); };
+      if (!close(measured.top, reference.top) || !close(measured.bottom, reference.bottom) ||
+          (!gpuBuilder && wide == 0u && !close(measured.bottom, cpuStatistics.sahCost)))
+        throw Error("GPU SAH cost " + std::to_string(measured.top) + " + " + std::to_string(measured.bottom) +
+                    " differs from the host's " + std::to_string(reference.top) + " + " + std::to_string(reference.bottom));
+      std::printf("PASS: GPU SAH cost matches the host (top %.4f, bottom %.4f)\n", measured.top, measured.bottom);
+    }
     if (gpuBuilder) {
       const std::vector<std::uint8_t> nodeBytes = uploader.readBuffer(bvhNodeBuffer, bvhNodeBuffer.size);
       const std::vector<std::uint8_t> triangleBytes = uploader.readBuffer(bvhTriangleBuffer, bvhTriangleBuffer.size);
@@ -663,6 +1366,14 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
       std::vector<pt::float4> downloadedTriangles(triangleBytes.size() / sizeof(pt::float4));
       std::memcpy(downloadedNodes.data(), nodeBytes.data(), nodeBytes.size());
       std::memcpy(downloadedTriangles.data(), triangleBytes.data(), triangleBytes.size());
+      pt::WideBvh downloadedWide;
+      if (wide != 0u) {
+        downloadedWide.nodes.resize(nodeBytes.size() / sizeof(pt::QuantizedWideNode));
+        std::memcpy(downloadedWide.nodes.data(), nodeBytes.data(), nodeBytes.size());
+        downloadedWide.triangles = downloadedTriangles;
+        downloadedWide.instances = trace.instances;
+        downloadedWide.width = wide;
+      }
       std::uint32_t expectedTie = 300u;
       const std::uint32_t firstCount = fixture.scene.primitives[trace.primitives[0]].indexCount / 3u;
       for (std::uint32_t sorted = 0; sorted < firstCount; ++sorted) {
@@ -684,7 +1395,12 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
         const pt::float3 origin(ray.originAndMin.x + direction.x * minimum,
                                 ray.originAndMin.y + direction.y * minimum,
                                 ray.originAndMin.z + direction.z * minimum);
-        const pt::PtHit hit = pt::ptTraceBvh(
+        const pt::PtHit hit = wide != 0u
+            ? pt::traceWideBvh(downloadedWide, materials.data(), fixture.indices.data(),
+                               reinterpret_cast<const float *>(fixture.vertices.data()), hostTextures, origin, direction,
+                               ray.directionAndMax.w - minimum, ray.control.x, ray.control.y, pt::float2(-1.0f, 0.0f),
+                               ray.control.z)
+            : pt::ptTraceBvh(
             downloadedNodes.data(), downloadedTriangles.data(), trace.instances.data(), materials.data(),
             fixture.indices.data(), reinterpret_cast<const float *>(fixture.vertices.data()), hostTextures,
             origin, direction, ray.directionAndMax.w - minimum, ray.control.x, ray.control.y, pt::float2(-1.0f, 0.0f), ray.control.z);
@@ -858,7 +1574,7 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
         std::chrono::duration<double>(std::chrono::steady_clock::now() - dispatchStarted).count();
     std::printf("%s dispatch: %.2f M queries/s (host-timed dispatch plus wait)\n",
                 rayPipeline ? "ray pipeline" : wavefront ? "wavefront binary BVH" : wide == 4u ? "quantized BVH4" : wide == 8u ? "quantized BVH8" :
-                gpuBuilder ? "GPU-built software-BVH" : software ? "software-BVH" : "ray-query",
+                ploc ? "parallel-PLOC software-BVH" : lbvh ? "parallel-LBVH software-BVH" : gpuBuilder ? "GPU-built software-BVH" : software ? "software-BVH" : "ray-query",
                 static_cast<double>(queries.size()) / dispatchSeconds * 1e-6);
     const std::vector<std::uint8_t> bytes =
         uploader.readBuffer(hitBuffer, queries.size() * sizeof(OracleHit));
@@ -868,13 +1584,16 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
     context.waitIdle();
   }
   if (context.sawValidationError) {
+    for (const LogEntry &entry : logEntries())
+      if (entry.level != LogEntry::Level::Info && entry.level != LogEntry::Level::Warning)
+        std::fprintf(stderr, "%s\n", entry.text.c_str());
     std::fprintf(stderr, "a Vulkan validation error was reported during the GPU ray oracle\n");
     return 1;
   }
   if (result == 0)
     std::printf("PASS: %s corpus on %s; Vulkan validation clean\n",
                 rayPipeline ? "ray pipeline" : wavefront ? "wavefront binary BVH" : wide == 4u ? "quantized BVH4" : wide == 8u ? "quantized BVH8" :
-                gpuBuilder ? "GPU-built software BVH" : software ? "software BVH" : "hardware ray-query",
+                ploc ? "parallel-PLOC software BVH" : lbvh ? "parallel-LBVH software BVH" : gpuBuilder ? "GPU-built software BVH" : software ? "software BVH" : "hardware ray-query",
                 context.info.name.c_str());
   return result;
 }
@@ -883,14 +1602,18 @@ int run(bool software, bool gpuBuilder, std::uint32_t wide, bool wavefront, bool
 
 int main(int argc, char **argv) {
   try {
-    const bool gpuBuilder = argc > 1 && std::string(argv[1]) == "--gpu-builder";
-    const std::uint32_t wide = argc > 1 && std::string(argv[1]) == "--wide4" ? 4u :
-                               argc > 1 && std::string(argv[1]) == "--wide8" ? 8u : 0u;
+    const std::string mode = argc > 1 ? argv[1] : "";
+    // --gpu-lbvh-wide4/8, --gpu-ploc-wide8: the parallel builder's tree collapsed on the GPU.
+    const bool lbvh = mode == "--gpu-lbvh" || mode == "--gpu-lbvh-wide4" || mode == "--gpu-lbvh-wide8";
+    const bool ploc = mode == "--gpu-ploc" || mode == "--gpu-ploc-wide8";
+    const bool gpuBuilder = lbvh || ploc || mode == "--gpu-builder";
+    const std::uint32_t wide = mode == "--wide4" || mode == "--gpu-lbvh-wide4" ? 4u :
+                               mode == "--wide8" || mode == "--gpu-lbvh-wide8" || mode == "--gpu-ploc-wide8" ? 8u : 0u;
     const bool wavefront = argc > 1 && std::string(argv[1]) == "--wavefront";
     const bool rayPipeline = argc > 1 && std::string(argv[1]) == "--pipeline";
     const bool software = gpuBuilder || wide != 0u || wavefront ||
                           (argc > 1 && std::string(argv[1]) == "--software");
-    return run(software, gpuBuilder, wide, wavefront, rayPipeline);
+    return run(software, gpuBuilder, lbvh, ploc, wide, wavefront, rayPipeline);
   } catch (const std::exception &error) {
     std::fprintf(stderr, "GPU ray oracle failed: %s\n", error.what());
     return 1;

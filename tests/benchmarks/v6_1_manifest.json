@@ -34,7 +34,8 @@
     "bvh-megakernel": {"renderer": "gpu-bvh", "execution": "megakernel", "builder": "cpu", "layout": "binary"},
     "bvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "cpu", "layout": "binary"},
     "bvh8-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "cpu", "layout": "bvh8"},
-    "lbvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "gpu", "layout": "binary"},
+    "lbvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "gpu-serial", "layout": "binary"},
+    "plbvh-wavefront": {"renderer": "gpu-bvh", "execution": "wavefront", "builder": "gpu-lbvh", "layout": "binary"},
     "pipeline-iterative": {"renderer": "gpu-pipeline", "execution": "megakernel"},
     "pipeline-wavefront": {"renderer": "gpu-pipeline", "execution": "wavefront"}
   },

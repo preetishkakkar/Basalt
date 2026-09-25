@@ -113,6 +113,7 @@ inline float4 operator-(float4 a) { return float4(-a.x, -a.y, -a.z, -a.w); }
 // Scalar functions. Every name that also has a vector form is declared for float here, or
 // unqualified calls inside this namespace would find only the vector one.
 inline float abs(float x) { return std::fabs(x); }
+inline int abs(int x) { return x < 0 ? -x : x; }
 inline float sqrt(float x) { return std::sqrt(x); }
 inline float rsqrt(float x) { return 1.0f / std::sqrt(x); }
 inline float pow(float x, float y) { return std::pow(x, y); }
@@ -146,6 +147,8 @@ inline bool isnan(float x) { return std::isnan(x); }
 inline bool isinf(float x) { return std::isinf(x); }
 inline bool isfinite(float x) { return std::isfinite(x); }
 inline uint popcount(uint x) { return static_cast<uint>(std::popcount(x)); }
+inline uint clz(uint x) { return static_cast<uint>(std::countl_zero(x)); }  // 32 for zero, as MSL
+inline uint mulhi(uint a, uint b) { return static_cast<uint>((static_cast<ulong>(a) * b) >> 32u); }
 
 #define PT_UNARY(name)                                                                            \
   inline float2 name(float2 v) { return float2(name(v.x), name(v.y)); }                           \

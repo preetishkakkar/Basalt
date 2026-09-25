@@ -182,6 +182,8 @@ basalt_shader(shaders/bloom.metal   ENTRY bloom_upsample OPTIONS --local-size 8 
 basalt_shader(shaders/path_trace.metal ENTRY path_trace OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_trace_wide.metal ENTRY path_trace_wide OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_trace_wide_emissive.metal ENTRY path_trace_wide_emissive OPTIONS --local-size 8 --local-size-y 8)
+basalt_shader(shaders/path_trace_wide_deep.metal ENTRY path_trace_wide_deep OPTIONS --local-size 8 --local-size-y 8)
+basalt_shader(shaders/path_trace_wide_emissive_deep.metal ENTRY path_trace_wide_emissive_deep OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_trace_emissive.metal ENTRY path_trace_emissive OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_trace_rt.metal ENTRY path_trace_rt OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_trace_pipeline.metal ENTRY path_trace_pipeline)
@@ -194,8 +196,10 @@ basalt_shader(shaders/path_wavefront_atomic.metal ENTRY path_wavefront_shade_ato
 basalt_shader(shaders/path_wavefront_fused_rt.metal ENTRY path_wavefront_fused_rt OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_fused.metal ENTRY path_wavefront_fused OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_fused_wide.metal ENTRY path_wavefront_fused_wide OPTIONS --local-size 64)
+basalt_shader(shaders/path_wavefront_fused_wide_deep.metal ENTRY path_wavefront_fused_wide_deep OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_intersect.metal ENTRY path_wavefront_intersect OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_intersect_wide.metal ENTRY path_wavefront_intersect_wide OPTIONS --local-size 64)
+basalt_shader(shaders/path_wavefront_intersect_wide_deep.metal ENTRY path_wavefront_intersect_wide_deep OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_intersect_rt.metal ENTRY path_wavefront_intersect_rt OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wavefront_intersect_pipeline)
 basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pipeline_miss)
@@ -203,6 +207,7 @@ basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pi
 basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pipeline_alpha)
 basalt_shader(shaders/path_wavefront_shadow.metal ENTRY path_wavefront_shadow OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_shadow_wide.metal ENTRY path_wavefront_shadow_wide OPTIONS --local-size 64)
+basalt_shader(shaders/path_wavefront_shadow_wide_deep.metal ENTRY path_wavefront_shadow_wide_deep OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_shadow_rt.metal ENTRY path_wavefront_shadow_rt OPTIONS --local-size 64)
 basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wavefront_shadow_pipeline)
 basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wave_shadow_pipeline_miss)
@@ -224,6 +229,35 @@ basalt_shader(shaders/raycone_oracle.metal ENTRY raycone_oracle OPTIONS --local-
 basalt_shader(shaders/wavefront_enqueue.metal ENTRY wavefront_enqueue OPTIONS --local-size 64)
 basalt_shader(shaders/wavefront_trace.metal ENTRY wavefront_trace OPTIONS --local-size 64)
 basalt_shader(shaders/bvh_build.metal ENTRY bvh_build OPTIONS --local-size 1)
+basalt_shader(shaders/bvh_cost.metal ENTRY bvh_cost OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_cost.metal ENTRY bvh_wide_cost OPTIONS --local-size 64)
+basalt_shader(shaders/animate.metal ENTRY animate_vertices OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_gather OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_size OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_roots OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_emit OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_emit_args OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_rows OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_init OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_single OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_neighbours OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_scan_sums OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_compact OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_finish OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_extents OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_instances OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_morton OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_topology OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_seed OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_fit OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_number OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_emit OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_finish OPTIONS --local-size 64)
+basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_histogram OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_reduce OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_blocks OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_apply OPTIONS --local-size 128)
+basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_scatter OPTIONS --local-size 128)
 basalt_shader(shaders/path_temporal.metal ENTRY path_temporal OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_temporal.metal ENTRY path_atrous OPTIONS --local-size 8 --local-size-y 8)
 basalt_shader(shaders/path_temporal.metal ENTRY path_reconstruct OPTIONS --local-size 8 --local-size-y 8)
@@ -327,6 +361,8 @@ add_executable(basalt WIN32
   src/scene/Camera.cpp
   src/render/Renderer.cpp
   src/render/GpuBvhBuilder.cpp
+  src/render/GpuLbvhBuilder.cpp
+  src/render/GpuBvhCollapse.cpp
   src/render/GpuProfiler.cpp
   src/render/PathReconstruction.cpp
   src/render/Environment.cpp
@@ -382,6 +418,8 @@ add_executable(gpu-ray-tests
   src/scene/Scene.cpp
   src/render/RayTracing.cpp
   src/render/GpuBvhBuilder.cpp
+  src/render/GpuLbvhBuilder.cpp
+  src/render/GpuBvhCollapse.cpp
   src/render/TraceScene.cpp)
 target_include_directories(gpu-ray-tests PRIVATE src shaders)
 target_link_libraries(gpu-ray-tests PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan)
@@ -399,8 +437,13 @@ set_tests_properties(gpu-ray-pipeline-disabled-tests PROPERTIES SKIP_RETURN_CODE
   ENVIRONMENT "BASALT_NO_RAY_PIPELINE=1")
 add_test(NAME gpu-bvh-tests COMMAND gpu-ray-tests --software)
 add_test(NAME gpu-bvh-build-tests COMMAND gpu-ray-tests --gpu-builder)
+add_test(NAME gpu-bvh-lbvh-tests COMMAND gpu-ray-tests --gpu-lbvh)
 add_test(NAME gpu-bvh4-tests COMMAND gpu-ray-tests --wide4)
 add_test(NAME gpu-bvh8-tests COMMAND gpu-ray-tests --wide8)
+add_test(NAME gpu-bvh-lbvh-bvh4-tests COMMAND gpu-ray-tests --gpu-lbvh-wide4)
+add_test(NAME gpu-bvh-lbvh-bvh8-tests COMMAND gpu-ray-tests --gpu-lbvh-wide8)
+add_test(NAME gpu-bvh-ploc-tests COMMAND gpu-ray-tests --gpu-ploc)
+add_test(NAME gpu-bvh-ploc-bvh8-tests COMMAND gpu-ray-tests --gpu-ploc-wide8)
 add_test(NAME gpu-wavefront-tests COMMAND gpu-ray-tests --wavefront)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
@@ -414,6 +457,16 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
     --exe "$<TARGET_FILE:basalt>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf"
     --output-dir "${CMAKE_CURRENT_BINARY_DIR}/wavefront-conformance" --hardware)
   set_tests_properties(gpu-wavefront-rt-render-tests PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME gpu-bvh-lbvh-identity-tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/bvh_builder_identity.py"
+    --exe "$<TARGET_FILE:basalt>" --data "${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+    --output-dir "${CMAKE_CURRENT_BINARY_DIR}/bvh-builder-identity")
+  set_tests_properties(gpu-bvh-lbvh-identity-tests PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME gpu-bvh-ploc-render-tests COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/bvh_ploc_conformance.py"
+    --exe "$<TARGET_FILE:basalt>" --data "${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+    --output-dir "${CMAKE_CURRENT_BINARY_DIR}/bvh-ploc-conformance")
+  set_tests_properties(gpu-bvh-ploc-render-tests PROPERTIES SKIP_RETURN_CODE 77)
   add_test(NAME gpu-ray-pipeline-render-tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/pipeline_conformance.py"
     --exe "$<TARGET_FILE:basalt>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf"
@@ -477,7 +530,6 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
   basalt_negative_cli(zero-bounces "--bounces needs an integer" --renderer gpu-bvh --bounces 0)
   basalt_negative_cli(malformed-spf "--spf needs an integer" --renderer gpu-bvh --spf 4x)
   basalt_negative_cli(gpu-intersector "--intersector requires --renderer cpu" --renderer gpu-bvh --intersector embree)
-  basalt_negative_cli(gpu-builder-wide "quantized wide BVHs currently require" --renderer gpu-bvh --bvh-builder gpu --bvh-width bvh8)
   basalt_negative_cli(cpu-wavefront "--path-execution wavefront requires" --renderer cpu --path-execution wavefront)
   basalt_negative_cli(cpu-guides "--albedo-pfm and --normal-pfm require a GPU path tracer" --renderer cpu --albedo-pfm "${CMAKE_CURRENT_BINARY_DIR}/negative-cli/a.pfm")
   basalt_negative_cli(missing-scene "does-not-exist" --renderer gpu-bvh "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/does-not-exist.gltf")
@@ -489,6 +541,10 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
   basalt_negative_cli(restir-spf "--spf must be 1" --renderer gpu-bvh --di-estimator restir --spf 4)
   basalt_negative_cli(restir-reuse-without "--restir-reuse and --restir-candidates require" --renderer gpu-bvh --restir-reuse both)
   basalt_negative_cli(restir-unknown "unknown direct-light estimator" --renderer gpu-bvh --di-estimator ris)
+  basalt_negative_cli(animate-renderer "--animate requires --renderer gpu-bvh" --renderer gpu --animate both)
+  basalt_negative_cli(animate-temporal "--animate cannot be combined with --path-temporal" --renderer gpu-bvh --animate instances --path-temporal)
+  basalt_negative_cli(unknown-animation "unknown animation" --renderer gpu-bvh --animate swirl)
+  basalt_negative_cli(unknown-bvh-update "unknown BVH update" --renderer gpu-bvh --bvh-update sometimes)
   add_test(NAME gpu-wavefront-batching-tests COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/wavefront_batching.py"
     --exe "$<TARGET_FILE:basalt>" --scene "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/materials.gltf"
@@ -540,7 +596,7 @@ target_compile_definitions(shader-stats PRIVATE
 add_executable(gpu-motion-tests tests/gpu_motion_tests.cpp
   src/core/Log.cpp src/core/Math.cpp src/platform/Window.cpp src/gpu/Context.cpp src/gpu/Resources.cpp
   src/gpu/Shader.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp
-  src/scene/Scene.cpp src/render/RayTracing.cpp src/render/GpuBvhBuilder.cpp src/render/PathReconstruction.cpp)
+  src/scene/Scene.cpp src/render/RayTracing.cpp src/render/GpuBvhBuilder.cpp src/render/GpuLbvhBuilder.cpp src/render/GpuBvhCollapse.cpp src/render/PathReconstruction.cpp)
 target_include_directories(gpu-motion-tests PRIVATE src shaders)
 target_link_libraries(gpu-motion-tests PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan)
 add_dependencies(gpu-motion-tests basalt-shaders)

@@ -56,7 +56,10 @@ PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint
     }
 
     const QuantizedWideNode &node = bvh.nodes[entry];
-    const uint childCount = as_type<uint>(node.origin.w);
+    const uint childCount = as_type<uint>(node.origin.w) & kWideSlotMask;
+    uint emptyMask = 0u;
+    for (uint i = 0; i < childCount; ++i)
+      if (node.children[i].w == kBvhEmpty) emptyMask |= 1u << i;
     alignas(32) uint px[8]{}, py[8]{}, pz[8]{};
     for (uint i = 0; i < childCount; ++i) {
       px[i] = node.children[i].x; py[i] = node.children[i].y; pz[i] = node.children[i].z;
@@ -88,7 +91,7 @@ PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint
     const __m256 farV = _mm256_mul_ps(_mm256_min_ps(_mm256_set1_ps(hit.t),
         _mm256_min_ps(fx, _mm256_min_ps(fy, fz))), _mm256_set1_ps(1.0000004f));
     uint hitMask = static_cast<uint>(_mm256_movemask_ps(_mm256_cmp_ps(nearV, farV, _CMP_LE_OQ)));
-    hitMask &= childCount == 8u ? 0xFFu : ((1u << childCount) - 1u);
+    hitMask &= (childCount == 8u ? 0xFFu : ((1u << childCount) - 1u)) & ~emptyMask;
     alignas(32) float nearDistances[8];
     _mm256_store_ps(nearDistances, nearV);
     float distances[8]{}; uint entries[8]{}; uint found = 0u;

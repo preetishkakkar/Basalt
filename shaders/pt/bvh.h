@@ -1,23 +1,10 @@
 // The software BVH, laid out and traversed the way the hardware structure behaves: a
 // top level over instances, one bottom level per instance in object space, masks and
-// non-opaque candidates. Shared by the CPU backend and the software GPU backend.
-//
-// Node: four float4, the bounds of both children, so one fetch tests two boxes.
-//   n0 = left.min,  w = left data      n1 = left.max,  w = left count
-//   n2 = right.min, w = right data     n3 = right.max, w = right count
-// A count of zero is an interior child whose data is its node index; kBvhEmpty data marks
-// a missing child. A positive count is a leaf: at the top level its data is an instance
-// (count 1); at the bottom level its data is the first of `count` triangles.
-// Triangle: three float4, the object-space vertices; the first w holds the triangle's index
-// within its primitive, as an int's bits.
+// non-opaque candidates. Shared by the CPU backend and the software GPU backend. The node
+// layouts are in bvh_layout.h.
 #pragma once
 #include "path.h"
-
-PT_CONSTANT uint kBvhEmpty = 0xFFFFFFFFu;
-PT_CONSTANT uint kBvhLeafTag = 0x80000000u;   // stack entries: a leaf, not a node
-PT_CONSTANT uint kBvhCountShift = 27u;         // bottom-level leaf entries: count above the first triangle
-PT_CONSTANT uint kBvhFirstMask = 0x07FFFFFFu;
-#define PT_BVH_STACK 64
+#include "bvh_layout.h"
 
 
 // The ray, prepared for boxes (a safe inverse) and for Woop, Benthin and Wald's
@@ -197,26 +184,25 @@ inline PtHit ptTraceBvh(device const float4 *nodes, device const float4 *triangl
   float3 prepareOrigin = origin;
   float3 prepareDirection = direction;
   bool prepare = true;
+  // The entry being visited is held in a register; the stack keeps only the entries still to
+  // visit (a node's far child), so the near child is never stored and reloaded. The visiting
+  // order is the one of pushing both children and popping the near one.
   uint stack[PT_BVH_STACK] = {};
-  uint depth = 1u;  // stack[0] = 0: the top level's root
+  uint depth = 0u;
+  uint entry = 0u;  // the top level's root
+  bool visiting = true;
   uint bottomBase = 0u;
   uint inBottom = 0u;
   uint instance = 0u;
   bool done = false;
 
-  while (depth > 0u && !done) {
-    if (inBottom != 0u && depth <= bottomBase) {
-      inBottom = 0u;
-      prepareOrigin = origin;
-      prepareDirection = direction;
-      prepare = true;
-    }
+  while (visiting && !done) {
     if (prepare) {
       ray = ptPrepareRay(prepareOrigin, prepareDirection);
       prepare = false;
     }
-    depth = depth - 1u;
-    const uint entry = stack[depth];
+    // Set by an entry that leaves nothing to visit next in its place: take the next from the stack.
+    bool pop = true;
 
     if ((entry & kBvhLeafTag) != 0u) {
       if (inBottom == 0u) {
@@ -232,8 +218,8 @@ inline PtHit ptTraceBvh(device const float4 *nodes, device const float4 *triangl
           prepare = true;
           inBottom = 1u;
           bottomBase = depth;
-          stack[depth] = traceInstances[instance].blasRoot;
-          depth = depth + 1u;
+          entry = traceInstances[instance].blasRoot;
+          pop = false;
         }
       } else {
         // A leaf of triangles. The object-space ray is an affine image of the world ray, so
@@ -287,8 +273,23 @@ inline PtHit ptTraceBvh(device const float4 *nodes, device const float4 *triangl
         depth = depth + 1u;
       }
       if (min(entries.x, entries.y) < hit.t && depth < uint(PT_BVH_STACK)) {
-        stack[depth] = push.x;
-        depth = depth + 1u;
+        entry = push.x;
+        pop = false;
+      }
+    }
+    if (pop) {
+      // The next entry from the stack; back in world space when it is the top level's.
+      if (depth == 0u) {
+        visiting = false;
+      } else {
+        if (inBottom != 0u && depth <= bottomBase) {
+          inBottom = 0u;
+          prepareOrigin = origin;
+          prepareDirection = direction;
+          prepare = true;
+        }
+        depth = depth - 1u;
+        entry = stack[depth];
       }
     }
   }

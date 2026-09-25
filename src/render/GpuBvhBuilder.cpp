@@ -27,6 +27,7 @@ static_assert(sizeof(pt::BvhBuildDescriptor) == 32);
 static_assert(sizeof(pt::BvhBuildControl) == 32);
 static_assert(sizeof(pt::BvhBuildRecord) == 48);
 static_assert(sizeof(pt::BvhBuildStatus) == 32);
+static_assert(sizeof(pt::BvhBuildStatus2) == 64);
 
 const char *errorName(std::uint32_t error) {
   switch (error) {
@@ -39,6 +40,19 @@ const char *errorName(std::uint32_t error) {
 }
 
 std::uint32_t nodeCount(std::uint32_t leaves) { return leaves > 1 ? leaves - 1 : 1; }
+
+// Orders compute writes before later compute reads and host readback copies.
+void computeBarrier(VkCommandBuffer command) {
+  VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+  barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+  barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &barrier;
+  vkCmdPipelineBarrier2(command, &dependency);
+}
 
 } // namespace
 
@@ -129,15 +143,7 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
     vkCmdDispatch(command, 1, 1, 1);
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
-    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dependency.memoryBarrierCount = 1;
-    dependency.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(command, &dependency);
+    computeBarrier(command);
   });
   const std::vector<std::uint8_t> statusBytes = uploader.readBuffer(statusBuffer, sizeof(pt::BvhBuildStatus));
   pt::BvhBuildStatus status{};
@@ -163,7 +169,86 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
   result.outputBytes = result.nodes.size + result.triangles.size;
   result.radixPasses = status.counts.w;
   result.maximumBuilderStack = status.result.w;
+  result.status.error = status.result.x;
+  result.status.topDepth = status.result.y;
+  result.status.bottomDepth = status.result.z;
+  result.status.maximumBuilderStack = status.result.w;
+  result.status.nodes = status.counts.x;
+  result.status.triangles = status.counts.y;
+  result.status.instances = status.counts.z;
+  result.status.sortPasses = status.counts.w;
+  result.status.dispatches = 1;
+
+  const pt::LayoutCost cost = gpuBvhSahCost(context, uploader, result.nodes, nodeCapacity, result.instances, false);
+  result.status.topCost = cost.top;
+  result.status.bottomCost = cost.bottom;
+  result.statistics.sahCost = cost.bottom;
   return result;
+}
+
+pt::LayoutCost gpuBvhSahCost(const Context &context, Uploader &uploader, const Buffer &nodes,
+                             std::uint32_t nodeCount, const std::vector<pt::TraceInstance> &instances, bool wide) {
+  pt::LayoutCost cost;
+  if (nodeCount == 0) return cost;
+  // Trees are contiguous node ranges starting at their roots: the TLAS at 0, then the
+  // distinct bottom-level roots in ascending order.
+  std::vector<std::uint32_t> roots;
+  roots.reserve(instances.size());
+  for (const pt::TraceInstance &instance : instances) roots.push_back(instance.blasRoot);
+  std::sort(roots.begin(), roots.end());
+  roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+  if (!roots.empty() && (roots.front() == 0u || roots.back() >= nodeCount))
+    throw std::runtime_error("BVH cost: a bottom-level root is outside the published node range");
+  std::vector<pt::uint4> trees;
+  trees.reserve(roots.size() + 1u);
+  trees.push_back({0u, roots.empty() ? nodeCount : roots.front(), 0u, 0u});
+  for (std::size_t i = 0; i < roots.size(); ++i) {
+    const std::uint32_t end = i + 1u < roots.size() ? roots[i + 1u] : nodeCount;
+    trees.push_back({roots[i], end - roots[i], 0u, 0u});
+  }
+
+  Buffer treeBuffer = uploader.createBuffer(trees.data(), trees.size() * sizeof(pt::uint4),
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "bvh-cost.trees");
+  Buffer contributions(context, static_cast<VkDeviceSize>(nodeCount) * 2u * sizeof(float),
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                       VMA_MEMORY_USAGE_AUTO, 0, "bvh-cost.contributions");
+  const pt::uint4 control{nodeCount, static_cast<std::uint32_t>(trees.size()), 0u, 0u};
+  Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                               "bvh-cost.control");
+  Program program(context, wide ? "bvh_wide_cost" : "bvh_cost");
+  Pipeline pipeline(context, program, wide ? "BVH wide SAH cost" : "BVH SAH cost");
+  DescriptorPool pool(context, 1);
+  const VkDescriptorSet set = pool.allocate(program.setLayouts[0]);
+  DescriptorWriter(context, program.compute(), set)
+      .buffer("nodes", nodes)
+      .buffer("trees", treeBuffer)
+      .buffer("contributions", contributions)
+      .buffer("control", controlBuffer)
+      .apply();
+  uploader.runImmediate([&](VkCommandBuffer command) {
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    vkCmdDispatch(command, (nodeCount + 63u) / 64u, 1, 1);
+    computeBarrier(command);
+  });
+  const std::vector<std::uint8_t> bytes = uploader.readBuffer(contributions, contributions.size);
+  std::vector<float> values(bytes.size() / sizeof(float));
+  std::memcpy(values.data(), bytes.data(), bytes.size());
+
+  // Per tree, in node order: the root term, then every node's children.
+  std::vector<double> treeCost(trees.size(), 0.0);
+  for (std::size_t t = 0; t < trees.size(); ++t) {
+    double sum = values[static_cast<std::size_t>(trees[t].x) * 2u + 1u];
+    for (std::uint32_t node = trees[t].x; node < trees[t].x + trees[t].y; ++node)
+      sum += values[static_cast<std::size_t>(node) * 2u];
+    treeCost[t] = sum;
+  }
+  cost.top = treeCost[0];
+  for (const pt::TraceInstance &instance : instances) {
+    const auto found = std::lower_bound(roots.begin(), roots.end(), instance.blasRoot);
+    cost.bottom += treeCost[1u + static_cast<std::size_t>(found - roots.begin())];
+  }
+  return cost;
 }
 
 } // namespace basalt

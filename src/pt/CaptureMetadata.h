@@ -31,8 +31,11 @@ struct CaptureMetadata {
   // Backend, as it ran.
   std::string renderer;     // cpu, gpu-ray-query, gpu-own-bvh, gpu-ray-pipeline, hybrid-ray-query, raster
   std::string intersector;  // own-bvh, embree, quantized-bvh8-avx2, driver-built-hardware-as, software-bvh ...
-  std::string builder;      // cpu-binned-sah, gpu-lbvh, embree, driver, not-applicable
+  std::string builder;      // cpu-binned-sah, gpu-serial-lbvh, gpu-parallel-lbvh, gpu-parallel-ploc, embree, driver, not-applicable
   std::string bvhLayout;    // binary-float, quantized-bvh4, quantized-bvh8, not-applicable
+  std::string bvhUpdate;    // on-change, rebuild-every-frame, refit, not-applicable
+  std::string animation = "off";  // --animate: off, instances, vertices, both
+  std::string wideStack = "not-applicable";  // --wide-stack: auto, deep, shallow
   std::string execution;    // megakernel, wavefront, iterative-raygen, wavefront-ray-pipeline, cpu-tiles
   unsigned cpuThreads = 0;
 

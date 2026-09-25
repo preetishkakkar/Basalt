@@ -6,6 +6,14 @@
 #include "pt/Tables.h"
 #include "render/GpuBvhBuilder.h"
 
+#define device
+#define thread
+namespace pt {
+#include "pt/animate.h"
+}
+#undef device
+#undef thread
+
 #include <algorithm>
 #include <chrono>
 #include <array>
@@ -300,6 +308,7 @@ Renderer::~Renderer() {
   context.waitIdle();
   acceleration.reset();
   if (timestampPool) vkDestroyQueryPool(context.device, timestampPool, nullptr);
+  if (updateTimestamps) vkDestroyQueryPool(context.device, updateTimestamps, nullptr);
   for (VkImageView view : bloomMipViews) vkDestroyImageView(context.device, view, nullptr);
   if (reflectionMipZero) vkDestroyImageView(context.device, reflectionMipZero, nullptr);
   for (VkImageView view : shadowLayerViews)
@@ -1240,7 +1249,7 @@ std::uint64_t Renderer::settingsKey() const {
   add(s.pathDiEstimator); add(s.pathRestirReuse); add(s.pathRestirCandidates);
   add(s.pathStrategy); add(s.pathClamp); add(s.pathTargetSamples); add(s.cpuIntersector); add(s.pathDenoise);
   add(s.pathSamplesPerFrame); add(s.pathTemporal); add(s.pathBvhDiagnostic); add(s.pathBvhBuilder);
-  add(s.pathBvhWidth);
+  add(s.pathBvhWidth); add(s.pathBvhUpdate); add(s.pathWideStack);
   add(s.pathExecution);
   return key;
 }
@@ -1309,6 +1318,7 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   key = hashBytes(&steadyViewProjection, sizeof(steadyViewProjection), key);
   const std::uint32_t extentAndGeneration[3] = {width, height, resourceGeneration};
   key = hashBytes(extentAndGeneration, sizeof(extentAndGeneration), key);
+  if (settings.animate != 0 && settings.renderer == 3) key = hashBytes(&animationFrame, sizeof(animationFrame), key);
   // A path tracer always accumulates while the view holds; that is how it converges.
   const bool accumulating = (settings.accumulate || settings.renderer != 0) && settings.debugView == 0;
   if (accumulating && key == accumulationKey) accumulatedFrames = std::min(accumulatedFrames + 1, 4096u);
@@ -2284,15 +2294,122 @@ void Renderer::ensureEmissiveTriangles() {
 }
 
 void Renderer::buildSoftwareBvh() {
-  if (!activeScene || (softwareBvhVersion == sceneVersion && softwareBvhBuilder == settings.pathBvhBuilder &&
-                       softwareBvhWidth == settings.pathBvhWidth)) return;
+  if (!activeScene) return;
+  // A new scene, builder or layout builds from scratch; so does every frame with --bvh-update
+  // rebuild. Animation (moved instances, warped vertices) updates a kept GPU LBVH (policy A)
+  // and rebuilds the others.
+  const bool changed = softwareBvhVersion != sceneVersion || softwareBvhBuilder != settings.pathBvhBuilder ||
+                       softwareBvhWidth != settings.pathBvhWidth;
+  const bool everyFrame = settings.pathBvhUpdate == 1;
+  const bool moved = softwareBvhTransforms != animationTransforms, warped = softwareBvhGeometry != animationGeometry;
+  if (!changed && !everyFrame && !moved && !warped) return;
+  if (!changed && !everyFrame && softwareBvhInFrame) return;  // recordSoftwareBvhUpdate()
   const auto started = std::chrono::steady_clock::now();
   context.waitIdle();
 
-  if (settings.pathBvhBuilder == 1) {
-    if (settings.pathBvhWidth != 0)
-      throw std::runtime_error("quantized wide BVHs currently require the CPU SAH builder");
-    GpuBvhBuildResult built = buildGpuBvh(context, uploader, *activeScene, traceScene);
+  // Per-frame builds keep the frame series and counters; a changed scene or setting starts them.
+  SoftwareBvhReport previous = std::move(softwareBvhReport);
+  softwareBvhReport = {};
+  softwareBvhReport.builder = settings.pathBvhBuilder;
+  if (!changed) {
+    softwareBvhReport.refits = previous.refits;
+    softwareBvhReport.topRebuilds = previous.topRebuilds;
+    softwareBvhReport.fullBuilds = previous.fullBuilds + 1u;
+    softwareBvhReport.updateMilliseconds = std::move(previous.updateMilliseconds);
+    softwareBvhReport.updateGpuMilliseconds = std::move(previous.updateGpuMilliseconds);
+  }
+  softwareBvhUpdatable = false;
+  softwareBvhInFrame = false;
+  softwareBvhBinaryNodes.reset();
+  softwareBinaryRows.reset();
+  softwareBvhGeometry = animationGeometry;
+  softwareBvhTransforms = animationTransforms;
+  if (settings.pathBvhBuilder != 0) {
+    if (settings.pathBvhBuilder < 1 || settings.pathBvhBuilder > 3)
+      throw std::runtime_error(std::string("unknown software BVH builder ") + bvhBuilderName(settings.pathBvhBuilder));
+    // The parallel builders (LBVH, PLOC topology) share one builder; animated scenes keep its
+    // tree (and the collapse) for per-frame updates. A TLAS rebuild is an LBVH over instances.
+    const bool parallel = settings.pathBvhBuilder >= 2;
+    if (parallel && !gpuLbvhBuilder) gpuLbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
+    const bool updatable = settings.animate != 0 && parallel && !everyFrame;
+    const GpuBvhTopology topology = settings.pathBvhBuilder == 3 ? GpuBvhTopology::Ploc : GpuBvhTopology::Lbvh;
+    GpuBvhBuildResult built = parallel ? gpuLbvhBuilder->build(uploader, *activeScene, traceScene, updatable, topology)
+                                       : buildGpuBvh(context, uploader, *activeScene, traceScene);
+    double gpuMilliseconds = 0.0;
+    for (const double stage : built.stageMilliseconds) gpuMilliseconds += stage;
+    softwareBvhReport.buildMilliseconds = built.milliseconds;
+    softwareBvhReport.topCost = softwareBvhReport.layoutTopCost = built.status.topCost;
+    softwareBvhReport.bottomCost = softwareBvhReport.layoutBottomCost = built.status.bottomCost;
+    softwareBvhReport.layoutNodes = built.statistics.topNodes + built.statistics.bottomNodes;
+    softwareBvhReport.stageMilliseconds = built.stageMilliseconds;
+    softwareBvhReport.plocIterations = built.status.plocIterations;
+    const VkBufferUsageFlags rowUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (settings.pathBvhWidth != 0 && updatable) {
+      // Animated: the in-frame collapse (as later frames run it) into an output of as many nodes
+      // as the binary tree, from the binary rows into the traced rows.
+      if (!gpuBvhCollapser) gpuBvhCollapser = std::make_unique<GpuBvhCollapser>(context);
+      const std::uint32_t width = settings.pathBvhWidth == 1 ? 4u : 8u;
+      Buffer output(context, VkDeviceSize(built.status.nodes) * sizeof(pt::QuantizedWideNode),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO, 0,
+                    "path.gpu-bvh.wide-nodes");
+      gpuBvhCollapser->prepareFrames(uploader, built.nodes, built.status.nodes, built.instances, width, output);
+      softwareBinaryRows = uploader.createBuffer(built.instances.data(), built.instances.size() * sizeof(pt::TraceInstance),
+                                                 rowUsage, "path.bvh.binary-instances");
+      Buffer traced = uploader.createBuffer(built.instances.data(), built.instances.size() * sizeof(pt::TraceInstance),
+                                            rowUsage, "path.bvh.instances");
+      uploader.runImmediate([&](VkCommandBuffer command) {
+        gpuBvhCollapser->recordCollapse(command, softwareBinaryRows, traced, kFramesInFlight);
+      });
+      std::uint32_t wideNodes = 0;
+      if (const std::string error = gpuBvhCollapser->frameError(kFramesInFlight, &softwareWideStack, &wideNodes);
+          !error.empty())
+        throw std::runtime_error(error);
+      const std::vector<std::uint8_t> tracedBytes = uploader.readBuffer(traced, traced.size);
+      std::memcpy(built.instances.data(), tracedBytes.data(), built.instances.size() * sizeof(pt::TraceInstance));
+      const pt::LayoutCost wideCost = gpuBvhSahCost(context, uploader, output, wideNodes, built.instances, true);
+      softwareBvhReport.layoutTopCost = wideCost.top;
+      softwareBvhReport.layoutBottomCost = wideCost.bottom;
+      softwareBvhReport.layoutNodes = wideNodes;
+      softwareBvhBinaryNodes = std::move(built.nodes);
+      built.nodes = std::move(output);
+      softwareTraceInstanceBuffer = std::move(traced);
+    } else if (settings.pathBvhWidth != 0) {
+      // The quantized layout, collapsed on the GPU exactly as pt::buildWideBvh would.
+      if (!gpuBvhCollapser) gpuBvhCollapser = std::make_unique<GpuBvhCollapser>(context);
+      GpuWideCollapseResult wide = gpuBvhCollapser->collapse(uploader, built.nodes, built.status.nodes, built.instances,
+                                                             settings.pathBvhWidth == 1 ? 4u : 8u,
+                                                             built.statistics.topDepth + built.statistics.bottomDepth,
+                                                             updatable);
+      gpuMilliseconds += wide.gpuMilliseconds;
+      softwareWideStack = wide.maximumStack;
+      const pt::LayoutCost wideCost = gpuBvhSahCost(context, uploader, wide.nodes, wide.nodeCount, wide.instances, true);
+      softwareBvhReport.collapseMilliseconds = wide.milliseconds;
+      softwareBvhReport.layoutTopCost = wideCost.top;
+      softwareBvhReport.layoutBottomCost = wideCost.bottom;
+      softwareBvhReport.layoutNodes = wide.nodeCount;
+      if (changed)
+        logInfo("GPU BVH collapse to BVH{}: {} nodes, {} levels, stack {}, GPU {:.3f} ms (gather {:.3f}, size {:.3f}, "
+                "emit {:.3f}), {:.1f} ms wall", settings.pathBvhWidth == 1 ? 4 : 8, wide.nodeCount, wide.levels,
+                wide.maximumStack, wide.gpuMilliseconds, wide.gatherMilliseconds, wide.sizeMilliseconds,
+                wide.emitMilliseconds, wide.milliseconds);
+      if (softwareBvhReport.stageMilliseconds.size() == kGpuBvhStageCount)
+        softwareBvhReport.stageMilliseconds[kGpuBvhStageCount - 1] = wide.gpuMilliseconds;
+      built.scratchBytes += wide.scratchBytes;
+      built.outputBytes += wide.nodes.size;
+      built.outputBytes -= built.nodes.size;
+      if (updatable) softwareBvhBinaryNodes = std::move(built.nodes);
+      built.nodes = std::move(wide.nodes);
+      built.instances = std::move(wide.instances);
+    }
+    softwareBvhUpdatable = updatable;
+    softwareBvhInFrame = updatable;
+    softwareBvhBinaryCount = built.status.nodes;
+    softwareBvhDepth = built.statistics.topDepth + built.statistics.bottomDepth;
+    if (!changed) {
+      softwareBvhReport.updateMilliseconds.push_back(
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+      softwareBvhReport.updateGpuMilliseconds.push_back(gpuMilliseconds);
+    }
     softwareBvhNodes = std::move(built.nodes);
     softwareBvhTriangles = std::move(built.triangles);
     softwareBvhStatistics = built.statistics;
@@ -2302,19 +2419,27 @@ void Renderer::buildSoftwareBvh() {
     softwareBvhMaximumStack = built.maximumBuilderStack;
     std::vector<pt::TraceInstance> rows = std::move(built.instances);
     if (rows.empty()) rows.push_back({});
-    // Own buffer: the raster and hardware sets keep naming the shared instance table.
-    softwareTraceInstanceBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
-                                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.bvh.instances");
+    // Own buffer: the raster and hardware sets keep naming the shared instance table. Updates
+    // copy it (binary) or write it (wide collapse).
+    if (!(settings.pathBvhWidth != 0 && updatable))
+      softwareTraceInstanceBuffer = uploader.createBuffer(rows.data(), rows.size() * sizeof(pt::TraceInstance),
+                                                          rowUsage, "path.bvh.instances");
     softwareBvhVersion = sceneVersion;
     softwareBvhBuilder = settings.pathBvhBuilder;
     softwareBvhWidth = settings.pathBvhWidth;
     pathSetsGeneration = ~0u;
-    logInfo("GPU LBVH: {} instances, {} triangles, {} + {} nodes (depth {} + {}), {} radix passes, "
-            "stack {}, {:.1f} MiB scratch, {:.1f} MiB output, built in {:.1f} ms",
-            softwareBvhStatistics.instances, softwareBvhStatistics.triangles,
+    wideStackNeeded = settings.pathBvhWidth != 0 &&
+                      (softwareWideStack > 64u || softwareBvhInFrame || (!changed && wideStackNeeded));
+    if (!changed) return;
+    logInfo("GPU BVH ({}): {} instances, {} triangles, {} + {} nodes (depth {} + {}, SAH {:.1f} + {:.1f}), "
+            "{} radix passes{}, stack {}, {:.1f} MiB scratch, {:.1f} MiB output, built in {:.1f} ms",
+            bvhBuilderName(settings.pathBvhBuilder), softwareBvhStatistics.instances, softwareBvhStatistics.triangles,
             softwareBvhStatistics.topNodes, softwareBvhStatistics.bottomNodes,
             softwareBvhStatistics.topDepth, softwareBvhStatistics.bottomDepth,
-            softwareBvhRadixPasses, softwareBvhMaximumStack,
+            softwareBvhReport.topCost, softwareBvhReport.bottomCost,
+            softwareBvhRadixPasses,
+            settings.pathBvhBuilder == 3 ? std::format(", {} PLOC iterations", softwareBvhReport.plocIterations) : "",
+            softwareBvhMaximumStack,
             static_cast<double>(softwareBvhScratchBytes) / (1024.0 * 1024.0),
             static_cast<double>(softwareBvhOutputBytes) / (1024.0 * 1024.0),
             softwareBvhStatistics.milliseconds);
@@ -2339,9 +2464,19 @@ void Renderer::buildSoftwareBvh() {
   pt::Bvh bvh;
   const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
   softwareBvhStatistics = pt::buildBvh(vertices, indices, instances, triangleCounts, bvh, threads);
+  softwareBvhReport.buildMilliseconds = softwareBvhStatistics.milliseconds;
+  softwareBvhReport.topCost = softwareBvhReport.layoutTopCost = pt::binaryLayoutCost(bvh.nodes, instances).top;
+  softwareBvhReport.bottomCost = softwareBvhReport.layoutBottomCost = softwareBvhStatistics.sahCost;
+  softwareBvhReport.layoutNodes = static_cast<std::uint32_t>(bvh.nodes.size() / 4u);
   std::vector<pt::QuantizedWideNode> wideNodes;
   if (settings.pathBvhWidth != 0) {
     pt::WideBvh wide = pt::buildWideBvh(bvh, instances, settings.pathBvhWidth == 1 ? 4u : 8u);
+    const pt::LayoutCost wideCost = pt::wideLayoutCost(wide.nodes, wide.instances);
+    softwareBvhReport.collapseMilliseconds = wide.milliseconds;
+    softwareBvhReport.layoutTopCost = wideCost.top;
+    softwareBvhReport.layoutBottomCost = wideCost.bottom;
+    softwareBvhReport.layoutNodes = static_cast<std::uint32_t>(wide.nodes.size());
+    softwareWideStack = wide.maximumStack;
     wideNodes = std::move(wide.nodes);
     bvh.triangles = std::move(wide.triangles);
     instances = std::move(wide.instances);
@@ -2372,6 +2507,7 @@ void Renderer::buildSoftwareBvh() {
   softwareBvhScratchBytes = softwareBvhOutputBytes = 0;
   softwareBvhRadixPasses = softwareBvhMaximumStack = 0;
   pathSetsGeneration = ~0u;
+  wideStackNeeded = settings.pathBvhWidth != 0 && (softwareWideStack > 64u || (!changed && wideStackNeeded));
   logInfo("GPU software BVH: {} instances, {} triangles, {} + {} nodes (depth {} + {}, SAH {:.1f}) "
           "built in {:.0f} ms; uploaded in {:.0f} ms total",
           softwareBvhStatistics.instances, softwareBvhStatistics.triangles,
@@ -2381,6 +2517,212 @@ void Renderer::buildSoftwareBvh() {
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
+// The wide kernels come with 64- and 96-entry (*_deep, PT_WIDE_BVH_STACK_DEEP) traversal stacks.
+// A tree whose proven bound exceeds 64 needs the deep ones. Otherwise auto uses 96 in the
+// megakernel only: there the driver allocates the deep variant fewer registers and it runs faster,
+// while the wavefront stages gain nothing from it.
+void Renderer::selectWideStack(bool deep) {
+  if (deep == wideStackDeep) return;
+  context.waitIdle();
+  const std::string suffix = deep ? "_deep" : "";
+  pathTraceWideProgram = std::make_unique<Program>(context, "path_trace_wide" + suffix);
+  pathTraceWideEmissiveProgram = std::make_unique<Program>(context, "path_trace_wide_emissive" + suffix);
+  pathWaveFusedWideProgram = std::make_unique<Program>(context, "path_wavefront_fused_wide" + suffix);
+  pathWaveIntersectWideProgram = std::make_unique<Program>(context, "path_wavefront_intersect_wide" + suffix);
+  pathWaveShadowWideProgram = std::make_unique<Program>(context, "path_wavefront_shadow_wide" + suffix);
+  pathTraceWidePipeline = Pipeline(context, *pathTraceWideProgram, "path.trace.software.wide" + suffix);
+  pathTraceWideEmissivePipeline = Pipeline(context, *pathTraceWideEmissiveProgram,
+                                            "path.trace.software.wide.emissive" + suffix);
+  pathWaveFusedWidePipeline = Pipeline(context, *pathWaveFusedWideProgram, "path.wavefront.fused.wide" + suffix);
+  pathWaveIntersectWidePipeline = Pipeline(context, *pathWaveIntersectWideProgram,
+                                            "path.wavefront.intersect.wide" + suffix);
+  pathWaveShadowWidePipeline = Pipeline(context, *pathWaveShadowWideProgram, "path.wavefront.shadow.wide" + suffix);
+  wideStackDeep = deep;
+  pathSetsGeneration = ~0u;
+  logInfo("wide traversal kernels: {}-entry stack (tree bound {})", deep ? PT_WIDE_BVH_STACK_DEEP : 64,
+          softwareWideStack);
+}
+
+// Orders every earlier compute and transfer access (earlier frames' traces included: same queue)
+// before later ones: in-frame updates rewrite what earlier frames read.
+static void computeTransferBarrier(VkCommandBuffer command) {
+  VkMemoryBarrier2 memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  memory.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                         VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &memory;
+  vkCmdPipelineBarrier2(command, &dependency);
+}
+
+// Policy A for a kept GPU LBVH, recorded into the frame's command buffer ahead of the trace:
+// warped vertices refit the tree; moved instances rebuild its TLAS. A wide layout re-emits its
+// collapse after a refit alone and collapses again after a TLAS rebuild (the TLAS's wide nodes
+// precede the bottom levels'). --bvh-update refit refits for moved instances too. The rows
+// (binary roots, current transforms) go up with the frame; nothing waits.
+void Renderer::recordSoftwareBvhUpdate(VkCommandBuffer command, bool moved, bool warped) {
+  const auto started = std::chrono::steady_clock::now();
+  if (settings.pathBvhUpdate == 2) {
+    warped = warped || moved;  // the refit also takes the new transforms
+    moved = false;
+  }
+  if (!updateTimestamps) {
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = kFramesInFlight * 2;
+    check(vkCreateQueryPool(context.device, &info, nullptr, &updateTimestamps), "vkCreateQueryPool (BVH updates)");
+  }
+  const std::uint32_t slot = frameIndex;
+  const bool wide = settings.pathBvhWidth != 0;
+  const Buffer &rows = wide ? softwareBinaryRows : softwareTraceInstanceBuffer;
+  const Buffer &binary = wide ? softwareBvhBinaryNodes : softwareBvhNodes;
+  vkCmdResetQueryPool(command, updateTimestamps, slot * 2u, 2u);
+  vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, updateTimestamps, slot * 2u);
+  context.beginLabel(command, "BVH update");
+  computeTransferBarrier(command);
+  const std::vector<pt::TraceInstance> hostRows = gpuLbvhBuilder->updateRows(*activeScene, traceScene);
+  const auto *bytes = reinterpret_cast<const std::uint8_t *>(hostRows.data());
+  const VkDeviceSize total = hostRows.size() * sizeof(pt::TraceInstance);
+  for (VkDeviceSize offset = 0; offset < total; offset += 65536u)
+    vkCmdUpdateBuffer(command, rows.handle, offset, std::min<VkDeviceSize>(65536u, total - offset), bytes + offset);
+  computeTransferBarrier(command);
+  if (warped) {
+    gpuLbvhBuilder->recordRefit(command, *activeScene, rows, binary, softwareBvhTriangles, slot * 2u);
+    ++softwareBvhReport.refits;
+  }
+  if (moved) {
+    gpuLbvhBuilder->recordRebuildTopLevel(command, *activeScene, rows, binary, softwareBvhTriangles, slot * 2u + 1u);
+    ++softwareBvhReport.topRebuilds;
+  }
+  if (wide) {
+    if (moved) gpuBvhCollapser->recordCollapse(command, rows, softwareTraceInstanceBuffer, slot);
+    else gpuBvhCollapser->recordReemit(command, rows, softwareTraceInstanceBuffer, slot);
+  }
+  computeTransferBarrier(command);
+  context.endLabel(command);
+  vkCmdWriteTimestamp2(command, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, updateTimestamps, slot * 2u + 1u);
+  updateRecorded[slot] = true;
+  softwareBvhGeometry = animationGeometry;
+  softwareBvhTransforms = animationTransforms;
+  softwareBvhReport.updateMilliseconds.push_back(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+
+// The update recorded for this frame slot has completed (its fence was waited on): its GPU time
+// and its status.
+void Renderer::checkSoftwareBvhFrame(std::uint32_t slot) {
+  if (!updateRecorded[slot]) return;
+  updateRecorded[slot] = false;
+  std::uint64_t stamps[2]{};
+  if (vkGetQueryPoolResults(context.device, updateTimestamps, slot * 2u, 2u, sizeof(stamps), stamps,
+                            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+    softwareBvhReport.updateGpuMilliseconds.push_back(static_cast<double>(stamps[1] - stamps[0]) *
+                                                      context.properties.limits.timestampPeriod * 1e-6);
+  for (const std::uint32_t lbvhSlot : {slot * 2u, slot * 2u + 1u})
+    if (const std::string error = gpuLbvhBuilder->frameError(lbvhSlot); !error.empty()) throw std::runtime_error(error);
+  if (gpuBvhCollapser)
+    if (const std::string error = gpuBvhCollapser->frameError(slot, &softwareWideStack); !error.empty())
+      throw std::runtime_error(error);
+}
+
+// --animate: seeded synthetic motion, a function of the frame number only. Instances turn about
+// their world centres and bob; vertices move by a travelling wave from their rest positions
+// (normals and the emissive-triangle list keep their rest values).
+void Renderer::animateScene(VkCommandBuffer command, bool inFrame) {
+  if (animationVersion != sceneVersion) {
+    context.waitIdle();
+    animationRest.clear();
+    animationCentres.clear();
+    for (const std::uint32_t primitive : traceScene.primitives) {
+      const Primitive &p = activeScene->primitives[primitive];
+      animationRest.push_back(p.transform);
+      animationCentres.push_back((p.worldBounds.minimum + p.worldBounds.maximum) * 0.5f);
+    }
+    const Aabb &bounds = activeScene->bounds;
+    animationSize = bounds.valid() ? std::max(length(bounds.maximum - bounds.minimum), 1e-3f) : 1.0f;
+    const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex);
+    animationRestVertices = Buffer(context, std::max<VkDeviceSize>(vertexBytes, 16),
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VMA_MEMORY_USAGE_AUTO, 0, "animation.rest-vertices");
+    if (vertexBytes > 0)
+      uploader.runImmediate([&](VkCommandBuffer command) {
+        const VkBufferCopy region{0, 0, vertexBytes};
+        vkCmdCopyBuffer(command, activeScene->vertexBuffer.handle, animationRestVertices.handle, 1, &region);
+      });
+    if (!animateProgram) {
+      animateProgram = std::make_unique<Program>(context, "animate_vertices");
+      animatePipeline = Pipeline(context, *animateProgram, "synthetic animation");
+    }
+    animationFrame = 0;
+    animationVersion = sceneVersion;
+  }
+  const float t = static_cast<float>(animationFrame) / 60.0f;  // seconds at a nominal 60 Hz
+  constexpr float kTau = 6.28318530718f;
+  if ((settings.animate & 1) != 0) {
+    for (std::size_t i = 0; i < traceScene.instances.size(); ++i) {
+      const float phase = static_cast<float>(i) * 2.39996323f;  // the golden angle spreads them
+      const float angle = 0.15f * std::sin(kTau * 0.25f * t + phase);
+      const float bob = 0.01f * animationSize * std::sin(kTau * 0.5f * t + 1.7f * phase);
+      const Vec3 centre = animationCentres[i];
+      const Mat4 model = translation(centre + Vec3{0.0f, bob, 0.0f}) *
+                         rotation({0.0f, std::sin(angle * 0.5f), 0.0f, std::cos(angle * 0.5f)}) *
+                         translation(Vec3{-centre.x, -centre.y, -centre.z}) * animationRest[i];
+      setTraceTransform(traceScene.instances[i], model);
+    }
+    ++animationTransforms;
+  }
+  if ((settings.animate & 2) != 0 && activeScene->vertexCount > 0) {
+    pt::AnimateControl control{};
+    control.counts = {activeScene->vertexCount, 0u, 0u, 0u};
+    control.wave = {0.004f * animationSize, kTau / (0.2f * animationSize), kTau * 0.5f * t, 0.0f};
+    if (inFrame) {
+      // In frame: after the earlier frames' reads of the vertices (same queue), before this
+      // frame's BVH update.
+      const std::uint32_t slot = frameIndex;
+      if (!animationPool) animationPool = std::make_unique<DescriptorPool>(context, kFramesInFlight);
+      if (!animationControls[slot].handle) {
+        animationControls[slot] = Buffer(context, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                         VMA_MEMORY_USAGE_AUTO,
+                                         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                             VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                         "animation.frame-control");
+        animationSets[slot] = animationPool->allocate(animateProgram->setLayouts[0]);
+        DescriptorWriter(context, animateProgram->compute(), animationSets[slot])
+            .buffer("rest", animationRestVertices).buffer("vertices", activeScene->vertexBuffer)
+            .buffer("control", animationControls[slot]).apply();
+      }
+      animationControls[slot].write(&control, sizeof(control));
+      computeTransferBarrier(command);
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, animatePipeline.handle);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, animateProgram->layout, 0, 1,
+                              &animationSets[slot], 0, nullptr);
+      vkCmdDispatch(command, (activeScene->vertexCount + 63u) / 64u, 1, 1);
+      computeTransferBarrier(command);
+      ++animationGeometry;
+      ++animationFrame;
+      return;
+    }
+    context.waitIdle();  // frames in flight read the vertices
+    Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                 "animation.control");
+    DescriptorPool pool(context, 1);
+    const VkDescriptorSet set = pool.allocate(animateProgram->setLayouts[0]);
+    DescriptorWriter(context, animateProgram->compute(), set)
+        .buffer("rest", animationRestVertices).buffer("vertices", activeScene->vertexBuffer)
+        .buffer("control", controlBuffer).apply();
+    uploader.runImmediate([&](VkCommandBuffer command) {
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, animatePipeline.handle);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, animateProgram->layout, 0, 1, &set, 0, nullptr);
+      vkCmdDispatch(command, (activeScene->vertexCount + 63u) / 64u, 1, 1);
+    });
+    ++animationGeometry;
+  }
+  ++animationFrame;
+}
+
 void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
   FrameResources &frame = frames[frameIndex];
   if (!activeScene) return;
@@ -2388,7 +2730,20 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
   const bool hybrid = settings.renderer == 4;
   const bool software = settings.renderer == 3;
   const bool pipelineBackend = settings.renderer == 5;
+  if (software) checkSoftwareBvhFrame(frameIndex);
+  // Animated scenes whose GPU LBVH is kept update in this frame's commands; a fresh build (a new
+  // scene, builder or layout, or --bvh-update rebuild) waits for the vertices instead.
+  const bool updateInFrame = software && softwareBvhInFrame && softwareBvhVersion == sceneVersion &&
+                             softwareBvhBuilder == settings.pathBvhBuilder && softwareBvhWidth == settings.pathBvhWidth &&
+                             settings.pathBvhUpdate != 1;
+  if (software && settings.animate != 0) animateScene(command, updateInFrame);
   if (software) buildSoftwareBvh();
+  if (updateInFrame && (softwareBvhTransforms != animationTransforms || softwareBvhGeometry != animationGeometry))
+    recordSoftwareBvhUpdate(command, softwareBvhTransforms != animationTransforms,
+                            softwareBvhGeometry != animationGeometry);
+  if (software && settings.pathBvhWidth != 0)
+    selectWideStack(wideStackNeeded || settings.pathWideStack == 1 ||
+                    (settings.pathWideStack == 0 && !(settings.pathExecution == 1 && settings.renderer != 4)));
   const bool emissiveSoftware = software && !pathEmissiveMetadata.empty();
   const bool wideSoftware = software && settings.pathBvhWidth != 0;
   const bool wavefront = settings.pathExecution == 1 && !hybrid;
@@ -2715,6 +3070,8 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
   gpuSamples += thisFrame;
   freshSampleFrame[frameIndex] = thisFrame > 0;
   stats.samples = gpuSamples;
+  // Animated, each frame is a new image: --spp N captures the N-th animated frame.
+  if (software && settings.animate != 0) stats.samples = animationFrame;
 
   // Stages this frame's tracing runs in. Pipeline wavefront keeps its init, shade and
   // resolve stages in compute, so it uses both.
@@ -2754,6 +3111,7 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
                       context.rayTracingShaderStage(),
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, traceStages, VK_ACCESS_2_SHADER_WRITE_BIT);
   if (restir && thisFrame > 0u) recordRestir(command, frame, software, wideSoftware, pipelineBackend, uniforms);
+  context.beginLabel(command, "path trace");  // a range for GPU profilers
   if (wavefront) {
     recordWavefront(command, frame, thisFrame, software, wideSoftware, pipelineBackend, profiling);
   } else if (pipelineBackend) {
@@ -2764,6 +3122,7 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
                             nullptr);
     vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
   }
+  context.endLabel(command);
   if (hybrid) {
     VkMemoryBarrier2 guideBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     guideBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;

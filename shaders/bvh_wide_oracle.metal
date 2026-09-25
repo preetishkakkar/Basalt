@@ -1,3 +1,5 @@
+// The deep traversal stack: tests may trace any tree the conversion accepts.
+#define PT_WIDE_BVH_STACK PT_WIDE_BVH_STACK_DEEP
 #include "shared/prelude.h"
 #include "pt/path.h"
 #define PT_TEXTURE_PARAMS array<texture2d<float>, kHitTextureSlots> maps, sampler materialSampler

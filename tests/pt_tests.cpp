@@ -10,10 +10,22 @@
 #include "pt/ImageFile.h"
 #include "pt/EnvironmentSun.h"
 
+#define device
+#define thread
+namespace pt {
+#include "../shaders/pt/bvh_build.h"
+#include "../shaders/pt/exact_float.h"
+} // namespace pt
+#undef device
+#undef thread
+
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <fstream>
 #include <cstdio>
 #include <cstring>
@@ -1333,13 +1345,139 @@ PT_TEST(bvh_refit_matches_rebuild) {
   return {};
 }
 
+PT_TEST(bvh_ordered_bits) {
+  // Unsigned order of the mapped bits must be the float order, and the mapping must invert.
+  const float values[] = {-3.0e38f, -3.5e10f, -1.0f, -1.0e-30f, -1.0e-45f, -0.0f, 0.0f, 1.0e-45f,
+                          1.0e-38f, 1.0e-30f, 0.5f, 1.0f, 1.0f + 1.0e-7f, 7.25e20f, 3.0e38f};
+  for (std::size_t i = 0; i < std::size(values); ++i) {
+    const uint bits = ptOrderedBits(values[i]);
+    if (as_type<uint>(ptOrderedFloat(bits)) != as_type<uint>(values[i])) return "ordered bits do not invert";
+    if (i > 0 && !(ptOrderedBits(values[i - 1]) < bits)) return "ordered bits break the float order at " + std::to_string(i);
+  }
+  std::mt19937 random(71);
+  std::uniform_int_distribution<uint> any;
+  for (int i = 0; i < 100000; ++i) {
+    const float a = as_type<float>(any(random)), b = as_type<float>(any(random));
+    if (std::isnan(a) || std::isnan(b) || a == b) continue;
+    if ((a < b) != (ptOrderedBits(a) < ptOrderedBits(b))) return "ordered bits disagree with a random comparison";
+  }
+  return {};
+}
+
+// shaders/pt/exact_float.h reproduces the host's IEEE float operations bit for bit (the GPU
+// collapse relies on it): random bit patterns, subnormals, specials, near cancellations.
+PT_TEST(exact_float_matches_native) {
+  auto bits = [](float f) { return std::bit_cast<uint>(f); };
+  auto value = [](uint u) { return std::bit_cast<float>(u); };
+  std::mt19937 random(90210);
+  std::uniform_int_distribution<uint> word(0u, 0xFFFFFFFFu);
+  const uint specials[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u, 0x007FFFFFu, 0x00800000u,
+                           0x3F800000u, 0xBF800000u, 0x7F7FFFFFu, 0xFF7FFFFFu, 0x7F800000u, 0xFF800000u,
+                           0x7FC00000u, 0x37800080u, 0x4B000000u, 0x477FFF00u};
+  // Operand pairs: uniform patterns, subnormal-heavy, near-equal (cancellation), modest values.
+  auto pair = [&](int kind, uint &a, uint &b) {
+    a = word(random);
+    b = word(random);
+    switch (kind) {
+    case 1: a &= 0x80FFFFFFu; b &= 0x81FFFFFFu; break;
+    case 2: b = (a ^ (word(random) & 0x80000000u)) + (word(random) & 0xFFu) - 128u; break;
+    case 3: a = bits(static_cast<float>(static_cast<int>(a % 200001u) - 100000) / 1024.0f);
+            b = bits(static_cast<float>(static_cast<int>(b % 20001u) - 10000) / 8.0f); break;
+    case 4: a = specials[a % std::size(specials)]; break;
+    case 5: a = specials[a % std::size(specials)]; b = specials[b % std::size(specials)]; break;
+    default: break;
+    }
+  };
+  auto same = [&](uint exact, float native) {
+    return std::isnan(native) ? ptExactIsNaN(exact) : exact == bits(native);
+  };
+  char why[256];
+  for (int n = 0; n < 6000000; ++n) {
+    uint a = 0u, b = 0u;
+    pair(n % 6, a, b);
+    const float x = value(a), y = value(b);
+    const struct { const char *name; uint exact; float native; } results[] = {
+        {"add", ptExactAdd(a, b), x + y},
+        {"subtract", ptExactSubtract(a, b), x - y},
+        {"multiply", ptExactMultiply(a, b), x * y},
+        {"divide", ptExactDivide(a, b), x / y},
+        {"min", ptExactMin(a, b), min(x, y)},
+        {"max", ptExactMax(a, b), max(x, y)},
+        {"nextafter up", ptExactNextAfter(a, true), std::nextafter(x, std::numeric_limits<float>::infinity())},
+        {"nextafter down", ptExactNextAfter(a, false), std::nextafter(x, -std::numeric_limits<float>::infinity())}};
+    for (const auto &r : results)
+      if (!same(r.exact, r.native)) {
+        std::snprintf(why, sizeof(why), "%s(%08x, %08x): exact %08x, native %08x", r.name, a, b, r.exact,
+                      bits(r.native));
+        return why;
+      }
+    if (ptExactLess(a, b) != (x < y)) {
+      std::snprintf(why, sizeof(why), "less(%08x, %08x) differs", a, b);
+      return why;
+    }
+    // The division's correction from any estimate within +-2000 units equals the bitwise quotient.
+    {
+      const uint sigA = (a & 0x7FFFFFu) | 0x800000u, sigB = (b & 0x7FFFFFu) | 0x800000u;
+      const uint shift = sigA < sigB ? 31u : 30u;
+      const uint exact = ptExactQuotientBitwise(sigA, sigB, shift);
+      const uint estimate = (exact & ~1u) + (word(random) % 4001u) - 2000u;
+      if (ptExactQuotientFrom(sigA, sigB, shift, estimate) != exact) {
+        std::snprintf(why, sizeof(why), "quotient(%06x, %06x) from %08x: %08x, bitwise %08x", sigA, sigB, estimate,
+                      ptExactQuotientFrom(sigA, sigB, shift, estimate), exact);
+        return why;
+      }
+    }
+    if (!std::isnan(x))
+      for (const bool up : {false, true}) {
+        const float rounded = up ? std::ceil(x) : std::floor(x);
+        const uint native = static_cast<uint>(std::clamp(rounded, 0.0f, 65535.0f));
+        const float quotient = x / y;
+        if (!std::isnan(quotient)) {
+          const float roundedQuotient = up ? std::ceil(quotient) : std::floor(quotient);
+          const uint nativeBin = static_cast<uint>(std::clamp(roundedQuotient, 0.0f, 65535.0f));
+          if (ptExactQuantiseQuotient(a, b, up) != nativeBin) {
+            std::snprintf(why, sizeof(why), "quantise(%08x / %08x, %d): exact %u, native %u", a, b, up ? 1 : 0,
+                          ptExactQuantiseQuotient(a, b, up), nativeBin);
+            return why;
+          }
+        }
+        if (ptExactQuantise(a, up) != native) {
+          std::snprintf(why, sizeof(why), "quantise(%08x, %d): exact %u, native %u", a, up ? 1 : 0,
+                        ptExactQuantise(a, up), native);
+          return why;
+        }
+      }
+  }
+  return {};
+}
+
+PT_TEST(bvh_layout_cost_matches_builder) {
+  Builder b = soup(2000);
+  std::vector<TraceInstance> instances = b.scene.instances;
+  Bvh bvh;
+  const BvhStatistics stats = buildBvh(b.scene.vertices, b.scene.indices, instances, b.scene.triangleCounts, bvh,
+                                       sharedPool().size());
+  const LayoutCost binary = binaryLayoutCost(bvh.nodes, instances);
+  if (!(stats.sahCost > 0.0) || std::abs(binary.bottom - stats.sahCost) > 1e-9 * stats.sahCost)
+    return "layout cost " + std::to_string(binary.bottom) + " differs from the builder's " + std::to_string(stats.sahCost);
+  if (!(binary.top >= 1.0)) return "the top level's layout cost is not that of an interior tree";
+  for (const uint width : {4u, 8u}) {
+    const WideBvh wide = buildWideBvh(bvh, instances, width);
+    const LayoutCost cost = wideLayoutCost(wide.nodes, wide.instances);
+    if (!(cost.bottom > 0.0 && cost.bottom < binary.bottom) || !(cost.top >= 1.0))
+      return "wide layout cost is not below the binary tree's";
+  }
+  std::printf("  SAH cost: binary %.2f (top %.2f)\n", binary.bottom, binary.top);
+  return {};
+}
+
 PT_TEST(quantized_bvh4_bvh8_match_binary) {
   Builder b = soup(2000);
   const WideBvh wide4 = buildWideBvh(b.scene.bvh, b.scene.instances, 4u);
   const WideBvh wide8 = buildWideBvh(b.scene.bvh, b.scene.instances, 8u);
   if (wide4.nodes.empty() || wide8.nodes.empty()) return "wide conversion emitted no nodes";
-  if (wide4.maximumStack == 0u || wide4.maximumStack > 64u ||
-      wide8.maximumStack == 0u || wide8.maximumStack > 64u)
+  if (wide4.maximumStack == 0u || wide4.maximumStack > PT_WIDE_BVH_STACK_DEEP ||
+      wide8.maximumStack == 0u || wide8.maximumStack > PT_WIDE_BVH_STACK_DEEP)
     return "wide conversion did not prove its GPU traversal stack bound";
   std::mt19937 random(1447);
   std::uniform_real_distribution<float> unit(-1.0f, 1.0f);

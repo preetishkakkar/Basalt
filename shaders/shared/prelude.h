@@ -18,4 +18,18 @@ inline float3 xyz(float4 v) { return v.xyz; }
 inline float2 xy(float4 v) { return v.xy; }
 inline float2 xy(float3 v) { return v.xy; }
 inline float2 zw(float4 v) { return v.zw; }
+
+// threadgroup_broadcast(value, lane, source, slot) is an msl2spirv builtin (msl2spirv's SHARED_MEMORY.md):
+// the invocations whose lane equals source store value at *slot, a barrier, every invocation reads
+// it, a second barrier. msl2spirv treats the result as workgroup-uniform, so a loop with barriers
+// may exit on it; other Metal compilers get the same sequence here.
+#ifndef __METAL2VULKAN__
+template <typename T> inline T threadgroup_broadcast(T value, uint lane, uint source, threadgroup T *slot) {
+  if (lane == source) slot[0] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const T result = slot[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return result;
+}
+#endif
 #endif

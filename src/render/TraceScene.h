@@ -17,4 +17,8 @@ struct TraceScene {
 // kRayMaskBlended, so the rasteriser's rays, which never ask for it, pass through them.
 TraceScene buildTraceScene(const Scene &scene, const std::vector<std::uint32_t> &materialSlots);
 
+// An instance row's object-to-world, world-to-object and normal matrices and its mirrored flag
+// for the model matrix; its other fields are kept.
+void setTraceTransform(pt::TraceInstance &instance, const Mat4 &model);
+
 } // namespace basalt

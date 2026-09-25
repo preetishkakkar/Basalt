@@ -8,33 +8,6 @@ constant uint kEmpty = 0xFFFFFFFFu;
 constant float kHuge = 3.0e38f;
 constant uint kBuilderStack = 64u;
 
-inline float3 buildPosition(const device float *vertices, uint index) {
-  const uint base = index * kVertexFloats;
-  return float3(vertices[base], vertices[base + 1u], vertices[base + 2u]);
-}
-
-inline uint expandMorton(uint value) {
-  value &= 0x000003ffu;
-  value = (value | (value << 16u)) & 0x030000FFu;
-  value = (value | (value << 8u)) & 0x0300F00Fu;
-  value = (value | (value << 4u)) & 0x030C30C3u;
-  value = (value | (value << 2u)) & 0x09249249u;
-  return value;
-}
-
-inline uint morton3(float3 point, float3 low, float3 high) {
-  const float3 extent = high - low;
-  float3 unit = float3(0.5f);
-  if (extent.x > 0.0f) unit.x = (point.x - low.x) / extent.x;
-  if (extent.y > 0.0f) unit.y = (point.y - low.y) / extent.y;
-  if (extent.z > 0.0f) unit.z = (point.z - low.z) / extent.z;
-  unit = clamp(unit, float3(0.0f), float3(0.999999f));
-  const uint x = uint(unit.x * 1024.0f);
-  const uint y = uint(unit.y * 1024.0f);
-  const uint z = uint(unit.z * 1024.0f);
-  return expandMorton(x) | (expandMorton(y) << 1u) | (expandMorton(z) << 2u);
-}
-
 inline void stableRadix(device BvhBuildRecord *a, device BvhBuildRecord *b, uint count,
                         thread uint &passes) {
   for (uint pass = 0u; pass < 6u; ++pass) {
@@ -172,12 +145,6 @@ inline bool emitTree(const device BvhBuildRecord *records, uint count, uint node
     }
   }
   return true;
-}
-
-inline float3 transformPoint(TraceInstance instance, float3 point) {
-  const float4 p = float4(point.x, point.y, point.z, 1.0f);
-  return float3(dot(instance.objectToWorld0, p), dot(instance.objectToWorld1, p),
-                dot(instance.objectToWorld2, p));
 }
 
 kernel void bvh_build(const device BvhBuildDescriptor *descriptors [[buffer(0)]],

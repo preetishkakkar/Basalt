@@ -58,10 +58,10 @@ uint maximumTraversalStack(const WideBvh &bvh) {
       if (entry.value >= bvh.nodes.size())
         throw std::runtime_error("wide BVH contains an invalid node reference");
       const QuantizedWideNode &node = bvh.nodes[entry.value];
-      const uint count = as_type<uint>(node.origin.w);
-      if (count > bvh.width) throw std::runtime_error("wide BVH node exceeds its declared width");
+      const uint count = as_type<uint>(node.origin.w) & kWideSlotMask;
+      if (count > 8u) throw std::runtime_error("wide BVH node exceeds eight slots");
       for (uint child = 0u; child < count; ++child)
-        stack.push_back({node.children[child].w, entry.bottom});
+        if (node.children[child].w != kBvhEmpty) stack.push_back({node.children[child].w, entry.bottom});
     }
     maximum = std::max(maximum, static_cast<uint>(stack.size()));
   }
@@ -112,6 +112,35 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
     float3 low(std::numeric_limits<float>::infinity());
     float3 high(-std::numeric_limits<float>::infinity());
     for (const Child &c : frontier) { low = min(low, c.low); high = max(high, c.high); }
+    // BVH8: octant slots (bvh_layout.h), greedily giving each slot s the child a ray of octant s
+    // meets first, the smallest dot(child centre - node centre, direction of s); the cheapest
+    // remaining (child, slot) pair first, lower child then lower slot on a tie.
+    std::array<int, 8> childOfSlot;
+    childOfSlot.fill(-1);
+    const bool octantSlots = width == 8u;
+    if (!octantSlots) {
+      // BVH4 nodes stay compact: children in collapse order in slots 0..count-1.
+      for (std::size_t i = 0; i < frontier.size(); ++i) childOfSlot[i] = static_cast<int>(i);
+    } else {
+      const float3 centre = (low + high) * 0.5f;
+      std::vector<bool> placed(frontier.size(), false);
+      for (std::size_t assigned = 0; assigned < frontier.size(); ++assigned) {
+        float best = std::numeric_limits<float>::infinity();
+        std::size_t bestChild = 0, bestSlot = 0;
+        for (std::size_t i = 0; i < frontier.size(); ++i) {
+          if (placed[i]) continue;
+          const float3 offset = (frontier[i].low + frontier[i].high) * 0.5f - centre;
+          for (std::size_t s = 0; s < 8u; ++s) {
+            if (childOfSlot[s] >= 0) continue;
+            const float cost = ((s & 1u) ? -offset.x : offset.x) + ((s & 2u) ? -offset.y : offset.y) +
+                               ((s & 4u) ? -offset.z : offset.z);
+            if (cost < best) { best = cost; bestChild = i; bestSlot = s; }
+          }
+        }
+        placed[bestChild] = true;
+        childOfSlot[bestSlot] = static_cast<int>(bestChild);
+      }
+    }
     if (frontier.empty()) {
       QuantizedWideNode node{};
       node.origin.w = as_type<float>(0u);
@@ -129,10 +158,14 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
     scale.y = std::nextafter(scale.y, std::numeric_limits<float>::infinity());
     scale.z = std::nextafter(scale.z, std::numeric_limits<float>::infinity());
     QuantizedWideNode node{};
-    node.origin = float4(low, as_type<float>(static_cast<uint>(frontier.size())));
+    node.origin = float4(low, as_type<float>(octantSlots ? (8u | kWideOctantOrdered) : static_cast<uint>(frontier.size())));
     node.scale = float4(scale, 0.0f);
-    for (std::size_t slot = 0; slot < frontier.size(); ++slot) {
-      const Child &c = frontier[slot];
+    for (std::size_t slot = 0; slot < (octantSlots ? 8u : frontier.size()); ++slot) {
+      if (childOfSlot[slot] < 0) {
+        node.children[slot] = uint4(0u, 0u, 0u, kBvhEmpty);
+        continue;
+      }
+      const Child &c = frontier[static_cast<std::size_t>(childOfSlot[slot])];
       uint data = c.data;
       if (c.count == 0u) data = emit(c.data, bottom);
       else if (bottom) data = kBvhLeafTag | (c.count << kBvhCountShift) | c.data;
@@ -147,11 +180,121 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
   if (!binary.nodes.empty()) emit(0u, false);
   for (TraceInstance &instance : result.instances) instance.blasRoot = emit(instance.blasRoot, true);
   result.maximumStack = maximumTraversalStack(result);
-  if (result.maximumStack > 64u)
-    throw std::runtime_error("wide BVH requires more than the GPU traversal stack's 64 entries");
+  if (result.maximumStack > PT_WIDE_BVH_STACK_DEEP)
+    throw std::runtime_error("wide BVH requires more than the GPU traversal stack's " +
+                             std::to_string(PT_WIDE_BVH_STACK_DEEP) + " entries");
   result.milliseconds = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - started).count();
   return result;
+}
+
+namespace {
+float layoutArea(float3 low, float3 high) {
+  if (!(low.x <= high.x && low.y <= high.y && low.z <= high.z)) return 0.0f;
+  const float3 d = high - low;
+  return 2.0f * (d.x * d.y + d.y * d.z + d.z * d.x);
+}
+
+double binaryTreeCost(const std::vector<float4> &nodes, uint root) {
+  const std::size_t nodeCount = nodes.size() / 4u;
+  if (root >= nodeCount) throw std::runtime_error("BVH cost: a root is outside the node array");
+  auto child = [&](uint node, uint side) {
+    const float4 a = nodes[node * 4u + side * 2u], b = nodes[node * 4u + side * 2u + 1u];
+    return Child{xyz(a), xyz(b), as_type<uint>(a.w), as_type<uint>(b.w)};
+  };
+  Child children[2] = {child(root, 0), child(root, 1)};
+  float3 low(3.0e38f), high(-3.0e38f);
+  uint present = 0;
+  for (const Child &c : children)
+    if (!(c.data == kBvhEmpty && c.count == 0u)) { low = min(low, c.low); high = max(high, c.high); ++present; }
+  const float rootArea = std::max(layoutArea(low, high), 1e-30f);
+  double cost = present == 2u ? 1.0 : 0.0;
+  std::vector<uint> stack{root};
+  std::size_t visited = 0;
+  while (!stack.empty()) {
+    if (++visited > nodeCount) throw std::runtime_error("BVH cost: the tree has a cycle");
+    const uint node = stack.back();
+    stack.pop_back();
+    for (uint side = 0; side < 2u; ++side) {
+      const Child c = child(node, side);
+      if (c.data == kBvhEmpty && c.count == 0u) continue;
+      const double relative = static_cast<double>(layoutArea(c.low, c.high) / rootArea);
+      cost += c.count == 0u ? relative : relative * static_cast<double>(c.count);
+      if (c.count == 0u) {
+        if (c.data >= nodeCount) throw std::runtime_error("BVH cost: a child is outside the node array");
+        stack.push_back(c.data);
+      }
+    }
+  }
+  return cost;
+}
+
+void decodeWide(const QuantizedWideNode &node, uint child, float3 &low, float3 &high) {
+  const uint4 &packed = node.children[child];
+  const float3 origin = xyz(node.origin), scale = xyz(node.scale);
+  low = origin + scale * float3(static_cast<float>(packed.x & 0xFFFFu), static_cast<float>(packed.y & 0xFFFFu),
+                                static_cast<float>(packed.z & 0xFFFFu));
+  high = origin + scale * float3(static_cast<float>(packed.x >> 16u), static_cast<float>(packed.y >> 16u),
+                                 static_cast<float>(packed.z >> 16u));
+}
+
+double wideTreeCost(const std::vector<QuantizedWideNode> &nodes, uint root, bool bottom) {
+  if (root >= nodes.size()) throw std::runtime_error("wide BVH cost: a root is outside the node array");
+  const QuantizedWideNode &top = nodes[root];
+  const uint rootSlots = as_type<uint>(top.origin.w) & kWideSlotMask;
+  float3 low(3.0e38f), high(-3.0e38f);
+  uint rootChildren = 0, onlyChild = kBvhEmpty;
+  for (uint child = 0; child < rootSlots; ++child) {
+    if (top.children[child].w == kBvhEmpty) continue;
+    float3 a, b;
+    decodeWide(top, child, a, b);
+    low = min(low, a);
+    high = max(high, b);
+    ++rootChildren;
+    onlyChild = top.children[child].w;
+  }
+  const float rootArea = std::max(layoutArea(low, high), 1e-30f);
+  const bool interiorRoot = rootChildren > 1u || (rootChildren == 1u && (onlyChild & kBvhLeafTag) == 0u);
+  double cost = interiorRoot ? 1.0 : 0.0;
+  std::vector<uint> stack{root};
+  std::size_t visited = 0;
+  while (!stack.empty()) {
+    if (++visited > nodes.size()) throw std::runtime_error("wide BVH cost: the tree has a cycle");
+    const QuantizedWideNode &node = nodes[stack.back()];
+    stack.pop_back();
+    const uint children = as_type<uint>(node.origin.w) & kWideSlotMask;
+    for (uint child = 0; child < children; ++child) {
+      const uint data = node.children[child].w;
+      if (data == kBvhEmpty) continue;
+      float3 a, b;
+      decodeWide(node, child, a, b);
+      const double relative = static_cast<double>(layoutArea(a, b) / rootArea);
+      if ((data & kBvhLeafTag) == 0u) {
+        cost += relative;
+        stack.push_back(data);
+      } else {
+        cost += relative * static_cast<double>(bottom ? (data & ~kBvhLeafTag) >> kBvhCountShift : 1u);
+      }
+    }
+  }
+  return cost;
+}
+} // namespace
+
+LayoutCost binaryLayoutCost(const std::vector<float4> &nodes, const std::vector<TraceInstance> &instances) {
+  LayoutCost cost;
+  if (nodes.size() < 4u) return cost;
+  cost.top = binaryTreeCost(nodes, 0u);
+  for (const TraceInstance &instance : instances) cost.bottom += binaryTreeCost(nodes, instance.blasRoot);
+  return cost;
+}
+
+LayoutCost wideLayoutCost(const std::vector<QuantizedWideNode> &nodes, const std::vector<TraceInstance> &instances) {
+  LayoutCost cost;
+  if (nodes.empty()) return cost;
+  cost.top = wideTreeCost(nodes, 0u, false);
+  for (const TraceInstance &instance : instances) cost.bottom += wideTreeCost(nodes, instance.blasRoot, true);
+  return cost;
 }
 
 PtHit traceWideBvh(const WideBvh &bvh, const Material *materials, const uint *indices,
@@ -203,10 +346,11 @@ PtHit traceWideBvh(const WideBvh &bvh, const Material *materials, const uint *in
       continue;
     }
     const QuantizedWideNode &node = bvh.nodes[entry];
-    const uint childCount = as_type<uint>(node.origin.w);
+    const uint childCount = as_type<uint>(node.origin.w) & kWideSlotMask;
     float distances[8]{}; uint entries[8]{}; uint found = 0u;
     for (uint child = 0; child < childCount; ++child) {
       const uint4 p = node.children[child]; const uint words[3]{p.x, p.y, p.z};
+      if (p.w == kBvhEmpty) continue;
       float3 low, high;
       for (uint axis = 0; axis < 3u; ++axis) {
         const float base = component(xyz(node.origin), axis), step = component(xyz(node.scale), axis);
