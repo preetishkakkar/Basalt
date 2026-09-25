@@ -130,7 +130,7 @@ struct StartupOptions {
 
 struct Application {
   explicit Application(const StartupOptions &options)
-      : window{"Basalt: Metal shaders on Vulkan", options.width, options.height},
+      : window{"Basalt: Slang shaders on Vulkan", options.width, options.height},
         context{window, options.validation} {}
   Window window;
   Context context;
@@ -204,7 +204,7 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
   pt::CaptureMetadata m;
   m.revision = BASALT_GIT_REVISION;
   m.dirtyAtConfigure = BASALT_GIT_DIRTY != 0;
-  m.shaderCompiler = "msl2spirv-" BASALT_MSL2SPIRV_VERSION;
+  m.shaderCompiler = "slang-" BASALT_SLANG_VERSION;
   m.scene = initialScenePath;
   try {
     m.sceneFileHash = pt::hashFile(initialScenePath);
@@ -935,7 +935,7 @@ void Application::drawInterface() {
   }
 
   ImGui::Separator();
-  ImGui::TextDisabled("Shaders: Metal Shading Language, compiled by msl2spirv");
+  ImGui::TextDisabled("Shaders: Slang " BASALT_SLANG_VERSION ", compiled by slangc");
   ImGui::End();
 
   if (showLog) {
@@ -1529,15 +1529,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       throw std::runtime_error("--di-estimator restir requires a path tracer");
     if (diEstimator == 1 && samplesPerFrame > 1)
       throw std::runtime_error("--di-estimator restir reuses one path per pixel per frame: --spf must be 1");
-    if (!deviceSelection.empty() && _putenv_s("BASALT_VULKAN_DEVICE", deviceSelection.c_str()) != 0)
-      throw std::runtime_error("could not apply the requested Vulkan device selection");
-    basalt::Application application(startup);
-    if ((rendererKind == 2 || rendererKind == 4) && !application.context.rayTracingSupported)
-      throw std::runtime_error("the selected renderer requires Vulkan ray queries on the selected device");
-    if (rendererKind == 5 && !application.context.rayPipelineSupported)
-      throw std::runtime_error("the selected renderer requires VK_KHR_ray_tracing_pipeline on the selected device");
-    if ((shadowMode == 2 || occlusionMode >= 1 || reflectionMode == 2) && !application.context.rayTracingSupported)
-      throw std::runtime_error("traced shadows, occlusion or reflections require Vulkan ray queries on the selected device");
     if (rendererKind == 1 && intersector == 1 && !pt::EmbreeScene::available())
       throw std::runtime_error("the requested Embree intersector is unavailable in this build");
     if (rendererKind == 1 && intersector == 2 && !pt::cpuAvx2Available())
@@ -1570,6 +1561,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       throw std::runtime_error("--albedo-pfm and --normal-pfm require a GPU path tracer");
     if (intersector >= 0 && rendererKind != 1)
       throw std::runtime_error("--intersector requires --renderer cpu");
+    if (!deviceSelection.empty() && _putenv_s("BASALT_VULKAN_DEVICE", deviceSelection.c_str()) != 0)
+      throw std::runtime_error("could not apply the requested Vulkan device selection");
+    basalt::Application application(startup);
+    if ((rendererKind == 2 || rendererKind == 4) && !application.context.rayTracingSupported)
+      throw std::runtime_error("the selected renderer requires Vulkan ray queries on the selected device");
+    if (rendererKind == 5 && !application.context.rayPipelineSupported)
+      throw std::runtime_error("the selected renderer requires VK_KHR_ray_tracing_pipeline on the selected device");
+    if ((shadowMode == 2 || occlusionMode >= 1 || reflectionMode == 2) && !application.context.rayTracingSupported)
+      throw std::runtime_error("traced shadows, occlusion or reflections require Vulkan ray queries on the selected device");
     const bool capture = !screenshot.empty() || !linear.empty() || !denoisedLinear.empty() ||
                          !albedoLinear.empty() || !normalLinear.empty();
     application.capturePath = screenshot;

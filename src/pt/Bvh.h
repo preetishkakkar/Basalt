@@ -1,4 +1,4 @@
-// Builds the software BVH in the layout shaders/pt/bvh.h traverses: one bottom level per
+// Builds the software BVH in the layout pt_bvh.slang traverses: one bottom level per
 // instance over its triangles in object space, one top level over the instances' world
 // bounds, as the hardware structure is built. Binned SAH, run across threads.
 #pragma once

@@ -1,6 +1,0 @@
-#pragma once
-#include "msl_sync.h"
-#include "msl_simd.h"
-#include "msl_simdgroup_matrix.h"
-#include "msl_function_table.h"
-#include "msl_command_buffer.h"

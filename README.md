@@ -1,12 +1,14 @@
 # Basalt
 
-A Vulkan renderer whose shaders are written in **Metal Shading Language**.
+A Vulkan renderer whose shaders are written in **[Slang](https://shader-slang.org)**.
 
-There is no GLSL and no HLSL in this repository. Every shader — the PBR forward
-pass, the shadow pass, the sky, the reflection resolve, the bloom chain, the
-tone mapper, the image-based lighting bake, the ray queries, and even the user
-interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
-[`msl2spirv`](tools/metal2vulkan), which the first configure fetches for you.
+Every shader — the PBR forward pass, the shadow pass, the sky, the reflection
+resolve, the bloom chain, the tone mapper, the image-based lighting bake, the
+ray queries, the path tracers, the BVH builders and even the user interface —
+is a Slang module compiled to Vulkan SPIR-V at build time by `slangc`, which the
+first configure fetches for you. The same modules are compiled to C++ for the
+CPU path tracer, so the CPU and the GPU run one implementation of the light
+transport.
 
 ![The Damaged Helmet rendered by Basalt](docs/helmet.png)
 
@@ -59,7 +61,7 @@ interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
   chain, ACES or Reinhard tone mapping, exposure, vignette, grain, sharpening,
   and a choice of no antialiasing, FXAA or temporal.
 - **A user interface** built with Dear ImGui, drawn through the engine's own
-  Metal shaders rather than the library's bundled SPIR-V.
+  shaders rather than the library's bundled SPIR-V.
 - **A path tracer** beside the rasteriser, switched with F5 or the interface,
   on the CPU and on the GPU in three ways: inline ray queries, its own BVH in
   compute (SAH or GPU LBVH, binary or quantized BVH4/BVH8), and a full Vulkan
@@ -72,8 +74,9 @@ interface — is a `.metal` source compiled to Vulkan SPIR-V at build time by
   Options add thin-lens depth of field, ray-cone texture filtering and ReSTIR DI
   at the primary vertex. Temporal reconstruction and Intel Open Image Denoise
   clean up the display without touching the raw image. The light transport is
-  written once, in the subset of MSL that also compiles as C++, so every
-  backend runs the same code and they agree to within tested tolerances.
+  written once, as Slang modules generic over the intersector and the texture
+  reads, and compiled both to SPIR-V and to C++, so every backend runs the same
+  code and they agree to within tested tolerances.
   Captures write linear PFM or OpenEXR with JSON metadata; `basalt --help`
   lists every option.
 - **Debug views** for base colour, normals, metallic, roughness, occlusion,
@@ -110,19 +113,15 @@ cmake --build build --parallel
 ./build/basalt.exe
 ```
 
-The build compiles every `.metal` source in [`shaders/`](shaders) with
-`msl2spirv` before it links the engine. A shader that does not compile fails the
-build, and a vertex entry whose outputs do not match its fragment entry's inputs
-fails it too, because the build passes `--check-fragment-entry` for each pair.
+The build compiles every entry point in [`shaders/slang/`](shaders/slang) with
+`slangc` and validates each module with `spirv-val` before it links the engine,
+so a shader that does not compile or validate fails the build. It also compiles
+the path tracer's modules to C++ for the CPU tracer.
 
-The compiler itself is not in the repository, since it is a 46 MB binary. The
-first configure downloads it from this project's releases into
-`tools/metal2vulkan/bin/`, checks it against a pinned SHA-256, and never asks
-again. To build a copy of your own instead, put it at that path or pass
-`-DBASALT_MSL2SPIRV=<path>`; either way the download is skipped.
-[`cmake/msl2spirv.cmake`](cmake/msl2spirv.cmake) has the rest, including
-`-DBASALT_DOWNLOAD_MSL2SPIRV=OFF` if you would rather it never reached the
-network.
+Slang is not in the repository. The first configure downloads its release
+(v2026.18.2) into `.deps/`, checks it against a pinned SHA-256, and never asks
+again; point `-DBASALT_SLANG_ROOT=<path>` at an unpacked release to use your own.
+[`cmake/slang.cmake`](cmake/slang.cmake) has the rest.
 
 The first configure also fetches Intel Embree and Intel Open Image Denoise,
 prebuilt and checked against pinned hashes, into `.deps/`. Both are optional:
@@ -169,61 +168,57 @@ Sample models are not committed. Any glTF 2.0 file works; the
 [Khronos sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets) are
 a good place to start.
 
-## How the Metal side works
+## Architecture
 
-The compiler maps Metal's per-stage argument tables onto Vulkan descriptor sets
-with one rule: the **vertex or compute stage is set 0 and the fragment stage is
-set 1**, and within a set the binding is a class base plus the Metal index —
-buffers at 0, samplers at 32, textures at 64. Every compiled shader comes with a
-reflection JSON describing exactly that, and the engine builds its descriptor
-set layouts, pipeline layouts and vertex input state from it rather than from
-constants written twice. `DescriptorWriter` takes resources by the name the
-shader gave them, so renaming a texture in a `.metal` file moves its descriptor
-with no C++ change.
+**Shaders.** Every shader lives in [`shaders/slang/`](shaders/slang). The entry points are in
+`entries/`; the code they share is organised as Slang modules, `basalt/` for the rasteriser
+(material, shading, random numbers, the traced shadow and reflection rays) and `pt/` for the path
+tracers (camera and path state, ray cones, BVH traversal, surfaces, the BSDF, lights, the path
+loop, ReSTIR DI, the temporal filter, the BVH builders' records). An entry imports the modules
+it needs, and variants are generics rather than preprocessor copies: the forward pass is one
+function with and without traced rays, and every GPU path tracer is one pixel function over the
+tracer it is given.
 
-Two consequences of the profile shaped the design:
+**Bindings.** Slang assigns every binding and the engine reads them back. Each compiled entry
+point comes with slangc's reflection JSON, and `src/gpu/` builds descriptor set layouts, pipeline
+layouts, push-constant ranges and vertex input state from it rather than from constants written
+twice. A file's loose globals share one set, each `ParameterBlock` is a set of its own (the
+rasteriser's per-frame view, per-material and scene data; the path tracers' scene and traced
+structure), and an entry point's `uniform` parameters are its push constants. `DescriptorWriter`
+takes resources by the name the shader gave them (`"geometry.materials"`, `"maps.table"`), so
+renaming one moves its descriptor with no C++ change. What an entry reads comes from its module's
+own decorations, so variants of one file share host code and a binding no stage reads is left
+out of the layout.
 
-- **There are no user push constants**, so per-draw data lives in a storage
-  buffer of instance records indexed by `[[instance_id]]`, which Vulkan fills
-  from the draw's first instance. A draw is `vkCmdDrawIndexed(..., firstInstance
-  = primitive index)` and the vertex entry reads its own transform and material.
-- **An entry binds at most eight textures and eight samplers.** The forward
-  fragment entry uses all eight (five material maps, the prefiltered cube, the
-  shadow array, and the texture table below), which is why the split-sum
-  environment BRDF is evaluated analytically instead of sampled from a baked
-  lookup table and the diffuse irradiance comes from spherical harmonics in
-  the uniforms rather than a cube. An array of textures counts as one binding
-  but takes consecutive indices, so it goes last: the forward and resolve
-  entries reach every material's base colour, metallic-roughness, emissive and
-  normal maps through a single table of 120 slots (white and a flat normal in
-  the first two, 118 for the scene's own textures), indexed by the primitive a
-  ray hit, which is what lets a shadow ray see through the cut-out of a leaf.
-- **An acceleration structure is only traversable from an entry**, not from a
-  helper, so every ray loop sits in the entry that owns it: shadow and
-  occlusion rays in the forward fragment, reflection rays in the resolve
-  kernel. The forward and resolve entries each exist twice, once with the
-  acceleration structure parameter and once without, so a device that cannot
-  trace never loads a module that asks for it.
+**Path tracers.** The path loop is `ptTracePath<Tracer, Maps, ...>` in `pt/pt_integrator.slang`,
+generic over an `IPtTracer` and an `IPtMaps`. The GPU gives it its texture table as the maps and
+one of four tracers: the binary or quantized BVH4/BVH8 software BVH, ray queries, or the full ray
+pipeline's `TraceRay`. The megakernel entries run a pixel's samples in one thread; the wavefront
+entries split each bounce into intersect, shade and shadow stages over queues in device memory,
+and the ReSTIR DI passes resample the primary vertex's lights before either. The CPU tracer
+compiles the module `pt/pt_cpu.slang` to C++ (`slangc -target cpp`) into the `basalt-pt`
+library and calls its exports; the host keeps only what it owns, its copies of the textures and
+its own intersectors (Embree and an AVX2 BVH8 traversal), which the generated code calls back
+through. The constants the host shares with the shaders are generated from the modules too.
 
-[`tools/metal2vulkan/README.md`](tools/metal2vulkan/README.md) documents the
-bundled compiler, every option it takes, and how to refresh it from a
-Metal2Vulkan checkout.
+**BVH builders.** The software BVH is built on the CPU (binned SAH) or on the GPU: a serial SAH
+kernel, a parallel LBVH (Karras) over a GPU radix sort, or PLOC, all publishing the same node
+layout, collapsed on the GPU to quantized BVH4/BVH8 and refitted in place for animated geometry.
+The parallel builders publish the serial builder's tree byte for byte, which the tests check.
 
 ## Layout
 
 | Path | What is in it |
 |---|---|
-| `shaders/` | Every shader, in Metal. `common.metal` holds the shared structures and shading maths. |
-| `src/core/` | Maths laid out to match MSL, logging, the error type. |
-| `src/gpu/` | Vulkan context, swapchain, buffers and images, shader and pipeline creation, descriptors, staging uploads. |
+| `shaders/slang/` | Every shader, in Slang: `entries/` holds the entry points, `basalt/` the rasteriser's modules and `pt/` the path tracers'. |
+| `src/core/` | Maths, logging, the error type, the JSON reader for shader reflection. |
+| `src/gpu/` | Vulkan context, swapchain, buffers and images, shader reflection, pipeline creation, descriptors, staging uploads. |
 | `src/scene/` | glTF loading, the scene representation, the camera. |
-| `src/render/` | The frame: shadow, forward, sky, reflection, bloom and post passes; the acceleration structures; the IBL bake; the ImGui backend. |
-| `tools/metal2vulkan/` | The shader compiler, its owned standard library, and the host reflection library that turns each shader's reflection JSON into Vulkan descriptor layouts. |
-| `shaders/shared/` | Headers compiled both as MSL and as C++: the buffer structures, the shading maths and the sample stream the rasteriser and the path tracer share. |
-| `shaders/pt/` | The path tracer's shared code: BVH traversal, hit reconstruction, the BSDF, light sampling, and the path loop itself (`integrator.inc`). |
-| `src/pt/` | The C++ side: the shim that gives MSVC the MSL types, the BVH builders and wide layouts, the environment and albedo tables, the CPU tracer, capture metadata and image files. |
+| `src/render/` | The frame: shadow, forward, sky, reflection, bloom and post passes; the GPU path tracers' passes and reconstruction; the acceleration structures and the GPU BVH builders; the IBL bake; the ImGui backend. |
+| `src/pt/` | The CPU side: the generated path tracer's host view (`Shared.h`, `Tracing.h`), the BVH builders and wide layouts, the environment and albedo tables, the CPU tracer, capture metadata and image files. |
 | `tests/` | The CTest manifest's programs and scripts: CPU transport tests, GPU oracles and image gates per backend, lifecycle and CLI rejection tests, and generated test scenes in `tests/data/`. |
 | `tools/` | The image comparison script, the benchmark harness and `shader-stats`. |
+| `cmake/` | Fetching Slang and the prebuilt Embree and Open Image Denoise, and generating the CPU tracer's C++ and constants. |
 | `docs/` | The screenshot above. |
 
 ## Known limitations
@@ -240,10 +235,6 @@ Metal2Vulkan checkout.
 - No skinning, morph targets or animation; node transforms are static.
 - Transparent surfaces are sorted per primitive, not per triangle, and cast no
   shadows.
-- The shadow pass draws alpha-masked casters through a fragment shader that
-  returns a colour no attachment receives, because the profile has no
-  `fragment void`. The validation layers report that as a warning; opaque
-  casters go through a depth-only pipeline with no fragment stage at all.
 - `KHR_materials_specular_glossiness` is approximated, not implemented.
 - In the rasteriser's traced effects, blended surfaces are left out of the
   acceleration structure, so those rays pass through them; the path tracers
@@ -270,5 +261,5 @@ Metal2Vulkan checkout.
 Basalt is licensed under the Apache License 2.0; see [LICENSE](LICENSE).
 
 The vendored libraries under `third_party/` keep their own licences, and
-[NOTICES.md](NOTICES.md) lists them. The `msl2spirv` compiler the build fetches
-is a separate project and is not covered by this licence.
+[NOTICES.md](NOTICES.md) lists them with the fetched dependencies, Slang among
+them.

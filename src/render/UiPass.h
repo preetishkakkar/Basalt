@@ -1,4 +1,4 @@
-// Dear ImGui through the engine's own Metal-compiled pipeline, replacing the library's GLSL backend.
+// Dear ImGui through the engine's own pipeline (ui.slang), replacing the library's GLSL backend.
 #pragma once
 #include "gpu/Descriptors.h"
 #include "gpu/Pipeline.h"
@@ -24,10 +24,8 @@ private:
   struct FrameBuffers {
     Buffer vertices;
     Buffer indices;
-    Buffer uniforms;
     std::size_t vertexCapacity = 0;
     std::size_t indexCapacity = 0;
-    VkDescriptorSet vertexSet = VK_NULL_HANDLE;
   };
 
   const Context &context;

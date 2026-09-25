@@ -16,14 +16,6 @@
 #include <stdexcept>
 #include <string>
 
-#define device
-#define thread
-namespace pt {
-#include "pt/bvh_build.h"
-}
-#undef device
-#undef thread
-
 namespace basalt {
 namespace {
 
@@ -31,8 +23,8 @@ static_assert(sizeof(pt::BvhSegment) == 32);
 static_assert(sizeof(pt::BvhLbvhControl) == 64);
 static_assert(sizeof(pt::BvhSortControl) == 32);
 
-constexpr std::uint32_t kFitIterations = 64;       // tree levels the fit publishes (PT_BVH_STACK)
-constexpr std::uint32_t kSortTile = 1024;          // keys per sort workgroup (bvh_sort.metal)
+constexpr std::uint32_t kFitIterations = pt::kBvhStack; // tree levels the fit publishes
+constexpr std::uint32_t kSortTile = 1024;          // keys per sort workgroup (bvh_sort.slang)
 constexpr std::uint32_t kSortMaximumBlocks = 1024; // one workgroup scans the block sums
 constexpr VkDeviceSize kSlot = 256;                // the largest offset alignment Vulkan allows
 
@@ -143,8 +135,8 @@ std::vector<GpuLbvhBuilder::SortSets> GpuLbvhBuilder::sortSets(
     const Buffer &blockSums, const Buffer &controls, VkDeviceSize controlBase, std::uint32_t passes) const {
   auto set = [&](const char *entry, const std::function<void(DescriptorWriter &)> &write) {
     const Kernel &k = kernel(entry);
-    const VkDescriptorSet s = pool.allocate(k.program->setLayouts[0]);
-    DescriptorWriter writer(context, k.program->compute(), s);
+    const VkDescriptorSet s = k.program->allocate(pool);
+    DescriptorWriter writer(context, *k.program, s);
     write(writer);
     writer.apply();
     return s;
@@ -183,7 +175,7 @@ std::uint32_t GpuLbvhBuilder::recordSort(VkCommandBuffer command, const std::vec
   auto run = [&](const char *entry, VkDescriptorSet s, std::uint32_t x) {
     const Kernel &k = kernel(entry);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.program->layout, 0, 1, &s, 0, nullptr);
+    k.program->bind(command, s);
     if (x > 0) vkCmdDispatch(command, x, 1, 1);
     barrier(command);
     ++dispatches;
@@ -279,8 +271,8 @@ GpuLbvhBuilder::CommonSets GpuLbvhBuilder::commonSets(DescriptorPool &pool, cons
                                                       const Buffer &nodes, const Buffer &triangles,
                                                       std::uint32_t partSlot) const {
   auto set = [&](const Kernel &kernel, const std::function<void(DescriptorWriter &)> &write) {
-    const VkDescriptorSet s = pool.allocate(kernel.program->setLayouts[0]);
-    DescriptorWriter writer(context, kernel.program->compute(), s);
+    const VkDescriptorSet s = kernel.program->allocate(pool);
+    DescriptorWriter writer(context, *kernel.program, s);
     write(writer);
     writer.apply();
     return s;
@@ -441,7 +433,7 @@ GpuBvhBuildResult GpuLbvhBuilder::build(Uploader &uploader, const Scene &scene, 
   std::vector<std::uint8_t> setup(setupBytes, 0);
   pt::BvhLbvhControl control{};
   control.sizes = {records, segmentCount, internalCount, triangleTotal};
-  control.geometry = {scene.indexCount, scene.vertexCount, PT_BVH_STACK, pt::kBvhBuildLayoutVersion};
+  control.geometry = {scene.indexCount, scene.vertexCount, pt::kBvhStack, pt::kBvhBuildLayoutVersion};
   control.range = {instanceCount, triangleTotal, 0u, 0u};
   control.part = {0u, 0u, internalCount, triangleTotal};
   for (std::uint32_t i = 0; i < kFitIterations; ++i) {
@@ -508,7 +500,7 @@ GpuBvhBuildResult GpuLbvhBuilder::build(Uploader &uploader, const Scene &scene, 
   k.entries = scratch(internalCount * 4ull, "path.gpu-lbvh.level-entries");
   // PLOC: the clusters and their boxes (two halves of a buffer each, 256-byte aligned), nearest
   // neighbours, kept flags scanned per block of 128 and the block sums, each segment's node
-  // cursor, and two iteration sizes (bvh_ploc.metal), a slot apart: an iteration reads one and
+  // cursor, and two iteration sizes (bvh_ploc.slang), a slot apart: an iteration reads one and
   // writes the next's into the other. The iterations over all workgroups run while the clusters
   // are many: about until the finish's threadgroup tile holds them (kPlocShared), at the fifth
   // that a PLOC iteration typically removes (the rate only sets how the work splits; the
@@ -569,8 +561,8 @@ GpuBvhBuildResult GpuLbvhBuilder::build(Uploader &uploader, const Scene &scene, 
     const std::uint32_t sortedSlot = passes & 1u;
     auto set = [&](const char *entry, const std::function<void(DescriptorWriter &)> &write) {
       const Kernel &kk = kernel(entry);
-      const VkDescriptorSet s = pool.allocate(kk.program->setLayouts[0]);
-      DescriptorWriter writer(context, kk.program->compute(), s);
+      const VkDescriptorSet s = kk.program->allocate(pool);
+      DescriptorWriter writer(context, *kk.program, s);
       write(writer);
       writer.apply();
       return s;
@@ -619,7 +611,7 @@ GpuBvhBuildResult GpuLbvhBuilder::build(Uploader &uploader, const Scene &scene, 
     auto run = [&](const char *entry, VkDescriptorSet s, std::uint32_t x) {
       const Kernel &kk = kernel(entry);
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.pipeline.handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.program->layout, 0, 1, &s, 0, nullptr);
+      kk.program->bind(command, s);
       if (x > 0) vkCmdDispatch(command, x, 1, 1);
       barrier(command);
       ++dispatches;
@@ -657,7 +649,7 @@ GpuBvhBuildResult GpuLbvhBuilder::build(Uploader &uploader, const Scene &scene, 
       auto indirect = [&](const char *entry, VkDescriptorSet s, VkDeviceSize offset) {
         const Kernel &kk = kernel(entry);
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.pipeline.handle);
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.program->layout, 0, 1, &s, 0, nullptr);
+        kk.program->bind(command, s);
         vkCmdDispatchIndirect(command, plocSizes.handle, offset);
         barrier(command);
         ++dispatches;
@@ -737,8 +729,7 @@ std::uint32_t GpuLbvhBuilder::recordFit(VkCommandBuffer command, const Kept &k, 
   const Kernel &fit = kernel("bvh_lbvh_fit");
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, fit.pipeline.handle);
   for (std::uint32_t i = 0; i < kFitIterations; ++i) {
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, fit.program->layout, 0, 1, &sets.fit[i], 0,
-                            nullptr);
+    fit.program->bind(command, sets.fit[i]);
     vkCmdDispatchIndirect(command, k.setup.handle, k.headerOffset + i * sizeof(pt::uint4));
     barrier(command);
   }
@@ -750,8 +741,7 @@ std::uint32_t GpuLbvhBuilder::recordNumber(VkCommandBuffer command, const Kept &
   const Kernel &number = kernel("bvh_lbvh_number");
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, number.pipeline.handle);
   for (std::uint32_t level = kFitIterations; level-- > 0;) {
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, number.program->layout, 0, 1,
-                            &sets.number[level], 0, nullptr);
+    number.program->bind(command, sets.number[level]);
     vkCmdDispatchIndirect(command, k.setup.handle, k.headerOffset + level * sizeof(pt::uint4));
     barrier(command);
   }
@@ -816,7 +806,7 @@ std::uint32_t GpuLbvhBuilder::recordRefitCommands(VkCommandBuffer command, const
   auto run = [&](const char *entry, VkDescriptorSet s, std::uint32_t x) {
     const Kernel &kk = kernel(entry);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.program->layout, 0, 1, &s, 0, nullptr);
+    kk.program->bind(command, s);
     if (x > 0) vkCmdDispatch(command, x, 1, 1);
     barrier(command);
     ++dispatches;
@@ -856,7 +846,7 @@ std::uint32_t GpuLbvhBuilder::recordTopLevelCommands(VkCommandBuffer command, co
   auto run = [&](const char *entry, VkDescriptorSet s, std::uint32_t x) {
     const Kernel &kk = kernel(entry);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, kk.program->layout, 0, 1, &s, 0, nullptr);
+    kk.program->bind(command, s);
     if (x > 0) vkCmdDispatch(command, x, 1, 1);
     barrier(command);
     ++dispatches;

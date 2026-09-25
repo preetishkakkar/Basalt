@@ -62,6 +62,22 @@ struct WorldTriangle {
   std::uint32_t mask = 0, flags = 0, material = 0;
 };
 
+// The CPU tracer's view of loose host arrays: a downloaded tree traced on the host with the
+// shared tracers.
+struct HostView : pt::TraceView {
+  HostView(const pt::HostTextures &textures, const std::vector<pt::TraceInstance> &instances,
+           const std::vector<pt::Material> &materials, const std::vector<std::uint32_t> &indices, const float *vertices,
+           std::size_t vertexFloats, const std::vector<pt::float4> &nodes = {}, const std::vector<pt::float4> &triangles = {})
+      : TraceView(textures) {
+    scene.traceInstances = pt::buffer(instances);
+    scene.materials = pt::buffer(materials);
+    scene.indices = pt::buffer(indices);
+    scene.vertices = pt::buffer(vertices, vertexFloats);
+    scene.bvhNodes = pt::buffer(nodes);
+    scene.bvhTriangles = pt::buffer(triangles);
+  }
+};
+
 struct Fixture {
   Scene scene;
   std::vector<Vertex> vertices;
@@ -482,14 +498,6 @@ int compareResults(const Fixture &fixture, const std::vector<OracleRay> &baseRay
   }
   return 0;
 }
-
-struct SamplerOwner {
-  VkDevice device = VK_NULL_HANDLE;
-  VkSampler sampler = VK_NULL_HANDLE;
-  ~SamplerOwner() {
-    if (sampler) vkDestroySampler(device, sampler, nullptr);
-  }
-};
 
 struct DownloadedTree {
   std::vector<pt::float4> nodes, triangles;
@@ -927,6 +935,11 @@ void runRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder &bu
   for (const Material &material : moved.scene.materials) materials.push_back(convertMaterial(material.uniforms));
   const pt::HostTextures textures;
   const auto *vertices = reinterpret_cast<const float *>(moved.vertices.data());
+  const std::size_t vertexFloats = moved.vertices.size() * sizeof(moved.vertices[0]) / sizeof(float);
+  const HostView refitView(textures, refitInstances, materials, moved.indices, vertices, vertexFloats, refitNodes,
+                           refitTriangles);
+  const HostView freshView(textures, fresh.instances, materials, moved.indices, vertices, vertexFloats, freshNodes,
+                           freshTriangles);
   std::mt19937 random(31337u);
   std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
   std::uint32_t hits = 0;
@@ -934,12 +947,8 @@ void runRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder &bu
     const pt::float3 origin(unit(random) * 5.0f, unit(random) * 3.0f + 1.0f, unit(random) * 5.0f);
     const pt::float3 target(unit(random) * 2.5f, unit(random) * 1.5f, unit(random) * 2.5f);
     const pt::float3 direction = pt::normalize(target - origin);
-    const pt::PtHit a = pt::ptTraceBvh(refitNodes.data(), refitTriangles.data(), refitInstances.data(), materials.data(),
-                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
-                                       pt::float2(-1.0f, 0.0f), 0u);
-    const pt::PtHit b = pt::ptTraceBvh(freshNodes.data(), freshTriangles.data(), fresh.instances.data(), materials.data(),
-                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
-                                       pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit a = pt::ptTraceBvh(refitView, origin, direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit b = pt::ptTraceBvh(freshView, origin, direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
     // The same closest distance (a different triangle only at an exact tie).
     if (a.found != b.found || (a.found != 0u && a.t != b.t))
       throw Error("the refit GPU LBVH and a fresh build of the moved scene disagree on ray " + std::to_string(r));
@@ -1065,6 +1074,8 @@ void runWideRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder
   for (const Material &material : moved.scene.materials) materials.push_back(convertMaterial(material.uniforms));
   const pt::HostTextures textures;
   const auto *vertices = reinterpret_cast<const float *>(moved.vertices.data());
+  const HostView binaryView(textures, refitted.instances, materials, moved.indices, vertices,
+                            moved.vertices.size() * sizeof(moved.vertices[0]) / sizeof(float), binaryNodes, triangles);
   std::mt19937 random(4711u);
   std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
   std::uint32_t hits = 0;
@@ -1072,11 +1083,8 @@ void runWideRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder
     const pt::float3 origin(unit(random) * 5.0f, unit(random) * 3.0f + 1.0f, unit(random) * 5.0f);
     const pt::float3 target(unit(random) * 2.5f, unit(random) * 1.5f, unit(random) * 2.5f);
     const pt::float3 direction = pt::normalize(target - origin);
-    const pt::PtHit a = pt::traceWideBvh(wideTree, materials.data(), moved.indices.data(), vertices, textures, origin,
-                                         direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
-    const pt::PtHit b = pt::ptTraceBvh(binaryNodes.data(), triangles.data(), refitted.instances.data(), materials.data(),
-                                       moved.indices.data(), vertices, textures, origin, direction, 1e30f, 0xFFu, 0u,
-                                       pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit a = pt::traceWideBvh(wideTree, binaryView, origin, direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
+    const pt::PtHit b = pt::ptTraceBvh(binaryView, origin, direction, 1e30f, 0xFFu, 0u, pt::float2(-1.0f, 0.0f), 0u);
     if (a.found != b.found || (a.found != 0u && a.t != b.t))
       throw Error("the re-emitted BVH" + std::to_string(width) + " and the refit binary tree disagree on ray " +
                   std::to_string(r));
@@ -1235,7 +1243,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         checkCollapse(uploader, *collapser, stressBuild.nodes, downloadBinaryNodes(uploader, stressBuild),
                       stressBuild.instances, wide, "GPU-built stress fixture", stressBuild.statistics);
       if (stressBuild.statistics.triangles != stressTriangles ||
-          stressBuild.statistics.topDepth + stressBuild.statistics.bottomDepth > PT_BVH_STACK)
+          stressBuild.statistics.topDepth + stressBuild.statistics.bottomDepth > pt::kBvhStack)
         throw Error("GPU LBVH stress fixture failed its count or depth contract");
       std::printf("PASS: GPU LBVH %u-triangle stress fixture (depth %u + %u)\n", stressTriangles,
                   stressBuild.statistics.topDepth, stressBuild.statistics.bottomDepth);
@@ -1387,6 +1395,10 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
       if (expectedTie != 332u) throw Error("GPU LBVH duplicate-Morton fixture was not emitted");
       std::printf("PASS: GPU LBVH stable duplicate-Morton ordering\n");
       pt::HostTextures hostTextures;
+      const HostView downloadedView(hostTextures, trace.instances, materials, fixture.indices,
+                                    reinterpret_cast<const float *>(fixture.vertices.data()),
+                                    fixture.vertices.size() * sizeof(fixture.vertices[0]) / sizeof(float), downloadedNodes,
+                                    downloadedTriangles);
       std::vector<OracleHit> downloadedHits(queries.size());
       for (std::size_t i = 0; i < queries.size(); ++i) {
         const OracleRay &ray = queries[i];
@@ -1396,14 +1408,10 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
                                 ray.originAndMin.y + direction.y * minimum,
                                 ray.originAndMin.z + direction.z * minimum);
         const pt::PtHit hit = wide != 0u
-            ? pt::traceWideBvh(downloadedWide, materials.data(), fixture.indices.data(),
-                               reinterpret_cast<const float *>(fixture.vertices.data()), hostTextures, origin, direction,
-                               ray.directionAndMax.w - minimum, ray.control.x, ray.control.y, pt::float2(-1.0f, 0.0f),
-                               ray.control.z)
-            : pt::ptTraceBvh(
-            downloadedNodes.data(), downloadedTriangles.data(), trace.instances.data(), materials.data(),
-            fixture.indices.data(), reinterpret_cast<const float *>(fixture.vertices.data()), hostTextures,
-            origin, direction, ray.directionAndMax.w - minimum, ray.control.x, ray.control.y, pt::float2(-1.0f, 0.0f), ray.control.z);
+            ? pt::traceWideBvh(downloadedWide, downloadedView, origin, direction, ray.directionAndMax.w - minimum, ray.control.x,
+                               ray.control.y, pt::float2(-1.0f, 0.0f), ray.control.z)
+            : pt::ptTraceBvh(downloadedView, origin, direction, ray.directionAndMax.w - minimum, ray.control.x, ray.control.y,
+                             pt::float2(-1.0f, 0.0f), ray.control.z);
         OracleHit output{};
         output.distanceAndBarycentric = {ray.directionAndMax.w, 0.0f, 0.0f, 0.0f};
         output.identity = {0u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0u};
@@ -1422,17 +1430,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
     Image whiteTexture = uploader.createTexture(white.data(), white.size(), 1, 1,
                                                 VK_FORMAT_R8G8B8A8_UNORM, 1, "oracle.white");
     std::vector<VkImageView> textureViews(pt::kHitTextureSlots, whiteTexture.view);
-    SamplerOwner sampler{context.device};
-    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_NEAREST;
-    samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.maxLod = 0.0f;
-    check(vkCreateSampler(context.device, &samplerInfo, nullptr, &sampler.sampler),
-          "vkCreateSampler (ray oracle)");
+    GltfSamplers samplers(context);
 
     std::unique_ptr<Program> program;
     Pipeline pipeline;
@@ -1443,20 +1441,19 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
           {"pipeline_oracle_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
           {"pipeline_oracle_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
           {"pipeline_oracle_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
-      const std::vector<m2v::host::RayShaderGroup> groups{
+      const std::vector<RayShaderGroup> groups{
           {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0u},
           {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1u},
           {VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
            VK_SHADER_UNUSED_KHR, 2u, 3u, VK_SHADER_UNUSED_KHR}};
       tracePipeline = std::make_unique<RayPipeline>(
-          context, stages, groups, m2v::host::ShaderBindingRecord{0u, {}},
-          std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
-          std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+          context, stages, groups, ShaderBindingRecords{0u, {1u}, {2u}});
     } else {
       program = std::make_unique<Program>(context, wavefront ? "wavefront_trace" :
           wide != 0u ? "bvh_wide_oracle" : software ? "bvh_oracle" : "ray_query_oracle");
       pipeline = Pipeline(context, *program, software ? "software BVH oracle" : "ray query oracle");
     }
+    const ShaderLayout &layout = rayPipeline ? tracePipeline->shaderLayout() : program->shaderLayout();
     std::unique_ptr<Program> enqueueProgram;
     Pipeline enqueuePipeline;
     Buffer queueBuffer, counterBuffer;
@@ -1472,37 +1469,25 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
           "oracle.wavefront.counters");
     }
     DescriptorPool pool(context, wavefront ? 3u : 1u);
-    const VkDescriptorSet set = pool.allocate(rayPipeline ? tracePipeline->setLayout : program->setLayouts[0]);
-    if (rayPipeline) {
-      DescriptorWriter(context, tracePipeline->shader(0), set)
-          .buffer("rays", rayBuffer).buffer("hits", hitBuffer).buffer("control", controlBuffer)
-          .accelerationStructure("scene", acceleration->topLevel).apply();
-      DescriptorWriter(context, tracePipeline->shader(3), set)
-          .buffer("traceInstances", instanceBuffer).buffer("materials", materialBuffer)
-          .buffer("indices", fixture.scene.indexBuffer).buffer("vertices", fixture.scene.vertexBuffer)
-          .textureArray("maps", textureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler", sampler.sampler).apply();
-    } else {
-      DescriptorWriter writer(context, program->compute(), set);
-      if (wavefront)
-        writer.buffer("queue", queueBuffer).buffer("counters", counterBuffer).buffer("hits", hitBuffer);
-      else
-        writer.buffer("rays", rayBuffer).buffer("hits", hitBuffer);
-      writer.buffer("traceInstances", instanceBuffer).buffer("materials", materialBuffer)
-          .buffer("indices", fixture.scene.indexBuffer).buffer("vertices", fixture.scene.vertexBuffer)
-          .buffer("control", controlBuffer);
-      if (software)
-        writer.buffer("bvhNodes", bvhNodeBuffer).buffer("bvhTriangles", bvhTriangleBuffer);
-      else
-        writer.accelerationStructure("scene", acceleration->topLevel);
-      writer.textureArray("maps", textureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler", sampler.sampler).apply();
-    }
+    // Every oracle entry declares the same globals; each stage reads only its own.
+    const VkDescriptorSet set = layout.allocate(pool);
+    DescriptorWriter writer(context, layout, set);
+    writer.buffer("rays", rayBuffer).buffer("hits", hitBuffer).buffer("control", controlBuffer)
+        .buffer("geometry.traceInstances", instanceBuffer).buffer("geometry.materials", materialBuffer)
+        .buffer("geometry.indices", fixture.scene.indexBuffer).buffer("geometry.vertices", fixture.scene.vertexBuffer)
+        .textureArray("maps.table", textureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    for (int i = 0; i < 6; ++i) writer.sampler(std::string("maps.") + GltfSamplers::names[i], samplers.handles[i]);
+    if (wavefront) writer.buffer("queue", queueBuffer).buffer("counters", counterBuffer);
+    if (software)
+      writer.buffer(wide != 0u ? "wideNodes" : "bvhNodes", bvhNodeBuffer).buffer("bvhTriangles", bvhTriangleBuffer);
+    else
+      writer.accelerationStructure("accelerationStructure", acceleration->topLevel);
+    writer.apply();
 
     VkDescriptorSet enqueueSet = VK_NULL_HANDLE;
     if (wavefront) {
-      enqueueSet = pool.allocate(enqueueProgram->setLayouts[0]);
-      DescriptorWriter(context, enqueueProgram->compute(), enqueueSet)
+      enqueueSet = enqueueProgram->allocate(pool);
+      DescriptorWriter(context, *enqueueProgram, enqueueSet)
           .buffer("rays", rayBuffer).buffer("queue", queueBuffer).buffer("counters", counterBuffer)
           .buffer("control", controlBuffer).apply();
 
@@ -1514,14 +1499,13 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
                                       static_cast<std::uint32_t>(queries.size() / 2u), 0u, 0u);
       Buffer overflowControlBuffer = uploader.createBuffer(&overflowControl, sizeof(overflowControl),
           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "oracle.wavefront.overflow-control");
-      const VkDescriptorSet overflowSet = pool.allocate(enqueueProgram->setLayouts[0]);
-      DescriptorWriter(context, enqueueProgram->compute(), overflowSet)
+      const VkDescriptorSet overflowSet = enqueueProgram->allocate(pool);
+      DescriptorWriter(context, *enqueueProgram, overflowSet)
           .buffer("rays", rayBuffer).buffer("queue", queueBuffer).buffer("counters", overflowCounter)
           .buffer("control", overflowControlBuffer).apply();
       uploader.runImmediate([&](VkCommandBuffer command) {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, enqueuePipeline.handle);
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, enqueueProgram->layout,
-                                0, 1, &overflowSet, 0, nullptr);
+        enqueueProgram->bind(command, overflowSet);
         vkCmdDispatch(command, (static_cast<std::uint32_t>(queries.size()) + 63u) / 64u, 1, 1);
       });
       const std::vector<std::uint8_t> overflowBytes = uploader.readBuffer(overflowCounter, sizeof(pt::uint4));
@@ -1536,8 +1520,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
     uploader.runImmediate([&](VkCommandBuffer command) {
       if (wavefront) {
         vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, enqueuePipeline.handle);
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, enqueueProgram->layout,
-                                0, 1, &enqueueSet, 0, nullptr);
+        enqueueProgram->bind(command, enqueueSet);
         vkCmdDispatch(command, (static_cast<std::uint32_t>(queries.size()) + 63u) / 64u, 1, 1);
         VkMemoryBarrier2 queueBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         queueBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -1549,13 +1532,11 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         queueDependency.pMemoryBarriers = &queueBarrier;
         vkCmdPipelineBarrier2(command, &queueDependency);
       }
-      if (rayPipeline)
-        tracePipeline->trace(command, set, static_cast<std::uint32_t>(queries.size()));
-      else {
-        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program->layout, 0, 1, &set, 0, nullptr);
-        vkCmdDispatch(command, (static_cast<std::uint32_t>(queries.size()) + 63u) / 64u, 1, 1);
-      }
+      if (rayPipeline) tracePipeline->bind(command);
+      else vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+      layout.bind(command, set);
+      if (rayPipeline) tracePipeline->traceRays(command, static_cast<std::uint32_t>(queries.size()));
+      else vkCmdDispatch(command, (static_cast<std::uint32_t>(queries.size()) + 63u) / 64u, 1, 1);
       VkBufferMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
       barrier.srcStageMask = rayPipeline ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
                                          : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;

@@ -38,14 +38,15 @@ public:
   Buffer restirDormant;  // the ReSTIR DI result bindings, never read with NEE
   std::vector<Image> textures;
   Image environment, accumulation, albedo, normal, output;
-  Sampler materialSampler, environmentSampler;
+  Sampler environmentSampler;
+  GltfSamplers tableSamplers;
   Program program;
   Pipeline pipeline;
   DescriptorPool pool;
-  VkDescriptorSet set{};
+  VkDescriptorSet set{}, sceneSet{}, structureSet{};
   GpuFixture(Context &c, Uploader &u, const pt_fixture::Builder &b, Buffer &guides, bool software,
              bool gpuBuilder)
-      : context(c), uploader(u), materialSampler{c.device}, environmentSampler{c.device},
+      : context(c), uploader(u), environmentSampler{c.device}, tableSamplers(c),
         program(c, software ? (b.scene.emissiveTriangles.empty() ? "path_trace" : "path_trace_emissive")
                             : "path_trace_rt"),
         pipeline(c, program, software ? "motion.path.software" : "motion.path.rt"), pool(c, 8) {
@@ -107,7 +108,6 @@ public:
     sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
     sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    check(vkCreateSampler(c.device, &sampler, nullptr, &materialSampler.handle), "motion material sampler");
     sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     check(vkCreateSampler(c.device, &sampler, nullptr, &environmentSampler.handle), "motion environment sampler");
     ImageDescription image;
@@ -121,23 +121,31 @@ public:
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     });
     restirDormant = Buffer(c, 48, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO, 0, "motion.restir");
-    set = pool.allocate(program.setLayouts[0]);
-    DescriptorWriter writer(c, program.compute(), set);
-    writer.buffer("uniforms", uniforms).buffer("traceInstances", instances)
-        .buffer("materials", materials).buffer("indices", scene.indexBuffer).buffer("vertices", scene.vertexBuffer)
+    sceneSet = program.allocate(pool, "scene");
+    DescriptorWriter sceneWriter(c, program, sceneSet, "scene");
+    sceneWriter.buffer("geometry.traceInstances", instances).buffer("geometry.materials", materials)
+        .buffer("geometry.indices", scene.indexBuffer).buffer("geometry.vertices", scene.vertexBuffer)
+        .textureArray("maps.table", views, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        .texture("maps.environmentMap", environment).sampler("maps.environmentSampler", environmentSampler.handle)
         .buffer("lights", lights).buffer("environmentDistribution", distribution).buffer("specularAlbedo", albedoTable)
-        .buffer("emissiveTriangles", emissives)
-        .buffer("reconstructionSamples", guides)
-        .buffer("restirResults", restirDormant).buffer("restirGuides", restirDormant);
+        .buffer("emissiveTriangles", emissives);
+    for (int i = 0; i < 6; ++i)
+      sceneWriter.sampler(std::string("maps.") + GltfSamplers::names[i], tableSamplers.handles[i]);
+    sceneWriter.apply();
+    structureSet = program.allocate(pool, "structure");
+    DescriptorWriter structure(c, program, structureSet, "structure");
     if (software)
-      writer.buffer("bvhNodes", bvhNodes).buffer("bvhTriangles", bvhTriangles);
+      structure.buffer("bvhNodes", bvhNodes).buffer("bvhTriangles", bvhTriangles);
     else
-      writer.accelerationStructure("scene", acceleration->topLevel);
-    writer
-        .texture("environmentMap", environment).storageTexture("accumulation", accumulation.view)
+      structure.accelerationStructure("accelerationStructure", acceleration->topLevel);
+    structure.apply();
+    set = program.allocate(pool);
+    DescriptorWriter(c, program, set)
+        .buffer("uniforms", uniforms).buffer("reconstructionSamples", guides)
+        .buffer("restirResults", restirDormant).buffer("restirGuides", restirDormant)
+        .storageTexture("accumulation", accumulation.view)
         .storageTexture("albedoAccumulation", albedo.view).storageTexture("normalAccumulation", normal.view)
-        .storageTexture("output", output.view).textureArray("maps", views, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-        .sampler("environmentSampler", environmentSampler.handle).sampler("materialSampler", materialSampler.handle).apply();
+        .storageTexture("output", output.view).apply();
   }
   void dispatch(VkCommandBuffer cmd, const pt::PathUniforms &u) {
     uniforms.write(&u, sizeof(u)); barrier(cmd);
@@ -145,7 +153,9 @@ public:
         VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    program.bind(cmd, set);
+    program.bind(cmd, sceneSet, "scene");
+    program.bind(cmd, structureSet, "structure");
     vkCmdDispatch(cmd, (temporal_motion::width + 7) / 8, (temporal_motion::height + 7) / 8, 1);
     barrier(cmd);
   }
@@ -293,7 +303,7 @@ int run(bool software, bool gpuBuilder, bool v7) {
           const auto raw = gpu->read(gpu->accumulation), output = gpu->read(gpu->output);
           for (pt::uint i = 0; i < pixels; ++i) {
             require(raw[i].w == float(stationarySamples), "GPU changed exact raw SPP");
-            const auto r = pt::xyz(raw[i]) / raw[i].w, f = pt::xyz(output[i]);
+            const pt::float3 r = pt::xyz(raw[i]) / raw[i].w, f = pt::xyz(output[i]);
             require(pt::ptFiniteColor(r) && pt::ptFiniteColor(f), "nonfinite GPU motion output");
             const auto re = r - refs[frame * pixels + i], fe = f - refs[frame * pixels + i];
             auto sum = [](pt::float3 v) { return double(v.x) + v.y + v.z; };

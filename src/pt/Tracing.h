@@ -1,6 +1,5 @@
-// The path tracer's shared code (shaders/pt) compiled for the CPU: the host copies of the
-// hit texture table and the environment that the shared code samples, then the headers
-// themselves inside namespace pt.
+// The CPU tracer's side of the shared Slang code: the host copies of the hit texture table and
+// the environment that the generated code samples, and TraceView, a frame as that code sees it.
 #pragma once
 #include "pt/Shared.h"
 
@@ -10,8 +9,8 @@
 
 namespace pt {
 
-// One texture of the hit table at level zero, sampled as the GPU's table sampler samples
-// it: bilinear, repeating, after decoding sRGB.
+// One texture of the hit table, sRGB-decoded on read when srgb is set: level zero in texels,
+// the smaller levels in mips.
 struct HostTexture {
   uint width = 1;
   uint height = 1;
@@ -47,41 +46,62 @@ struct HostEnvironment {
   float3 sample(float2 uv) const;
 };
 
-} // namespace pt
+// A frame as the generated code sees it: `scene` holds the host's arrays as buffers, the
+// uniforms and the intersector (0 the binary software BVH); the code calls back through it
+// for texture reads and, for any other intersector, to `trace`. Fixed in memory: scene.host is
+// this address, and scenes from withInstances carry it, so the view must outlive them.
+class TraceView {
+public:
+  using Trace = PtHit (*)(const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed,
+                          float2 cone, uint anyHit);
+  TraceView(const HostTextures &textures, const HostEnvironment *environment = nullptr);
+  TraceView(const TraceView &) = delete;
+  TraceView &operator=(const TraceView &) = delete;
 
-#define PT_TEXTURE_PARAMS const HostTextures &maps
-#define PT_TEXTURE_ARGS maps
-#define PT_ENVIRONMENT_PARAMS const HostEnvironment &environmentMap
-#define PT_ENVIRONMENT_ARGS environmentMap
+  PtCpuScene scene{};
+  const HostTextures &textures;
+  const HostEnvironment *environment;
+  // The host intersector for scene.intersector != 0, and what it traces.
+  Trace trace = nullptr;
+  const void *tracer = nullptr;
 
-namespace pt {
-inline float4 ptSampleTexture(PT_TEXTURE_PARAMS, uint slot, float2 uv, uint samplerCode, float lodBase) {
-  return maps.sample(slot, uv, samplerCode, lodBase);
+  PtCpuScene *get() const { return const_cast<PtCpuScene *>(&scene); }
+  // This view's scene with other instance rows, for an intersector with its own (the wide BVH).
+  PtCpuScene withInstances(const std::vector<TraceInstance> &instances) const;
+};
+
+// The alpha test every intersector applies to masked and blended candidates.
+inline bool ptCandidateSolid(const PtCpuScene &scene, uint instance, uint primitive, float2 barycentric, uint frontFacing,
+                             uint seed, float3 direction, float coneWidth) {
+  return gen::ptCpuCandidateSolid(const_cast<PtCpuScene *>(&scene), instance, primitive, barycentric, frontFacing, seed, direction,
+                             coneWidth);
 }
-inline float ptTextureFootprintOf(PT_TEXTURE_PARAMS, uint slot, float lodBase) { return maps.footprint(slot, lodBase); }
-inline float3 ptSampleEnvironment(PT_ENVIRONMENT_PARAMS, float2 uv) { return environmentMap.sample(uv); }
-} // namespace pt
-
-#define device
-#define thread
-namespace pt {
-#include "../../shaders/pt/path.h"
-#include "../../shaders/pt/raycone.h"
-#include "../../shaders/pt/bvh.h"
-#include "../../shaders/pt/surface.h"
-#include "../../shaders/pt/bsdf.h"
-#include "../../shaders/pt/reconstruction.h"
-#include "../../shaders/pt/temporal.h"
-#include "../../shaders/pt/lights.h"
-#include "../../shaders/pt/restir.h"
-} // namespace pt
-#undef device
-#undef thread
-
-namespace pt {
-static_assert(sizeof(PathUniforms) == 224, "PathUniforms must match the MSL constant-buffer layout");
-static_assert(sizeof(PtEmissiveTriangle) == 112, "emissive triangle layout must match MSL");
-static_assert(sizeof(PtReconstructionSample) == 128, "Reconstruction sample must match MSL");
-static_assert(sizeof(PtReservoir) == 32, "ReSTIR reservoir must match MSL");
-static_assert(sizeof(PtRestirSurface) == 64, "ReSTIR surface must match MSL");
+// The watertight triangle test, for the host's intersectors.
+inline PtRayPrep ptPrepareRay(float3 origin, float3 direction) { return gen::ptCpuPrepareRay(origin, direction); }
+inline bool ptIntersectTriangle(const PtRayPrep &ray, float3 v0, float3 v1, float3 v2, float tMax, float &t, float2 &barycentric,
+                                uint &candidateFlags) {
+  return gen::ptCpuIntersectTriangle(const_cast<PtRayPrep *>(&ray), v0, v1, v2, tMax, &t, &barycentric, &candidateFlags);
 }
+// The binary software BVH over a view's scene.bvhNodes and bvhTriangles.
+inline PtHit ptTraceBvh(const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone,
+                        uint anyHit) {
+  return gen::ptCpuTraceBvh(view.get(), origin, direction, tMax, mask, seed, cone, anyHit != 0u);
+}
+// A pixel's surface at a hit.
+inline PtSurface ptSurfaceAt(const TraceView &view, PtHit hit, float3 rayDirection, float coneWidth) {
+  return gen::ptCpuSurfaceAt(view.get(), &hit, rayDirection, coneWidth);
+}
+
+// ReSTIR DI's resampling over a view's lights and emitters.
+inline PtReservoir ptRestirInitial(const TraceView &view, PtBsdf bsdf, float3 position, float3 geometricNormal, float2 cone,
+                                   uint seed, uint candidates) {
+  return gen::ptCpuRestirInitial(view.get(), &bsdf, position, geometricNormal, cone, seed, candidates);
+}
+inline float3 ptRestirIntegrand(const TraceView &view, PtBsdf bsdf, float3 position, float3 geometricNormal, uint light,
+                                float2 params, float2 cone, float3 &direction, float &reach, float &sourcePdf,
+                                float &solidAnglePdf, float &bsdfPdf) {
+  return gen::ptCpuRestirIntegrand(view.get(), &bsdf, position, geometricNormal, light, params, cone, &direction, &reach,
+                                   &sourcePdf, &solidAnglePdf, &bsdfPdf);
+}
+
+} // namespace pt

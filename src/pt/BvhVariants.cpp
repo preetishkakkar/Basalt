@@ -72,6 +72,7 @@ uint maximumTraversalStack(const WideBvh &bvh) {
 bool cpuAvx2Available() {
 #ifdef _MSC_VER
   int registers[4]{};
+  // OSXSAVE and AVX (leaf 1 ECX 27, 28), the OS saving YMM state (XCR0 bits 1-2), AVX2 (leaf 7 EBX 5).
   __cpuid(registers, 1);
   if ((registers[2] & (1 << 27)) == 0 || (registers[2] & (1 << 28)) == 0) return false;
   if ((_xgetbv(0) & 6u) != 6u) return false;
@@ -112,7 +113,7 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
     float3 low(std::numeric_limits<float>::infinity());
     float3 high(-std::numeric_limits<float>::infinity());
     for (const Child &c : frontier) { low = min(low, c.low); high = max(high, c.high); }
-    // BVH8: octant slots (bvh_layout.h), greedily giving each slot s the child a ray of octant s
+    // BVH8: octant slots (pt_wide_bvh.slang), greedily giving each slot s the child a ray of octant s
     // meets first, the smallest dot(child centre - node centre, direction of s); the cheapest
     // remaining (child, slot) pair first, lower child then lower slot on a tie.
     std::array<int, 8> childOfSlot;
@@ -167,6 +168,8 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
       }
       const Child &c = frontier[static_cast<std::size_t>(childOfSlot[slot])];
       uint data = c.data;
+      // A bottom-level leaf packs its triangle count above kBvhCountShift; a top-level leaf is one
+      // instance index.
       if (c.count == 0u) data = emit(c.data, bottom);
       else if (bottom) data = kBvhLeafTag | (c.count << kBvhCountShift) | c.data;
       else data = kBvhLeafTag | c.data;
@@ -180,9 +183,9 @@ WideBvh buildWideBvh(const Bvh &binary, const std::vector<TraceInstance> &source
   if (!binary.nodes.empty()) emit(0u, false);
   for (TraceInstance &instance : result.instances) instance.blasRoot = emit(instance.blasRoot, true);
   result.maximumStack = maximumTraversalStack(result);
-  if (result.maximumStack > PT_WIDE_BVH_STACK_DEEP)
+  if (result.maximumStack > kWideStackDeep)
     throw std::runtime_error("wide BVH requires more than the GPU traversal stack's " +
-                             std::to_string(PT_WIDE_BVH_STACK_DEEP) + " entries");
+                             std::to_string(kWideStackDeep) + " entries");
   result.milliseconds = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - started).count();
   return result;
@@ -297,88 +300,12 @@ LayoutCost wideLayoutCost(const std::vector<QuantizedWideNode> &nodes, const std
   return cost;
 }
 
-PtHit traceWideBvh(const WideBvh &bvh, const Material *materials, const uint *indices,
-                   const float *vertices, const HostTextures &textures, float3 origin,
-                   float3 direction, float tMax, uint mask, uint seed, float2 cone, uint anyHit) {
-  PtHit hit{}; hit.t = tMax;
-  PtRayPrep ray{}; float3 prepOrigin = origin, prepDirection = direction;
-  bool prepare = true, done = false; uint stack[128]{};
-  uint depth = bvh.nodes.empty() ? 0u : 1u, bottomBase = 0u, inBottom = 0u, instance = 0u;
-  while (depth > 0u && !done) {
-    if (inBottom != 0u && depth <= bottomBase) {
-      inBottom = 0u; prepOrigin = origin; prepDirection = direction; prepare = true;
-    }
-    if (prepare) { ray = ptPrepareRay(prepOrigin, prepDirection); prepare = false; }
-    const uint entry = stack[--depth];
-    if ((entry & kBvhLeafTag) != 0u) {
-      if (inBottom == 0u) {
-        instance = entry & ~kBvhLeafTag;
-        const TraceInstance &row = bvh.instances[instance];
-        if ((row.mask & mask) != 0u) {
-          prepOrigin = float3(dot(row.worldToObject0, float4(origin, 1.0f)),
-                              dot(row.worldToObject1, float4(origin, 1.0f)),
-                              dot(row.worldToObject2, float4(origin, 1.0f)));
-          prepDirection = float3(dot(xyz(row.worldToObject0), direction),
-                                 dot(xyz(row.worldToObject1), direction),
-                                 dot(xyz(row.worldToObject2), direction));
-          prepare = true; inBottom = 1u; bottomBase = depth; stack[depth++] = row.blasRoot;
-        }
-      } else {
-        const uint first = entry & kBvhFirstMask;
-        const uint count = (entry & ~kBvhLeafTag) >> kBvhCountShift;
-        for (uint i = 0; i < count && !done; ++i) {
-          const uint triangle = (first + i) * 3u; const float4 v0 = bvh.triangles[triangle];
-          float distance = 0.0f; float2 barycentric(0.0f);
-          if (ptIntersectTriangle(ray, xyz(v0), xyz(bvh.triangles[triangle + 1u]),
-              xyz(bvh.triangles[triangle + 2u]), hit.t, distance, barycentric, hit.ambiguous)) {
-            const uint primitive = as_type<uint>(v0.w);
-            if ((bvh.instances[instance].flags & kInstanceBlended) != 0u) hit.ambiguous |= 1u;
-            if (ptCandidateSolid(bvh.instances.data(), materials, indices, vertices, textures,
-                instance, primitive, barycentric, (hit.ambiguous >> 1u) & 1u, seed, direction,
-                ptConeWidthOrLevelZero(cone, distance))) {
-              hit.ambiguous &= 1u; hit.t = distance; hit.barycentric = barycentric;
-              hit.instance = instance; hit.primitive = primitive; hit.found = 1u;
-              if (anyHit != 0u) done = true;
-            }
-          }
-        }
-      }
-      continue;
-    }
-    const QuantizedWideNode &node = bvh.nodes[entry];
-    const uint childCount = as_type<uint>(node.origin.w) & kWideSlotMask;
-    float distances[8]{}; uint entries[8]{}; uint found = 0u;
-    for (uint child = 0; child < childCount; ++child) {
-      const uint4 p = node.children[child]; const uint words[3]{p.x, p.y, p.z};
-      if (p.w == kBvhEmpty) continue;
-      float3 low, high;
-      for (uint axis = 0; axis < 3u; ++axis) {
-        const float base = component(xyz(node.origin), axis), step = component(xyz(node.scale), axis);
-        const float l = base + step * float(words[axis] & 0xFFFFu);
-        const float h = base + step * float(words[axis] >> 16u);
-        if (axis == 0u) { low.x = l; high.x = h; }
-        else if (axis == 1u) { low.y = l; high.y = h; }
-        else { low.z = l; high.z = h; }
-      }
-      const float3 a = (low - ray.origin) * ray.inverse, z = (high - ray.origin) * ray.inverse;
-      const float3 nearV = min(a, z), farV = max(a, z);
-      const float nearD = std::max(std::max(nearV.x, nearV.y), std::max(nearV.z, 0.0f));
-      const float farD = std::min(std::min(farV.x, farV.y), std::min(farV.z, hit.t)) * 1.0000004f;
-      if (nearD <= farD) { distances[found] = nearD; entries[found++] = p.w; }
-    }
-    for (uint i = 1u; i < found; ++i) {
-      const float d = distances[i]; const uint e = entries[i]; uint j = i;
-      while (j > 0u && distances[j - 1u] < d) {
-        distances[j] = distances[j - 1u]; entries[j] = entries[j - 1u]; --j;
-      }
-      distances[j] = d; entries[j] = e;
-    }
-    for (uint i = 0u; i < found; ++i) {
-      if (depth >= 128u) throw std::runtime_error("wide BVH traversal stack overflow");
-      stack[depth++] = entries[i];
-    }
-  }
-  hit.ambiguous &= 1u;  // drop the per-candidate facing scratch bit
-  return hit;
+PtHit traceWideBvh(const WideBvh &bvh, const TraceView &view, float3 origin, float3 direction, float tMax, uint mask,
+                   uint seed, float2 cone, uint anyHit) {
+  if (bvh.maximumStack > static_cast<uint>(kWideStackDeep))
+    throw std::runtime_error("wide BVH traversal stack overflow");
+  PtCpuScene scene = view.withInstances(bvh.instances);
+  scene.bvhTriangles = buffer(bvh.triangles);
+  return gen::ptCpuTraceWideBvh(&scene, buffer(bvh.nodes), origin, direction, tMax, mask, seed, cone, anyHit != 0u);
 }
 } // namespace pt

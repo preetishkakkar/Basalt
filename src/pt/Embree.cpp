@@ -18,8 +18,7 @@ namespace {
 // Handed to Embree with every query and read back in the filter callbacks.
 struct QueryContext {
   RTCRayQueryContext context;  // first, so Embree's pointer is ours
-  const CpuScene *scene;
-  const CpuFrame *frame;
+  const TraceView *view;
   uint seed;
   float3 direction;  // world space, for the alpha test's level of detail
   float2 cone;       // the ray cone where the ray leaves
@@ -36,13 +35,11 @@ void candidateFilter(const RTCFilterFunctionNArguments *args) {
     const float facing = RTCHitN_Ng_x(args->hit, args->N, i) * RTCRayN_dir_x(args->ray, args->N, i) +
                          RTCHitN_Ng_y(args->hit, args->N, i) * RTCRayN_dir_y(args->ray, args->N, i) +
                          RTCHitN_Ng_z(args->hit, args->N, i) * RTCRayN_dir_z(args->ray, args->N, i);
-    const CpuScene &scene = *query->scene;
-    if ((scene.instances[instance].flags & kInstanceBlended) != 0u) query->ambiguous = 1;
+    const PtCpuScene &scene = query->view->scene;
+    if ((scene.traceInstances[instance].flags & kInstanceBlended) != 0u) query->ambiguous = 1;
     // Embree reports the object-space normal and ray here: the object-space facing is glTF's
     // front, whatever the instance's determinant.
-    if (!ptCandidateSolid(scene.instances.data(), query->frame->materials.data(), scene.indices.data(),
-                          scene.vertices.data(), scene.textures, instance, primitive, barycentric,
-                          facing < 0.0f ? 1u : 0u, query->seed, query->direction,
+    if (!ptCandidateSolid(scene, instance, primitive, barycentric, facing < 0.0f ? 1u : 0u, query->seed, query->direction,
                           ptConeWidthOrLevelZero(query->cone, RTCRayN_tfar(args->ray, args->N, i))))
       args->valid[i] = 0;
   }
@@ -82,6 +79,7 @@ EmbreeScene::EmbreeScene(const CpuScene &scene) : state(std::make_unique<State>(
                                kVertexFloats * sizeof(float), vertexCount - instance.vertexOffset);
     rtcSetSharedGeometryBuffer(triangles, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3,
                                state->indices.data() + instance.firstIndex, 0, 3 * sizeof(uint), scene.triangleCounts[i]);
+    // Single-sided geometry needs the filter too: ptCandidateSolid rejects its back faces.
     if ((instance.flags & (kInstanceMasked | kInstanceBlended)) != 0u ||
         (instance.flags & kInstanceDoubleSided) == 0u) {
       rtcSetGeometryIntersectFilterFunction(triangles, candidateFilter);
@@ -115,8 +113,8 @@ EmbreeScene::~EmbreeScene() {
   if (state->device) rtcReleaseDevice(state->device);
 }
 
-PtHit EmbreeScene::trace(const CpuScene &scene, const CpuFrame &frame, float3 origin, float3 direction, float tMax,
-                         uint mask, uint seed, float2 cone, uint anyHit) const {
+PtHit EmbreeScene::trace(const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed,
+                         float2 cone, uint anyHit) const {
   PtHit hit;
   hit.ambiguous = 0;
   hit.t = tMax;
@@ -126,8 +124,7 @@ PtHit EmbreeScene::trace(const CpuScene &scene, const CpuFrame &frame, float3 or
   hit.found = 0u;
   QueryContext query;
   rtcInitRayQueryContext(&query.context);
-  query.scene = &scene;
-  query.frame = &frame;
+  query.view = &view;
   query.seed = seed;
   query.direction = direction;
   query.cone = cone;
@@ -187,7 +184,7 @@ struct EmbreeScene::State {};
 bool EmbreeScene::available() { return false; }
 EmbreeScene::EmbreeScene(const CpuScene &) { throw std::runtime_error("this build has no Embree"); }
 EmbreeScene::~EmbreeScene() = default;
-PtHit EmbreeScene::trace(const CpuScene &, const CpuFrame &, float3, float3, float tMax, uint, uint, float2, uint) const {
+PtHit EmbreeScene::trace(const TraceView &, float3, float3, float tMax, uint, uint, float2, uint) const {
   PtHit hit;
   hit.ambiguous = 0;
   hit.t = tMax;

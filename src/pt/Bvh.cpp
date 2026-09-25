@@ -278,9 +278,9 @@ BvhStatistics buildBvh(const std::vector<float> &vertices, const std::vector<uin
   // when the stack fills would turn a capacity problem into a plausible wrong image.
   for (uint i = 0; i < instanceCount; ++i) {
     const uint required = top.depth + bottom[i].depth;
-    if (required > PT_BVH_STACK)
+    if (required > kBvhStack)
       throw std::runtime_error("software BVH needs a traversal stack of " + std::to_string(required) +
-                               " entries; this build supports " + std::to_string(PT_BVH_STACK));
+                               " entries; this build supports " + std::to_string(kBvhStack));
   }
 
   // Layout: the top level at node 0, then each bottom level; triangles in leaf order.

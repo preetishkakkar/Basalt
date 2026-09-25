@@ -1,5 +1,0 @@
-msl2spirv 1.0.2, packaged as release msl2spirv-1.0.2
-source commit: 833006a
-LLVM fork pin: 83b6d09ae810da20510e4ee3f6fe8525c1704610
-asset: msl2spirv-1.0.2-windows-x64.zip
-sha256: 212f182a7373f1a36a6cecac804907061bdbfc3dd2f7706f04c08c8357fbea5d

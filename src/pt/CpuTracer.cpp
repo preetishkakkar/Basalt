@@ -80,97 +80,67 @@ void WorkerPool::parallelFor(uint count, const std::function<void(uint)> &fn) {
   finishedCondition.wait(lock, [&] { return finishedWorkers == workers.size(); });
 }
 
-// One path, through the shared loop, with whichever intersector the frame asks for.
+FrameView::FrameView(const CpuScene &cpu, const CpuFrame &frame) : TraceView(cpu.textures, &cpu.environment) {
+  scene.traceInstances = buffer(cpu.instances);
+  scene.materials = buffer(frame.materials);
+  scene.indices = buffer(cpu.indices);
+  scene.vertices = buffer(cpu.vertices);
+  scene.lights = buffer(frame.lights);
+  scene.environmentDistribution = buffer(cpu.distribution);
+  scene.specularAlbedo = buffer(cpu.specularAlbedo);
+  scene.emissiveTriangles = buffer(cpu.emissiveTriangles);
+  scene.bvhNodes = buffer(cpu.bvh.nodes);
+  scene.bvhTriangles = buffer(cpu.bvh.triangles);
+  scene.uniforms = frame.uniforms;
+  // An intersector the scene was built without falls back to the binary BVH.
+  scene.intersector = 0u;
+  if (frame.intersector == 1 && cpu.embree) {
+    scene.intersector = 1u;
+    tracer = cpu.embree.get();
+    trace = [](const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone,
+               uint anyHit) {
+      return static_cast<const EmbreeScene *>(view.tracer)->trace(view, origin, direction, tMax, mask, seed, cone, anyHit);
+    };
+  } else if (frame.intersector == 2 && cpu.wideAvx2) {
+    scene.intersector = 2u;
+    tracer = cpu.wideAvx2.get();
+    trace = [](const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone,
+               uint anyHit) {
+      return traceWideBvhAvx2(*static_cast<const WideBvh *>(view.tracer), view, origin, direction, tMax, mask, seed, cone,
+                              anyHit);
+    };
+  }
+}
 
 namespace {
 
-template <class Trace>
-PathSample integrate(const CpuScene &scene, const CpuFrame &frame, uint pixelX, uint pixelY, uint sampleIndex,
-                     float3 restirDirect, float3 restirDiffuse, const Trace &traceRay) {
-  const PathUniforms &uniforms = frame.uniforms;
-  const TraceInstance *traceInstances = scene.instances.data();
-  const Material *materials = frame.materials.data();
-  const uint *indices = scene.indices.data();
-  const float *vertices = scene.vertices.data();
-  const Light *lights = frame.lights.data();
-  const float *environmentDistribution = scene.distribution.data();
-  const float *specularAlbedo = scene.specularAlbedo.data();
-  const PtEmissiveTriangle *emissiveTriangles = scene.emissiveTriangles.data();
-  const HostTextures &maps = scene.textures;
-  const HostEnvironment &environmentMap = scene.environment;
-  float3 pathRadiance(0.0f), pathAlbedo(0.0f), pathNormal(0.0f);
-  PtReconstructionSample pathGuide = ptEmptyReconstructionSample();
-#define PT_TRACE(origin, direction, tMax, mask, seed, cone, anyHit, hit) \
-  hit = traceRay(origin, direction, tMax, mask, seed, cone, anyHit)
-#define PT_RESTIR_DIRECT restirDirect
-#define PT_RESTIR_DIFFUSE restirDiffuse
-#include "../../shaders/pt/integrator.inc"
-#undef PT_RESTIR_DIFFUSE
-#undef PT_RESTIR_DIRECT
-#undef PT_TRACE
-  return {pathRadiance, pathAlbedo, pathNormal, pathGuide};
-}
-
 bool finite(float3 v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }
-
-// Calls body(trace) with the frame's intersector as trace(origin, direction, tMax, mask, seed,
-// cone, anyHit) -> PtHit.
-template <class Body>
-auto withIntersector(const CpuScene &scene, const CpuFrame &frame, const Body &body) {
-  if (frame.intersector == 1 && scene.embree) {
-    const EmbreeScene &embree = *scene.embree;
-    return body([&](float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone, uint anyHit) {
-      return embree.trace(scene, frame, origin, direction, tMax, mask, seed, cone, anyHit);
-    });
-  }
-  if (frame.intersector == 2 && scene.wideAvx2) {
-    const WideBvh &wide = *scene.wideAvx2;
-    return body([&](float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone, uint anyHit) {
-      return traceWideBvhAvx2(wide, frame.materials.data(), scene.indices.data(), scene.vertices.data(),
-                              scene.textures, origin, direction, tMax, mask, seed, cone, anyHit);
-    });
-  }
-  const float4 *nodes = scene.bvh.nodes.data();
-  const float4 *triangles = scene.bvh.triangles.data();
-  return body([&](float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone, uint anyHit) {
-    return ptTraceBvh(nodes, triangles, scene.instances.data(), frame.materials.data(), scene.indices.data(),
-                      scene.vertices.data(), scene.textures, origin, direction, tMax, mask, seed, cone, anyHit);
-  });
-}
 
 } // namespace
 
-PathSample CpuTracer::tracePixel(const CpuScene &scene, const CpuFrame &frame, uint pixelX, uint pixelY,
-                                 uint sampleIndex, float3 restirDirect, float3 restirDiffuse) {
-  return withIntersector(scene, frame, [&](const auto &trace) {
-    return integrate(scene, frame, pixelX, pixelY, sampleIndex, restirDirect, restirDiffuse, trace);
-  });
+PathSample CpuTracer::tracePixel(const TraceView &view, uint pixelX, uint pixelY, uint sampleIndex, float3 restirDirect,
+                                 float3 restirDiffuse) {
+  const PtPath path = gen::ptCpuTracePath(view.get(), pixelX, pixelY, sampleIndex, restirDirect, restirDiffuse);
+  return {path.radiance, path.albedo, path.normal, path.guide};
 }
 
-// ReSTIR DI: the same per-pixel passes as the GPU's reservoir kernels, from
-// shaders/pt/restir.h.
+PathSample CpuTracer::tracePixel(const CpuScene &scene, const CpuFrame &frame, uint pixelX, uint pixelY,
+                                 uint sampleIndex, float3 restirDirect, float3 restirDiffuse) {
+  const FrameView view(scene, frame);
+  return tracePixel(view, pixelX, pixelY, sampleIndex, restirDirect, restirDiffuse);
+}
+
+// ReSTIR DI: the GPU's reservoir passes (pt_restir.slang), per pixel on the workers.
 
 void CpuTracer::restirFrame(const CpuScene &scene, const CpuFrame &frame, uint sampleIndex, RestirState &state,
                             WorkerPool &pool) {
   const PathUniforms &uniforms = frame.uniforms;
   const uint width = frame.width, height = frame.height, pixels = width * height;
-  const TraceInstance *traceInstances = scene.instances.data();
-  const Material *materials = frame.materials.data();
-  const uint *indices = scene.indices.data();
-  const float *vertices = scene.vertices.data();
-  const Light *lights = frame.lights.data();
-  const float *environmentDistribution = scene.distribution.data();
-  const float *specularAlbedo = scene.specularAlbedo.data();
-  const PtEmissiveTriangle *emissiveTriangles = scene.emissiveTriangles.data();
-  const HostTextures &maps = scene.textures;
-  const HostEnvironment &environmentMap = scene.environment;
-  const PtRestirLights l = ptRestirLights(uniforms.environment, uniforms.distribution, uniforms.sunDirection,
-                                          uniforms.sunRadiance, uniforms.path, uniforms.counts, uniforms.emissive);
-  const float2 cameraCone = ptCameraCone(uniforms.lens);
   const uint candidates = std::min(uniforms.estimator.y, kPtRestirMaxCandidates);
   if (state.previous.image.x != width || state.previous.image.y != height ||
       state.previousSurfaces.size() != pixels || state.previousReservoirs.size() != pixels)
     state.previous.image.z = 0u;
+  // estimator.z bit 0: temporal reuse.
   if ((uniforms.estimator.z & 1u) == 0u) state.previous.image.z = 0u;
   state.surfaces.assign(pixels, PtRestirSurface{});
   state.reservoirs.assign(pixels, ptEmptyReservoir());
@@ -178,61 +148,22 @@ void CpuTracer::restirFrame(const CpuScene &scene, const CpuFrame &frame, uint s
   state.direct.assign(pixels, float3(0.0f));
   state.directDiffuse.assign(pixels, float3(0.0f));
 
-  withIntersector(scene, frame, [&](const auto &trace) {
-    // Primary hits, initial resampling and temporal reuse (reads only the previous frame).
-    pool.parallelFor(height, [&](uint y) {
-      for (uint x = 0; x < width; ++x) {
-        const uint pixel = y * width + x;
-        const uint seed = pathSeed(x, y, sampleIndex, uniforms.counts.z);
-        float3 origin(0.0f);
-        const float3 direction = ptRestirCameraRay(uniforms.cameraPosition, uniforms.cameraForward, uniforms.cameraRight,
-                                                   uniforms.cameraUp, uniforms.image, uniforms.lens, x, y, seed, origin);
-        const PtHit hit = trace(origin, direction, kPtInfinity, uniforms.counts.y, ptTraceSeed(seed, 0u, 0u),
-                                cameraCone, 0u);
-        if (hit.found == 0u) {
-          state.reservoirs[pixel].count = static_cast<float>(candidates);
-          continue;
-        }
-        const float hitWidth = ptConeWidthOrLevelZero(cameraCone, hit.t);
-        const PtSurface surface = ptSurfaceAt(traceInstances, materials, indices, vertices, maps, hit, direction, hitWidth);
-        const PtRestirSurface record = ptRestirSurfaceOf(surface, hit, traceInstances[hit.instance].material, direction,
-                                                         hitWidth, xyz(uniforms.cameraPosition),
-                                                         xyz(uniforms.cameraForward));
-        state.surfaces[pixel] = record;
-        const PtBsdf bsdf = ptMakeBsdf(surface, -direction, specularAlbedo);
-        const PtReservoir initial = ptRestirInitial(PT_RESTIR_LIGHT_ARGS, l, bsdf, surface.position,
-                                                    surface.geometricNormal, ptConeShadow(cameraCone, hitWidth), seed,
-                                                    candidates);
-        state.reservoirs[pixel] = ptRestirTemporal(PT_RESTIR_PASS_ARGS, l, state.previous, cameraCone, pixel, sampleIndex,
-                                                   candidates, record, initial, state.previousSurfaces.data(),
-                                                   state.previousReservoirs.data());
-      }
-    });
-    // Spatial reuse, then the final reservoir's light with its shadow ray.
-    pool.parallelFor(height, [&](uint y) {
-      for (uint x = 0; x < width; ++x) {
-        const uint pixel = y * width + x;
-        PtReservoir final = state.reservoirs[pixel];
-        if ((uniforms.estimator.z & 2u) != 0u)
-          final = ptRestirSpatial(PT_RESTIR_PASS_ARGS, l, cameraCone, pixel, sampleIndex, width, height,
-                                  state.surfaces.data(), state.reservoirs.data());
-        finals[pixel] = final;
-        float3 shadowOrigin(0.0f), shadowDirection(0.0f), diffuseFraction(1.0f);
-        float shadowReach = 0.0f;
-        float2 shadowCone(0.0f);
-        const uint seed = pathSeed(x, y, sampleIndex, uniforms.counts.z);
-        const float3 contribution = ptRestirShade(PT_RESTIR_PASS_ARGS, l, cameraCone, state.surfaces[pixel], final,
-                                                  seed, shadowOrigin, shadowDirection, shadowReach, shadowCone,
-                                                  diffuseFraction);
-        if (!(ptMaxComponent(contribution) > 0.0f)) continue;
-        const PtHit blocker = trace(shadowOrigin, shadowDirection, shadowReach, uniforms.counts.y,
-                                    ptTraceSeed(seed, 0u, 1u), shadowCone, 1u);
-        if (blocker.found != 0u) continue;
-        state.direct[pixel] = contribution;
-        state.directDiffuse[pixel] = contribution * diffuseFraction;
-      }
-    });
-    return 0;
+  const FrameView view(scene, frame);
+  // Primary hits, initial resampling and temporal reuse (reads only the previous frame).
+  pool.parallelFor(height, [&](uint y) {
+    for (uint x = 0; x < width; ++x) {
+      const uint pixel = y * width + x;
+      gen::ptCpuRestirPrimary(view.get(), x, y, sampleIndex, candidates, &state.previous, buffer(state.previousSurfaces),
+                         buffer(state.previousReservoirs), &state.surfaces[pixel], &state.reservoirs[pixel]);
+    }
+  });
+  // Spatial reuse, then the final reservoir's light with its shadow ray.
+  pool.parallelFor(height, [&](uint y) {
+    for (uint x = 0; x < width; ++x) {
+      const uint pixel = y * width + x;
+      gen::ptCpuRestirSpatialShade(view.get(), x, y, sampleIndex, buffer(state.surfaces), buffer(state.reservoirs), &finals[pixel],
+                              &state.direct[pixel], &state.directDiffuse[pixel]);
+    }
   });
 
   std::swap(state.previousSurfaces, state.surfaces);
@@ -253,14 +184,15 @@ constexpr uint kSumFloats = 9;  // radiance, albedo, normal
 // frame's ReSTIR DI state, when the estimator is ReSTIR.
 void traceTile(const CpuScene &scene, const CpuFrame &frame, uint tile, uint sampleIndex, float *sums,
                PtReconstructionSample *guides = nullptr, const RestirState *restir = nullptr) {
+  const FrameView view(scene, frame);
   const uint tilesX = (frame.width + kTile - 1) / kTile;
   const uint x0 = (tile % tilesX) * kTile, y0 = (tile / tilesX) * kTile;
   for (uint y = y0; y < std::min(y0 + kTile, frame.height); ++y)
     for (uint x = x0; x < std::min(x0 + kTile, frame.width); ++x) {
       const std::size_t pixel = static_cast<std::size_t>(y) * frame.width + x;
       const PathSample sample =
-          restir ? CpuTracer::tracePixel(scene, frame, x, y, sampleIndex, restir->direct[pixel], restir->directDiffuse[pixel])
-                 : CpuTracer::tracePixel(scene, frame, x, y, sampleIndex);
+          restir ? CpuTracer::tracePixel(view, x, y, sampleIndex, restir->direct[pixel], restir->directDiffuse[pixel])
+                 : CpuTracer::tracePixel(view, x, y, sampleIndex);
       if (guides) guides[static_cast<std::size_t>(y) * frame.width + x] = sample.guide;
       float *p = sums + (static_cast<std::size_t>(y) * frame.width + x) * kSumFloats;
       if (finite(sample.radiance)) {
@@ -462,8 +394,9 @@ void CpuTracer::coordinate() {
       if (f.uniforms.image.z > 0.5f) previewGuides.resize(static_cast<std::size_t>(blocksX) * blocksY);
       pool.parallelFor(blocksY, [&](uint by) {
         if (stale()) return;
+        const FrameView view(s, previewFrame);
         for (uint bx = 0; bx < blocksX; ++bx) {
-          const auto path = tracePixel(s, previewFrame, bx, by, 0);
+          const auto path = tracePixel(view, bx, by, 0);
           if (!previewGuides.empty()) previewGuides[static_cast<std::size_t>(by) * blocksX + bx] = path.guide;
           float3 c = path.radiance;
           if (!finite(c)) c = float3(0.0f);

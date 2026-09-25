@@ -1,5 +1,5 @@
-// Types laid out as MSL lays them out, so structs upload as they stand: float3 is
-// 16 bytes, float4x4 is four float4 columns.
+// Types laid out as the shaders' Vulkan buffers lay them out, so structs upload as they stand:
+// float3 is 16 bytes, float4x4 is four float4 columns.
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -69,7 +69,7 @@ inline Vec4 operator-(Vec4 a, Vec4 b) { return {a.x - b.x, a.y - b.y, a.z - b.z,
 inline Vec4 operator*(Vec4 a, float s) { return {a.x * s, a.y * s, a.z * s, a.w * s}; }
 inline float dot(Vec4 a, Vec4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 
-// Column-major, like MSL.
+// Column-major, as the shaders are compiled (-matrix-layout-column-major).
 struct Mat4 {
   Vec4 columns[4];
   Mat4() : columns{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}} {}

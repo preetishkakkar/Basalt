@@ -13,7 +13,7 @@ namespace basalt {
 
 class Uploader;
 
-// Interleaved to match the attributes the Metal vertex entries declare.
+// Interleaved to match the vertex inputs the Slang vertex entries declare.
 struct Vertex {
   Vec3 position;
   Vec3 normal;
@@ -26,7 +26,7 @@ static_assert(sizeof(Vertex) == 72, "the vertex layout must match the pipeline's
 
 enum class AlphaMode : std::uint32_t { Opaque = 0, Mask = 1, Blend = 2 };
 
-// Mirrors Material in shaders/common.metal.
+// Mirrors Material in shaders/slang/basalt/basalt_types.slang.
 struct MaterialUniforms {
   Vec4 baseColorFactor{1, 1, 1, 1};
   Vec4 emissive{0, 0, 0, 1};      // rgb factor, w strength
@@ -66,7 +66,7 @@ struct Primitive {
   std::string name;
 };
 
-// Mirrors Instance in shaders/common.metal.
+// Mirrors Instance in shaders/slang/basalt/basalt_common.slang.
 struct InstanceRecord {
   Vec4 modelRow0, modelRow1, modelRow2;
   Vec4 normalRow0, normalRow1, normalRow2;
@@ -74,7 +74,7 @@ struct InstanceRecord {
 };
 static_assert(sizeof(InstanceRecord) == 112, "the instance layout must match the shader");
 
-// Mirrors Light in shaders/common.metal.
+// Mirrors Light in shaders/slang/basalt/basalt_types.slang.
 struct LightRecord {
   Vec4 position{0, 0, 0, 0};
   Vec4 color{1, 1, 1, 0};

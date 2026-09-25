@@ -1,6 +1,6 @@
-// The CPU path tracer: the shared path loop (shaders/pt/integrator.inc) run per pixel on
-// worker threads, over the software BVH or Embree, accumulating progressively, denoised on
-// request. Independent of Vulkan.
+// The CPU path tracer: the shared path loop (pt_integrator.slang, generated as C++) run per
+// pixel on worker threads, over the software BVH, Embree or the AVX2 wide BVH, accumulating
+// progressively, denoised on request. Independent of Vulkan.
 #pragma once
 #include "pt/Bvh.h"
 #include "pt/BvhVariants.h"
@@ -35,7 +35,7 @@ struct CpuScene {
   Bvh bvh;
   BvhStatistics bvhStatistics;
   std::shared_ptr<EmbreeScene> embree;  // when the frame asks for Embree
-  std::shared_ptr<WideBvh> wideAvx2;    // optional V6 quantized BVH8 + AVX2 traversal
+  std::shared_ptr<WideBvh> wideAvx2;    // optional quantized BVH8 for the AVX2 traversal
 };
 
 // What changes every restart.
@@ -48,6 +48,13 @@ struct CpuFrame {
   uint targetSamples = 0;  // stop there; zero runs until the next restart
   uint intersector = 0;    // 0 binary software BVH, 1 Embree, 2 quantized BVH8 + AVX2
   bool denoise = false;
+};
+
+// A CPU frame as the generated code sees it: the scene's and the frame's arrays, the uniforms
+// and the frame's intersector.
+class FrameView : public TraceView {
+public:
+  FrameView(const CpuScene &scene, const CpuFrame &frame);
 };
 
 // ReSTIR DI state, per pixel, carried from frame to frame: this frame's primary
@@ -129,6 +136,8 @@ public:
   static PathSample tracePixel(const CpuScene &scene, const CpuFrame &frame, uint pixelX, uint pixelY,
                                uint sampleIndex, float3 restirDirect = float3(0.0f),
                                float3 restirDiffuse = float3(0.0f));
+  static PathSample tracePixel(const TraceView &view, uint pixelX, uint pixelY, uint sampleIndex,
+                               float3 restirDirect = float3(0.0f), float3 restirDiffuse = float3(0.0f));
 
   // One ReSTIR DI frame for sample `sampleIndex` of every pixel: primary hits, initial
   // resampling, temporal and spatial reuse (per uniforms.estimator) and the shadow rays,

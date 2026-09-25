@@ -204,6 +204,7 @@ int main(int argc, char **argv) {
     m.sceneContentHash = loaded.contentHash;
     m.environment = environmentPath;
     m.device = "CPU";
+    m.shaderCompiler = "slang-" BASALT_SLANG_VERSION;  // the path tracer is pt_cpu.slang as C++
     m.renderer = "cpu";
     m.intersector = intersector == "embree" ? "embree" : intersector == "avx2" ? "quantized-bvh8-avx2" : "own-bvh";
     m.builder = intersector == "embree" ? "embree" : "cpu-binned-sah";

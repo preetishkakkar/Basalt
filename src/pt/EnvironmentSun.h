@@ -26,7 +26,7 @@ EnvironmentSun extractEnvironmentSun(std::vector<float> &rgba, uint width, uint 
 
 // The path tracer's sun uniforms (PathUniforms::sunDirection, sunRadiance) for a disc of this
 // irradiance, direction and angular radius; a zero irradiance gives no sun.
-void environmentSunUniforms(float3 direction, float3 irradiance, float angularRadius, float4 &sunDirection,
-                            float4 &sunRadiance);
+void environmentSunUniforms(float3 direction, float3 irradiance, float angularRadius, Vector<float, 4> &sunDirection,
+                            Vector<float, 4> &sunRadiance);
 
 } // namespace pt

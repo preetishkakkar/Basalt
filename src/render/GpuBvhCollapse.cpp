@@ -15,21 +15,13 @@
 #include <string>
 #include <unordered_set>
 
-#define device
-#define thread
-namespace pt {
-#include "pt/bvh_build.h"
-}
-#undef device
-#undef thread
-
 namespace basalt {
 namespace {
 
 static_assert(sizeof(pt::BvhCollapseControl) == 32);
 static_assert(sizeof(pt::BvhCollapseStatus) == 16);
 
-constexpr std::uint32_t kLevels = 64;  // bvh_collapse.metal's kCollapseLevels (PT_BVH_STACK)
+constexpr std::uint32_t kLevels = pt::kBvhStack;  // bvh_collapse.slang's kCollapseLevels
 constexpr VkDeviceSize kSlot = 256;    // the largest offset alignment Vulkan allows
 
 const char *const kEntries[] = {"bvh_collapse_gather", "bvh_collapse_size", "bvh_collapse_roots",
@@ -62,7 +54,7 @@ void barrier(VkCommandBuffer command) {
 struct Layout {
   VkDeviceSize status = 0, header = 0, headerBytes = 0, rootNumber = 0, rootBytes = 0, error = 0, control = 0,
                level = 0, levelBytes = 0, instanceRoot = 0, rootTask = 0, emitHeader = 0, bytes = 0;
-  VkDeviceSize controlAt(std::uint32_t level) const { return control + level * kSlot; }
+  VkDeviceSize controlAt(std::uint32_t depth) const { return control + depth * kSlot; }
 };
 
 Layout layoutFor(std::uint32_t instanceCount) {
@@ -216,8 +208,8 @@ GpuWideCollapseResult GpuBvhCollapser::collapse(Uploader &uploader, const Buffer
 
   DescriptorPool pool(context, 256);
   auto set = [&](const Kernel &k, const std::function<void(DescriptorWriter &)> &write) {
-    const VkDescriptorSet s = pool.allocate(k.program->setLayouts[0]);
-    DescriptorWriter writer(context, k.program->compute(), s);
+    const VkDescriptorSet s = k.program->allocate(pool);
+    DescriptorWriter writer(context, *k.program, s);
     write(writer);
     writer.apply();
     return s;
@@ -254,7 +246,7 @@ GpuWideCollapseResult GpuBvhCollapser::collapse(Uploader &uploader, const Buffer
 
   auto indirectLevel = [&](VkCommandBuffer command, const Kernel &k, VkDescriptorSet s, std::uint32_t level) {
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.program->layout, 0, 1, &s, 0, nullptr);
+    k.program->bind(command, s);
     vkCmdDispatchIndirect(command, setupBuffer.handle, headerOffset + level * sizeof(pt::uint4));
     barrier(command);
     ++result.dispatches;
@@ -278,8 +270,7 @@ GpuWideCollapseResult GpuBvhCollapser::collapse(Uploader &uploader, const Buffer
     for (std::uint32_t level = levels; level-- > 0;) indirectLevel(command, size, sizeSets[level], level);
     mark(command, kMarkSized);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, rootsKernel.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, rootsKernel.program->layout, 0, 1, &rootsSet, 0,
-                            nullptr);
+    rootsKernel.program->bind(command, rootsSet);
     vkCmdDispatch(command, 1, 1, 1);
     barrier(command);
     ++result.dispatches;
@@ -294,7 +285,7 @@ GpuWideCollapseResult GpuBvhCollapser::collapse(Uploader &uploader, const Buffer
   if (status.result.x != pt::kBvhBuildErrorNone)
     throw std::runtime_error(std::string("GPU wide collapse failed: ") + errorName(status.result.x) + " (code " +
                              std::to_string(status.result.x) + "; traversal stack bound " +
-                             std::to_string(status.result.w) + " of " + std::to_string(PT_WIDE_BVH_STACK_DEEP) + ", " +
+                             std::to_string(status.result.w) + " of " + std::to_string(pt::kWideStackDeep) + ", " +
                              std::to_string(status.result.y) + " levels)");
   result.nodeCount = status.result.z;
   result.levels = status.result.y;
@@ -323,8 +314,7 @@ GpuWideCollapseResult GpuBvhCollapser::collapse(Uploader &uploader, const Buffer
     mark(command, kMarkEmitStart);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.pipeline.handle);
     for (std::uint32_t level = 0; level < result.levels; ++level) {
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.program->layout, 0, 1, &emitSets[level], 0,
-                              nullptr);
+      emit.program->bind(command, emitSets[level]);
       vkCmdDispatch(command, (headers[level].w * 8u + 63u) / 64u, 1, 1);
       barrier(command);
       ++result.dispatches;
@@ -373,8 +363,8 @@ GpuWideCollapseResult GpuBvhCollapser::reemit(Uploader &uploader, const Buffer &
   DescriptorPool pool(context, 128);
   std::vector<VkDescriptorSet> emitSets;
   for (std::uint32_t level = 0; level < k.levelTasks.size(); ++level) {
-    const VkDescriptorSet s = pool.allocate(emit.program->setLayouts[0]);
-    DescriptorWriter(context, emit.program->compute(), s)
+    const VkDescriptorSet s = emit.program->allocate(pool);
+    DescriptorWriter(context, *emit.program, s)
         .buffer("binary", binaryNodes).buffer("taskNode", k.taskNode).buffer("taskSlots", k.taskSlots)
         .buffer("taskChild", k.taskChild).buffer("taskSize", k.taskSize).buffer("taskNumber", k.taskNumber)
         .buffer("levelBase", k.setup, k.levelOffset, k.levelBytes)
@@ -390,8 +380,7 @@ GpuWideCollapseResult GpuBvhCollapser::reemit(Uploader &uploader, const Buffer &
     context.beginLabel(command, "collapse re-emit");
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.pipeline.handle);
     for (std::uint32_t level = 0; level < k.levelTasks.size(); ++level) {
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.program->layout, 0, 1, &emitSets[level], 0,
-                              nullptr);
+      emit.program->bind(command, emitSets[level]);
       vkCmdDispatch(command, (k.levelTasks[level] * 8u + 63u) / 64u, 1, 1);
       barrier(command);
       ++result.dispatches;
@@ -463,8 +452,8 @@ void GpuBvhCollapser::prepareFrames(Uploader &uploader, const Buffer &binaryNode
   f.pool = std::make_unique<DescriptorPool>(context, 256);
   auto set = [&](const char *entry, const std::function<void(DescriptorWriter &)> &write) {
     const Kernel &k = kernel(entry);
-    const VkDescriptorSet s = f.pool->allocate(k.program->setLayouts[0]);
-    DescriptorWriter writer(context, k.program->compute(), s);
+    const VkDescriptorSet s = k.program->allocate(*f.pool);
+    DescriptorWriter writer(context, *k.program, s);
     write(writer);
     writer.apply();
     return s;
@@ -509,8 +498,8 @@ void GpuBvhCollapser::recordRows(VkCommandBuffer command, const Buffer &input, c
   const VkBuffer key[2] = {input.handle, output.handle};
   if (!f.rows || std::memcmp(key, f.rowsKey, sizeof(key)) != 0) {
     const Kernel &k = kernel("bvh_collapse_rows");
-    f.rows = f.pool->allocate(k.program->setLayouts[0]);
-    DescriptorWriter(context, k.program->compute(), f.rows)
+    f.rows = k.program->allocate(*f.pool);
+    DescriptorWriter(context, *k.program, f.rows)
         .buffer("input", input).buffer("output", output)
         .buffer("rootNumber", f.setup, f.layout.rootNumber, f.layout.rootBytes)
         .buffer("control", f.setup, f.layout.controlAt(0), sizeof(pt::BvhCollapseControl))
@@ -519,7 +508,7 @@ void GpuBvhCollapser::recordRows(VkCommandBuffer command, const Buffer &input, c
   }
   const Kernel &k = kernel("bvh_collapse_rows");
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.program->layout, 0, 1, &f.rows, 0, nullptr);
+  k.program->bind(command, f.rows);
   vkCmdDispatch(command, (std::max(1u, f.instanceCount) + 63u) / 64u, 1, 1);
   barrier(command);
 }
@@ -529,8 +518,7 @@ void GpuBvhCollapser::recordEmit(VkCommandBuffer command) {
   const Kernel &emit = kernel("bvh_collapse_emit");
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.pipeline.handle);
   for (std::uint32_t level = 0; level < kLevels; ++level) {
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, emit.program->layout, 0, 1, &f.emit[level], 0,
-                            nullptr);
+    emit.program->bind(command, f.emit[level]);
     vkCmdDispatchIndirect(command, f.setup.handle, f.layout.emitHeader + level * sizeof(pt::uint4));
     barrier(command);
   }
@@ -564,14 +552,14 @@ void GpuBvhCollapser::recordCollapse(VkCommandBuffer command, const Buffer &inpu
   auto indirect = [&](const char *entry, VkDescriptorSet s, std::uint32_t level) {
     const Kernel &k = kernel(entry);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.program->layout, 0, 1, &s, 0, nullptr);
+    k.program->bind(command, s);
     vkCmdDispatchIndirect(command, f.setup.handle, l.header + level * sizeof(pt::uint4));
     barrier(command);
   };
   auto direct = [&](const char *entry, VkDescriptorSet s, std::uint32_t groups) {
     const Kernel &k = kernel(entry);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, k.program->layout, 0, 1, &s, 0, nullptr);
+    k.program->bind(command, s);
     vkCmdDispatch(command, groups, 1, 1);
     barrier(command);
   };
@@ -607,7 +595,7 @@ std::string GpuBvhCollapser::frameError(std::uint32_t slot, std::uint32_t *maxim
   if (status.result.x != pt::kBvhBuildErrorNone)
     return std::string("GPU wide collapse failed: ") + errorName(status.result.x) + " (code " +
            std::to_string(status.result.x) + "; traversal stack bound " + std::to_string(status.result.w) + " of " +
-           std::to_string(PT_WIDE_BVH_STACK_DEEP) + ", " + std::to_string(status.result.y) + " levels)";
+           std::to_string(pt::kWideStackDeep) + ", " + std::to_string(status.result.y) + " levels)";
   if (status.result.z == 0u || status.result.z > f.capacity)
     return "GPU wide collapse published an impossible node count";
   return {};

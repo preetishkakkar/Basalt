@@ -11,7 +11,8 @@
 namespace basalt {
 namespace {
 
-struct UiUniforms {
+// Mirrors UiTransform in shaders/slang/entries/ui.slang: the vertex stage's push constants.
+struct UiTransform {
   float scaleAndTranslate[4];
 };
 
@@ -59,23 +60,14 @@ UiPass::UiPass(const Context &ctx, Uploader &uploader, VkFormat colorFormat) : c
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   check(vkCreateSampler(ctx.device, &samplerInfo, nullptr, &sampler), "vkCreateSampler (ui)");
 
-  fontSet = pool->allocate(program->setLayouts[1]);
-  DescriptorWriter(ctx, program->fragment(), fontSet)
+  fontSet = program->allocate(*pool);
+  DescriptorWriter(ctx, *program, fontSet)
       .texture("atlas", fontAtlas)
       .sampler("atlasSampler", sampler)
       .apply();
   io.Fonts->SetTexID(reinterpret_cast<ImTextureID>(fontSet));
 
   frames.resize(kFramesInFlight);
-  for (FrameBuffers &frame : frames) {
-    frame.uniforms = Buffer(ctx, sizeof(UiUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                            VMA_MEMORY_USAGE_AUTO,
-                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                            "ui.uniforms");
-    frame.vertexSet = pool->allocate(program->setLayouts[0]);
-    DescriptorWriter(ctx, program->vertex(), frame.vertexSet).buffer("ui", frame.uniforms).apply();
-  }
 }
 
 UiPass::~UiPass() {
@@ -121,16 +113,14 @@ void UiPass::record(VkCommandBuffer command, ImDrawData *drawData, std::uint32_t
     indexTarget += commands->IdxBuffer.Size;
   }
 
-  UiUniforms uniforms{};
-  uniforms.scaleAndTranslate[0] = 2.0f / drawData->DisplaySize.x;
-  uniforms.scaleAndTranslate[1] = 2.0f / drawData->DisplaySize.y;
-  uniforms.scaleAndTranslate[2] = -1.0f - drawData->DisplayPos.x * uniforms.scaleAndTranslate[0];
-  uniforms.scaleAndTranslate[3] = -1.0f - drawData->DisplayPos.y * uniforms.scaleAndTranslate[1];
-  frame.uniforms.write(&uniforms, sizeof(uniforms));
+  UiTransform transform{};
+  transform.scaleAndTranslate[0] = 2.0f / drawData->DisplaySize.x;
+  transform.scaleAndTranslate[1] = 2.0f / drawData->DisplaySize.y;
+  transform.scaleAndTranslate[2] = -1.0f - drawData->DisplayPos.x * transform.scaleAndTranslate[0];
+  transform.scaleAndTranslate[3] = -1.0f - drawData->DisplayPos.y * transform.scaleAndTranslate[1];
 
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, program->layout, 0, 1,
-                          &frame.vertexSet, 0, nullptr);
+  program->push(command, transform);
   const VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(command, 0, 1, &frame.vertices.handle, &offset);
   vkCmdBindIndexBuffer(command, frame.indices.handle, 0,
@@ -171,8 +161,7 @@ void UiPass::record(VkCommandBuffer command, ImDrawData *drawData, std::uint32_t
       auto texture = reinterpret_cast<VkDescriptorSet>(draw.GetTexID());
       if (!texture) texture = fontSet;
       if (texture != boundTexture) {
-        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, program->layout, 1, 1,
-                                &texture, 0, nullptr);
+        program->bind(command, texture);
         boundTexture = texture;
       }
       vkCmdDrawIndexed(command, draw.ElemCount, 1, draw.IdxOffset + indexOffset,

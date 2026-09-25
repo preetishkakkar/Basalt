@@ -27,6 +27,7 @@ float4 decode(std::uint32_t texel, bool srgb) {
   return float4(table[texel & 0xFFu], table[(texel >> 8) & 0xFFu], table[(texel >> 16) & 0xFFu], a / 255.0f);
 }
 
+// mode: 0 repeat, 1 clamp to edge, 2 mirrored repeat (glTF's wrap, as packedSampler encodes it).
 int wrap(int i, int size, uint mode) {
   if (mode == 1u) return std::clamp(i, 0, size - 1);
   if (mode == 2u) {
@@ -153,5 +154,50 @@ float3 HostEnvironment::sample(float2 uv) const {
   const float3 bottom = mix(at(x0, y1), at(x1, y1), tx);
   return mix(top, bottom, ty);
 }
+
+TraceView::TraceView(const HostTextures &hostTextures, const HostEnvironment *hostEnvironment)
+    : textures(hostTextures), environment(hostEnvironment) {
+  scene.host = reinterpret_cast<std::uint64_t>(this);
+}
+
+PtCpuScene TraceView::withInstances(const std::vector<TraceInstance> &instances) const {
+  PtCpuScene copy = scene;
+  copy.traceInstances = buffer(instances);
+  return copy;
+}
+
+// What the generated code calls back for (pt_cpu.slang), with the C linkage it declares; only
+// the generated C++ calls them, so returning vectors is fine.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4190)
+#endif
+namespace {
+const TraceView &viewOf(std::uint64_t host) { return *reinterpret_cast<const TraceView *>(host); }
+} // namespace
+
+extern "C" Vector<float, 4> ptHostSampleTexture(std::uint64_t host, uint slot, Vector<float, 2> uv, uint samplerCode, float lodBase) {
+  return viewOf(host).textures.sample(slot, uv, samplerCode, lodBase);
+}
+
+extern "C" float ptHostTextureFootprint(std::uint64_t host, uint slot, float lodBase) {
+  return viewOf(host).textures.footprint(slot, lodBase);
+}
+
+extern "C" Vector<float, 3> ptHostSampleEnvironment(std::uint64_t host, Vector<float, 2> uv) {
+  const TraceView &view = viewOf(host);
+  return view.environment ? view.environment->sample(uv) : float3(0.0f);
+}
+
+extern "C" PtHit ptHostTrace(std::uint64_t host, Vector<float, 3> origin, Vector<float, 3> direction, float tMax, uint mask, uint seed,
+                  Vector<float, 2> cone, uint anyHit) {
+  const TraceView &view = viewOf(host);
+  if (!view.trace) return ptTraceBvh(view, origin, direction, tMax, mask, seed, cone, anyHit);
+  return view.trace(view, origin, direction, tMax, mask, seed, cone, anyHit);
+}
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 } // namespace pt

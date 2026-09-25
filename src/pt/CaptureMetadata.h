@@ -15,7 +15,7 @@ struct CaptureMetadata {
   // Source and toolchain.
   std::string revision;
   bool dirtyAtConfigure = false;
-  std::string shaderCompiler;  // empty when no shader was compiled (CPU-only build)
+  std::string shaderCompiler;  // the compiler of the shaders and of the CPU tracer's generated code
 
   // Scene: the file as given, a hash of its bytes, and the environment ("" is the default sky).
   std::string scene;

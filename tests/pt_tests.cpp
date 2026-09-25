@@ -10,15 +10,6 @@
 #include "pt/ImageFile.h"
 #include "pt/EnvironmentSun.h"
 
-#define device
-#define thread
-namespace pt {
-#include "../shaders/pt/bvh_build.h"
-#include "../shaders/pt/exact_float.h"
-} // namespace pt
-#undef device
-#undef thread
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -98,7 +89,7 @@ PtSurface flatSurface(float3 normal, float3 base, float metallic, float roughnes
 double integratedAlbedo(float3 base, float metallic, float roughness, float3 view) {
   static const std::vector<float> table = buildSpecularAlbedoTable();
   const PtSurface surface = flatSurface(float3(0.0f, 0.0f, 1.0f), base, metallic, roughness);
-  const PtBsdf bsdf = ptMakeBsdf(surface, view, table.data());
+  const PtBsdf bsdf = ptMakeBsdf(surface, view, table);
   const int n = 1 << 21;
   double sum = 0.0;
   for (int i = 0; i < n; ++i) {
@@ -170,7 +161,7 @@ PT_TEST(sample_indices_remain_exact_above_the_float_integer_limit) {
   first.counts.w = 16'777'216u;
   second.counts.w = 16'777'217u;
   if (first.counts.w == second.counts.w)
-    return "adjacent sample indices aliased across the shared CPU/MSL uniform ABI";
+    return "adjacent sample indices aliased across the shared CPU/GPU uniform ABI";
   if (first.counts.w != 16'777'216u || second.counts.w != 16'777'217u)
     return "sample indices did not round-trip through the integer uniform lane";
   return {};
@@ -200,9 +191,9 @@ PT_TEST(environment_distribution_matches_its_pdf) {
   std::uniform_real_distribution<float> unit(0.0f, 1.0f);
   for (int i = 0; i < 20000; ++i) {
     float pdf = 0.0f;
-    const float3 d = ptSampleEnvironmentDirection(b.scene.distribution.data(), b.scene.distributionInfo,
+    const float3 d = ptSampleEnvironmentDirection(b.scene.distribution, b.scene.distributionInfo,
                                                   float2(unit(random), unit(random)), pdf);
-    const float expected = ptEnvironmentPdf(b.scene.distribution.data(), b.scene.distributionInfo, d);
+    const float expected = ptEnvironmentPdf(b.scene.distribution, b.scene.distributionInfo, d);
     if (pdf > 0.0f && std::abs(pdf - expected) > 1e-3f * std::max(pdf, expected))
       return format("sample pdf %g, pdf function %g", pdf, expected);
   }
@@ -212,7 +203,7 @@ PT_TEST(environment_distribution_matches_its_pdf) {
   for (int i = 0; i < n; ++i) {
     const float z = 1.0f - 2.0f * (static_cast<float>(i) + 0.5f) / n, r = std::sqrt(1.0f - z * z);
     const float phi = 2.0f * kPi * radicalInverse(static_cast<uint>(i));
-    integral += ptEnvironmentPdf(b.scene.distribution.data(), b.scene.distributionInfo,
+    integral += ptEnvironmentPdf(b.scene.distribution, b.scene.distributionInfo,
                                  float3(r * std::cos(phi), z, r * std::sin(phi)));
   }
   integral *= 4.0 * kPi / n;
@@ -237,7 +228,7 @@ PT_TEST(specular_albedo_table_matches_brute_force) {
         sum += distributionGGX(normalize(view + light).z, alpha) * visibilitySmith(cosine, u, alpha) * u;
       }
       const double brute = sum / n * 2.0 * kPi;
-      const double tabled = ptSpecularAlbedo(table.data(), cosine, roughness);
+      const double tabled = ptSpecularAlbedo(table, cosine, roughness);
       if (std::abs(tabled - brute) > 0.005)
         return format("roughness %g, cos %g: table %g", roughness, cosine, tabled) + format(", brute force %g", brute);
     }
@@ -339,12 +330,8 @@ PT_TEST(bvh_matches_brute_force) {
     const float3 origin = float3(unit(random), unit(random), unit(random)) * 3.0f;
     const float3 target = float3(unit(random) * 1.5f, unit(random) * 0.6f, unit(random) * 0.6f);
     const float3 direction = normalize(target - origin);
-    const PtHit hit = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-                                 b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-                                 b.scene.textures, origin, direction, kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
-    const PtHit any = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-                                 b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-                                 b.scene.textures, origin, direction, kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
+    const PtHit hit = ptTraceBvh(FrameView(b.scene, b.frame), origin, direction, kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
+    const PtHit any = ptTraceBvh(FrameView(b.scene, b.frame), origin, direction, kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
     double best = static_cast<double>(kPtInfinity);
     uint bestInstance = 0, bestPrimitive = 0;
     for (const WorldTriangle &w : world) {
@@ -434,7 +421,7 @@ PT_TEST(smooth_metal_albedo_integrates_to_one) {
       const float angle = degrees * kPi / 180.0f;
       const float3 view(std::sin(angle), 0.0f, std::cos(angle));
       const PtSurface surface = flatSurface(float3(0.0f, 0.0f, 1.0f), float3(1.0f), 1.0f, roughness);
-      const PtBsdf bsdf = ptMakeBsdf(surface, view, table.data());
+      const PtBsdf bsdf = ptMakeBsdf(surface, view, table);
       const double albedo = hemisphereIntegral(float3(-view.x, -view.y, view.z), 1.0f, 2048u, [&](float3 light) {
         float pdf = 0.0f;
         return static_cast<double>(ptLuminance(ptBsdfEvaluate(bsdf, surface.geometricNormal, light, pdf)));
@@ -484,7 +471,7 @@ PT_TEST(bsdf_sampling_mass_matches_the_reported_pdf) {
     const PtSurface surface = flatSurface(float3(0.0f, 0.0f, 1.0f), float3(0.7f, 0.4f, 0.2f),
                                           0.35f, roughness);
     const float3 view = normalize(float3(0.7f, 0.0f, 0.7141428f));
-    const PtBsdf bsdf = ptMakeBsdf(surface, view, table.data());
+    const PtBsdf bsdf = ptMakeBsdf(surface, view, table);
     double integratedPdf = 0.0;
     uint validSamples = 0;
     for (uint i = 0; i < samples; ++i) {
@@ -532,7 +519,7 @@ PT_TEST(sun_on_a_plane_matches_the_brdf) {
     const std::vector<float> image = b.render(1024);
     const double rendered = meanLuminance(image, 8, 0, 0, 8, 8);
     const PtSurface surface = flatSurface(float3(0.0f, 1.0f, 0.0f), base, 0.0f, 1.0f);
-    const PtBsdf bsdf = ptMakeBsdf(surface, float3(0.0f, 1.0f, 0.0f), b.scene.specularAlbedo.data());
+    const PtBsdf bsdf = ptMakeBsdf(surface, float3(0.0f, 1.0f, 0.0f), b.scene.specularAlbedo);
     float pdf = 0.0f;
     const double expected = ptLuminance(ptBsdfEvaluate(bsdf, surface.geometricNormal, sunDirection, pdf)) * 3.0;
     if (std::abs(rendered - expected) > 0.01 * expected)
@@ -584,7 +571,7 @@ PT_TEST(point_light_on_a_plane_matches_the_brdf) {
   const std::vector<float> image = b.render(256);
   const double rendered = meanLuminance(image, 4, 0, 0, 4, 4);
   const PtSurface surface = flatSurface(float3(0.0f, 1.0f, 0.0f), base, 0.0f, 0.7f);
-  const PtBsdf bsdf = ptMakeBsdf(surface, float3(0.0f, 1.0f, 0.0f), b.scene.specularAlbedo.data());
+  const PtBsdf bsdf = ptMakeBsdf(surface, float3(0.0f, 1.0f, 0.0f), b.scene.specularAlbedo);
   float pdf = 0.0f;
   const double expected =
       ptLuminance(ptBsdfEvaluate(bsdf, surface.geometricNormal, float3(0.0f, 1.0f, 0.0f), pdf)) * 8.0 / 4.0;
@@ -984,20 +971,15 @@ PT_TEST(material_uv_vertex_colour_and_sidedness_are_shared) {
     v[14] = 0.5f; v[15] = 0.25f; v[16] = 1.0f; v[17] = 1.0f;
   }
   b.finish(1u);
-  const PtHit front = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(),
-      b.scene.instances.data(), b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-      b.scene.textures, float3(0.0f, 0.0f, 1.0f), float3(0.0f, 0.0f, -1.0f), 10.0f,
+  const PtHit front = ptTraceBvh(FrameView(b.scene, b.frame), float3(0.0f, 0.0f, 1.0f), float3(0.0f, 0.0f, -1.0f), 10.0f,
       kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
   if (front.found == 0u) return "the front face was not accepted";
-  const PtSurface surface = ptSurfaceAt(b.scene.instances.data(), b.frame.materials.data(), b.scene.indices.data(),
-      b.scene.vertices.data(), b.scene.textures, front, float3(0.0f, 0.0f, -1.0f), -1.0f);
+  const PtSurface surface = ptSurfaceAt(FrameView(b.scene, b.frame), front, float3(0.0f, 0.0f, -1.0f), -1.0f);
   if (std::abs(surface.baseColor.x - 0.5f) > 1e-5f || surface.baseColor.y > 1e-5f ||
       surface.baseColor.z > 1e-5f)
     return "UV1 selection or vertex-colour modulation did not reach the shared surface";
   b.scene.instances[0].flags &= ~kInstanceDoubleSided;
-  const PtHit back = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(),
-      b.scene.instances.data(), b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-      b.scene.textures, float3(0.0f, 0.0f, -1.0f), float3(0.0f, 0.0f, 1.0f), 10.0f,
+  const PtHit back = ptTraceBvh(FrameView(b.scene, b.frame), float3(0.0f, 0.0f, -1.0f), float3(0.0f, 0.0f, 1.0f), 10.0f,
       kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
   if (back.found != 0u) return "a one-sided material accepted a back-face ray";
   return {};
@@ -1021,18 +1003,13 @@ PT_TEST(rejected_mask_candidates_leave_no_coverage_bits) {
     b.finish(1u);
     const float3 origin(0.0f, 0.0f, 2.0f), direction(0.0f, 0.0f, -1.0f);
     std::vector<std::pair<const char *, PtHit>> hits;
-    hits.emplace_back("binary", ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(),
-        b.scene.instances.data(), b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-        b.scene.textures, origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
+    hits.emplace_back("binary", ptTraceBvh(FrameView(b.scene, b.frame), origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
     const WideBvh wide4 = buildWideBvh(b.scene.bvh, b.scene.instances, 4u);
     const WideBvh wide8 = buildWideBvh(b.scene.bvh, b.scene.instances, 8u);
-    hits.emplace_back("bvh4", traceWideBvh(wide4, b.frame.materials.data(), b.scene.indices.data(),
-        b.scene.vertices.data(), b.scene.textures, origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
-    hits.emplace_back("bvh8", traceWideBvh(wide8, b.frame.materials.data(), b.scene.indices.data(),
-        b.scene.vertices.data(), b.scene.textures, origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
+    hits.emplace_back("bvh4", traceWideBvh(wide4, FrameView(b.scene, b.frame), origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
+    hits.emplace_back("bvh8", traceWideBvh(wide8, FrameView(b.scene, b.frame), origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
     if (cpuAvx2Available())
-      hits.emplace_back("avx2", traceWideBvhAvx2(wide8, b.frame.materials.data(), b.scene.indices.data(),
-          b.scene.vertices.data(), b.scene.textures, origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
+      hits.emplace_back("avx2", traceWideBvhAvx2(wide8, FrameView(b.scene, b.frame), origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u));
     for (const auto &[name, hit] : hits) {
       if (hit.found == 0u || hit.instance != 0u || std::abs(hit.t - 3.0f) > 1e-4f)
         return std::string(name) + " did not return the opaque surface behind the rejected mask";
@@ -1061,10 +1038,9 @@ PT_TEST(mirrored_one_sided_instances_agree_across_cpu_intersectors) {
   uint accepted = 0;
   for (const float side : {1.0f, -1.0f}) {
     const float3 origin(0.1f, 0.2f, 2.0f * side), direction(0.0f, 0.0f, -side);
-    const PtHit own = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures, origin,
+    const PtHit own = ptTraceBvh(FrameView(b.scene, b.frame), origin,
         direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
-    const PtHit other = embree.trace(b.scene, b.frame, origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
+    const PtHit other = embree.trace(FrameView(b.scene, b.frame), origin, direction, kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
     if (own.found != other.found)
       return std::string("Embree ") + (other.found ? "accepted" : "rejected") + " the " +
              (side > 0 ? "+z" : "-z") + " side of a one-sided mirrored instance; the own BVH did not";
@@ -1073,9 +1049,7 @@ PT_TEST(mirrored_one_sided_instances_agree_across_cpu_intersectors) {
   if (accepted != 1u) return "exactly one side of a one-sided quad must be visible";
   // glTF 2.0: the mirror (x -> -x) keeps the object-space front, +z, although its world winding
   // is now clockwise seen from there.
-  const PtHit fromAbove = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-      b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-      float3(0.1f, 0.2f, 2.0f), float3(0.0f, 0.0f, -1.0f), kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
+  const PtHit fromAbove = ptTraceBvh(FrameView(b.scene, b.frame), float3(0.1f, 0.2f, 2.0f), float3(0.0f, 0.0f, -1.0f), kPtInfinity, kRayMaskScene, 0u, float2(-1.0f, 0.0f), 0u);
   if (fromAbove.found == 0u) return "the object-space front (+z) of a mirrored instance is not its front";
   return {};
 }
@@ -1311,6 +1285,12 @@ PT_TEST(bvh_refit_matches_rebuild) {
       b.scene.triangleCounts, rebuilt, sharedPool().size());
   if (refitted.nodes.size() != oldNodes || refitted.triangles.size() != oldTriangles)
     return "refit changed BVH topology or leaf storage";
+  FrameView refitView(b.scene, b.frame), rebuiltView(b.scene, b.frame);
+  refitView.scene.bvhNodes = buffer(refitted.nodes);
+  refitView.scene.bvhTriangles = buffer(refitted.triangles);
+  rebuiltView.scene.traceInstances = buffer(rebuiltInstances);
+  rebuiltView.scene.bvhNodes = buffer(rebuilt.nodes);
+  rebuiltView.scene.bvhTriangles = buffer(rebuilt.triangles);
 
   std::mt19937 random(913);
   std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
@@ -1319,18 +1299,10 @@ PT_TEST(bvh_refit_matches_rebuild) {
     const float3 origin = float3(unit(random), unit(random), unit(random)) * 3.5f;
     const float3 direction = normalize(float3(unit(random) * 1.6f, unit(random), unit(random)) - origin);
     const uint seed = pcgHash(static_cast<uint>(r));
-    const PtHit a = ptTraceBvh(refitted.nodes.data(), refitted.triangles.data(), b.scene.instances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), 0u);
-    const PtHit c = ptTraceBvh(rebuilt.nodes.data(), rebuilt.triangles.data(), rebuiltInstances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), 0u);
-    const PtHit ao = ptTraceBvh(refitted.nodes.data(), refitted.triangles.data(), b.scene.instances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origin, direction, 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
-    const PtHit co = ptTraceBvh(rebuilt.nodes.data(), rebuilt.triangles.data(), rebuiltInstances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origin, direction, 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+    const PtHit a = ptTraceBvh(refitView, origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), 0u);
+    const PtHit c = ptTraceBvh(rebuiltView, origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), 0u);
+    const PtHit ao = ptTraceBvh(refitView, origin, direction, 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+    const PtHit co = ptTraceBvh(rebuiltView, origin, direction, 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
     if (ao.found != co.found || a.found != c.found) return "refit changed nearest/occlusion found state";
     if (a.found != 0u) {
       const float tolerance = std::max(2e-7f, 1e-4f * a.t);
@@ -1364,7 +1336,7 @@ PT_TEST(bvh_ordered_bits) {
   return {};
 }
 
-// shaders/pt/exact_float.h reproduces the host's IEEE float operations bit for bit (the GPU
+// pt_exact_float.slang reproduces the host's IEEE float operations bit for bit (the GPU
 // collapse relies on it): random bit patterns, subnormals, specials, near cancellations.
 PT_TEST(exact_float_matches_native) {
   auto bits = [](float f) { return std::bit_cast<uint>(f); };
@@ -1476,8 +1448,8 @@ PT_TEST(quantized_bvh4_bvh8_match_binary) {
   const WideBvh wide4 = buildWideBvh(b.scene.bvh, b.scene.instances, 4u);
   const WideBvh wide8 = buildWideBvh(b.scene.bvh, b.scene.instances, 8u);
   if (wide4.nodes.empty() || wide8.nodes.empty()) return "wide conversion emitted no nodes";
-  if (wide4.maximumStack == 0u || wide4.maximumStack > PT_WIDE_BVH_STACK_DEEP ||
-      wide8.maximumStack == 0u || wide8.maximumStack > PT_WIDE_BVH_STACK_DEEP)
+  if (wide4.maximumStack == 0u || wide4.maximumStack > pt::kWideStackDeep ||
+      wide8.maximumStack == 0u || wide8.maximumStack > pt::kWideStackDeep)
     return "wide conversion did not prove its GPU traversal stack bound";
   std::mt19937 random(1447);
   std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
@@ -1494,25 +1466,20 @@ PT_TEST(quantized_bvh4_bvh8_match_binary) {
   };
   std::vector<PtHit> baseline(rays), four(rays), eight(rays), avx(rays);
   const double binaryRate = timed([&](int r) {
-    baseline[r] = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origins[r], directions[r], kPtInfinity, 7u, pcgHash(static_cast<uint>(r)), float2(-1.0f, 0.0f), 0u);
+    baseline[r] = ptTraceBvh(FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u, pcgHash(static_cast<uint>(r)), float2(-1.0f, 0.0f), 0u);
   });
   const double fourRate = timed([&](int r) {
-    four[r] = traceWideBvh(wide4, b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-                           b.scene.textures, origins[r], directions[r], kPtInfinity, 7u,
+    four[r] = traceWideBvh(wide4, FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u,
                            pcgHash(static_cast<uint>(r)), float2(-1.0f, 0.0f), 0u);
   });
   const double eightRate = timed([&](int r) {
-    eight[r] = traceWideBvh(wide8, b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-                            b.scene.textures, origins[r], directions[r], kPtInfinity, 7u,
+    eight[r] = traceWideBvh(wide8, FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u,
                             pcgHash(static_cast<uint>(r)), float2(-1.0f, 0.0f), 0u);
   });
   double avxRate = 0.0;
   if (cpuAvx2Available())
     avxRate = timed([&](int r) {
-      avx[r] = traceWideBvhAvx2(wide8, b.frame.materials.data(), b.scene.indices.data(),
-          b.scene.vertices.data(), b.scene.textures, origins[r], directions[r], kPtInfinity,
+      avx[r] = traceWideBvhAvx2(wide8, FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity,
           7u, pcgHash(static_cast<uint>(r)), float2(-1.0f, 0.0f), 0u);
     });
   std::vector<int> order(rays);
@@ -1534,9 +1501,7 @@ PT_TEST(quantized_bvh4_bvh8_match_binary) {
   std::vector<PtHit> sorted(rays);
   const auto sortedStarted = std::chrono::steady_clock::now();
   for (int index : order)
-    sorted[index] = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-        origins[index], directions[index], kPtInfinity, 7u, pcgHash(static_cast<uint>(index)), float2(-1.0f, 0.0f), 0u);
+    sorted[index] = ptTraceBvh(FrameView(b.scene, b.frame), origins[index], directions[index], kPtInfinity, 7u, pcgHash(static_cast<uint>(index)), float2(-1.0f, 0.0f), 0u);
   const double sortedRate = rays / std::chrono::duration<double>(
       std::chrono::steady_clock::now() - sortedStarted).count();
   const double sortedTotalRate = 1.0 / (1.0 / sortedRate + sortSeconds / rays);
@@ -1569,18 +1534,13 @@ PT_TEST(quantized_bvh4_bvh8_match_binary) {
         return "AVX2 BVH8 changed nearest traversal results";
     }
     const uint seed = pcgHash(static_cast<uint>(r));
-    const PtHit binaryOcclusion = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(),
-        b.scene.instances.data(), b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-        b.scene.textures, origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
-    const PtHit fourOcclusion = traceWideBvh(wide4, b.frame.materials.data(), b.scene.indices.data(),
-        b.scene.vertices.data(), b.scene.textures, origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
-    const PtHit eightOcclusion = traceWideBvh(wide8, b.frame.materials.data(), b.scene.indices.data(),
-        b.scene.vertices.data(), b.scene.textures, origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+    const PtHit binaryOcclusion = ptTraceBvh(FrameView(b.scene, b.frame), origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+    const PtHit fourOcclusion = traceWideBvh(wide4, FrameView(b.scene, b.frame), origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+    const PtHit eightOcclusion = traceWideBvh(wide8, FrameView(b.scene, b.frame), origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
     if (binaryOcclusion.found != fourOcclusion.found || binaryOcclusion.found != eightOcclusion.found)
       return "quantized wide BVH changed finite occlusion";
     if (avxRate > 0.0) {
-      const PtHit avxOcclusion = traceWideBvhAvx2(wide8, b.frame.materials.data(), b.scene.indices.data(),
-          b.scene.vertices.data(), b.scene.textures, origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
+      const PtHit avxOcclusion = traceWideBvhAvx2(wide8, FrameView(b.scene, b.frame), origins[r], directions[r], 4.0f, 7u, seed, float2(-1.0f, 0.0f), 1u);
       if (binaryOcclusion.found != avxOcclusion.found)
         return "AVX2 BVH8 changed finite occlusion";
     }
@@ -1629,22 +1589,36 @@ PT_TEST(embree_matches_the_own_bvh) {
     return rays / std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
   };
   const double ownRate = timed([&](int r) {
-    own[r] = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-                        b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(), b.scene.textures,
-                        origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
+    own[r] = ptTraceBvh(FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
   });
   const double embreeRate = timed([&](int r) {
-    theirs[r] = embree.trace(b.scene, b.frame, origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
+    theirs[r] = embree.trace(FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 0u);
   });
   timed([&](int r) {
-    ownBlocked[r] = ptTraceBvh(b.scene.bvh.nodes.data(), b.scene.bvh.triangles.data(), b.scene.instances.data(),
-                               b.frame.materials.data(), b.scene.indices.data(), b.scene.vertices.data(),
-                               b.scene.textures, origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
+    ownBlocked[r] = ptTraceBvh(FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
   });
   timed([&](int r) {
-    embreeBlocked[r] = embree.trace(b.scene, b.frame, origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
+    embreeBlocked[r] = embree.trace(FrameView(b.scene, b.frame), origins[r], directions[r], kPtInfinity, 7u, 0u, float2(-1.0f, 0.0f), 1u);
   });
-  int differ = 0, explainedEdges = 0, explainedRounding = 0, hits = 0, occlusionDiffer = 0;
+  // A triangle of the scene in world space, and the distance to it along a ray in double
+  // precision (infinity for a miss).
+  auto worldTriangle = [&](uint i, uint primitive, float3 (&triangle)[3]) {
+    const TraceInstance &instance = b.scene.instances[i];
+    for (uint k = 0; k < 3; ++k) {
+      const uint vertex = b.scene.indices[instance.firstIndex + primitive * 3u + k] + instance.vertexOffset;
+      const float *p = b.scene.vertices.data() + static_cast<std::size_t>(vertex) * kVertexFloats;
+      triangle[k] = applyRows(instance.objectToWorld0, instance.objectToWorld1, instance.objectToWorld2,
+                              float3(p[0], p[1], p[2]));
+    }
+  };
+  auto oracleDistance = [&](int r, uint i, uint primitive) {
+    float3 triangle[3];
+    worldTriangle(i, primitive, triangle);
+    double distance = std::numeric_limits<double>::infinity();
+    oracleTriangle(origins[r], directions[r], triangle, std::numeric_limits<double>::infinity(), distance);
+    return distance;
+  };
+  int differ = 0, explainedEdges = 0, explainedRounding = 0, explainedTies = 0, hits = 0, occlusionDiffer = 0;
   for (int r = 0; r < rays; ++r) {
     hits += own[r].found != 0u ? 1 : 0;
     const bool sameFound = own[r].found == theirs[r].found;
@@ -1662,7 +1636,15 @@ PT_TEST(embree_matches_the_own_bvh) {
     const bool rounding = sameIdentity && own[r].found != 0u && difference <= roundingTolerance;
     const bool edge = sameFound && own[r].found != 0u && !sameIdentity &&
                       (nearEdge(own[r]) || nearEdge(theirs[r]));
-    const bool explained = sameFound && (own[r].found == 0u || rounding || edge);
+    // Two triangles the ray meets at the same point (crossing surfaces): the exact distances
+    // agree, so neither is nearer and either answer is right.
+    bool tie = false;
+    if (sameFound && own[r].found != 0u && !sameIdentity && !edge) {
+      const double a = oracleDistance(r, own[r].instance, own[r].primitive);
+      const double c = oracleDistance(r, theirs[r].instance, theirs[r].primitive);
+      tie = std::isfinite(a) && std::isfinite(c) && std::abs(a - c) <= 1e-6 * std::max(a, c);
+    }
+    const bool explained = sameFound && (own[r].found == 0u || rounding || edge || tie);
     if (!explained) {
       if (differ < 10) {
         double oracle = static_cast<double>(kPtInfinity), oracleU = 0.0, oracleV = 0.0;
@@ -1675,12 +1657,7 @@ PT_TEST(embree_matches_the_own_bvh) {
                 hashFloat(pcgHash(i * 0x9E3779B9u + primitive)) >= 0.5f)
               continue;
             float3 triangle[3];
-            for (uint k = 0; k < 3; ++k) {
-              const uint vertex = b.scene.indices[instance.firstIndex + primitive * 3u + k] + instance.vertexOffset;
-              const float *p = b.scene.vertices.data() + static_cast<std::size_t>(vertex) * kVertexFloats;
-              triangle[k] = applyRows(instance.objectToWorld0, instance.objectToWorld1, instance.objectToWorld2,
-                                      float3(p[0], p[1], p[2]));
-            }
+            worldTriangle(i, primitive, triangle);
             double candidate = 0.0;
             double candidateU = 0.0, candidateV = 0.0;
             if (oracleTriangle(origins[r], directions[r], triangle, oracle, candidate, &candidateU, &candidateV)) {
@@ -1704,12 +1681,13 @@ PT_TEST(embree_matches_the_own_bvh) {
       ++differ;
     }
     else if (edge) ++explainedEdges;
+    else if (tie) ++explainedTies;
     else if (difference > std::max(2e-7f, 1e-4f * own[r].t)) ++explainedRounding;
     if (ownBlocked[r].found != embreeBlocked[r].found) ++occlusionDiffer;
   }
   std::printf("  one million rays: own BVH %.2f M/s, Embree %.2f M/s, "
-              "%d edge cases, %d same-triangle rounding cases\n",
-              ownRate * 1e-6, embreeRate * 1e-6, explainedEdges, explainedRounding);
+              "%d edge cases, %d crossing-surface ties, %d same-triangle rounding cases\n",
+              ownRate * 1e-6, embreeRate * 1e-6, explainedEdges, explainedTies, explainedRounding);
   if (hits < rays / 4) return format("only %g rays hit", hits);
   if (differ != 0) return format("%g of %g nearest rays disagree with Embree", differ, rays);
   if (occlusionDiffer != 0) return format("Embree's occlusion disagrees on %g rays", occlusionDiffer);
@@ -1878,7 +1856,7 @@ double sphereIntegral(float3 view, float etap, uint n, const std::function<doubl
 // 1 / etap^2, so transmitted directions are weighted back by etap^2.
 double layeredAlbedo(const PtSurface &surface, float3 view, uint n) {
   static const std::vector<float> table = buildSpecularAlbedoTable();
-  const PtBsdf bsdf = ptMakeBsdf(surface, view, table.data());
+  const PtBsdf bsdf = ptMakeBsdf(surface, view, table);
   const double transmittedWeight = static_cast<double>(bsdf.transmission.y) * bsdf.transmission.y;
   return sphereIntegral(view, bsdf.transmission.y, n, [&](float3 light) {
     float pdf = 0.0f;
@@ -1914,7 +1892,7 @@ PT_TEST(v7_fresnel_ior_and_total_internal_reflection) {
   static const std::vector<float> table = buildSpecularAlbedoTable();
   for (const float ior : {1.33f, 1.5f, 2.0f}) {
     const PtBsdf bsdf = ptMakeBsdf(layeredSurface(float3(1.0f), 0.0f, 0.5f, 1.0f, ior, false, true), viewAt(0.0f),
-                                   table.data());
+                                   table);
     const double expected = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
     const double normal = ptFresnelInterface(bsdf.f0, 1.0f, bsdf.transmission.y).x;
     if (std::abs(normal - expected) > 0.005 * expected)
@@ -1922,7 +1900,7 @@ PT_TEST(v7_fresnel_ior_and_total_internal_reflection) {
   }
   // From inside glass at 60 degrees (critical angle 41.8): no transmission, all reflected.
   const PtSurface inside = layeredSurface(float3(1.0f), 0.0f, kMinRoughness, 1.0f, 1.5f, false, false);
-  const PtBsdf bsdf = ptMakeBsdf(inside, viewAt(60.0f), table.data());
+  const PtBsdf bsdf = ptMakeBsdf(inside, viewAt(60.0f), table);
   auto value = [&](float3 light) {
     float pdf = 0.0f;
     return static_cast<double>(ptLuminance(ptBsdfEvaluate(bsdf, inside.geometricNormal, light, pdf)));
@@ -1945,18 +1923,18 @@ PT_TEST(v7_refraction_eta_transitions) {
     // Enter a closed slab through its top face, leave through the parallel bottom face.
     const float3 incoming = -viewAt(degrees);
     const PtBsdf top = ptMakeBsdf(layeredSurface(float3(1.0f), 0.0f, 0.5f, 1.0f, 1.5f, false, true), -incoming,
-                                  table.data());
+                                  table);
     const float3 inside = ptTransmittedDirection(top, normal);
     if (inside.z >= 0.0f) return format("entering at %g degrees did not refract downwards", degrees);
     // The bottom face, seen from inside: its shading normal faces the ray (up), leaving glass.
     const PtBsdf bottom = ptMakeBsdf(layeredSurface(float3(1.0f), 0.0f, 0.5f, 1.0f, 1.5f, false, false), -inside,
-                                     table.data());
+                                     table);
     const float3 outgoing = ptTransmittedDirection(bottom, normal);
     const double error = std::acos(std::min(1.0f, dot(outgoing, incoming)));
     if (!(error < 1e-4)) return format("slab at %g degrees: exit direction off by %g rad", degrees, error);
     // A thin-walled sheet transmits a smooth micro-normal's ray straight on.
     const PtBsdf sheet = ptMakeBsdf(layeredSurface(float3(1.0f), 0.0f, 0.5f, 1.0f, 1.5f, true, true), -incoming,
-                                    table.data());
+                                    table);
     const float3 straight = ptTransmittedDirection(sheet, normal);
     const double bend = std::acos(std::min(1.0f, dot(straight, incoming)));
     if (!(bend < 1e-4)) return format("thin-walled sheet at %g degrees bent the ray by %g rad", degrees, bend);
@@ -1985,7 +1963,7 @@ PT_TEST(v7_bsdf_sampling_matches_pdf) {
   };
   constexpr uint rows = 24u, columns = 48u, samples = 1u << 20;
   for (const Case &c : cases) {
-    const PtBsdf bsdf = ptMakeBsdf(c.surface, viewAt(c.degrees), table.data());
+    const PtBsdf bsdf = ptMakeBsdf(c.surface, viewAt(c.degrees), table);
     auto binOf = [&](float3 d) {
       const uint row = std::min(rows - 1u, static_cast<uint>((d.z + 1.0f) * 0.5f * rows));
       float phi = std::atan2(d.y, d.x);
@@ -2049,7 +2027,7 @@ PT_TEST(v7_bsdf_sampling_matches_pdf) {
   return {};
 }
 
-// The V6 evaluator and sampler as they stood before V7 (shaders/pt/bsdf.h with the unclamped
+// The V6 evaluator and sampler as they stood before V7 (pt_bsdf.slang with the unclamped
 // ptDistributionGGX), the frozen reference for "clearcoat factor 0 is bitwise-identical to V6".
 float3 v6BsdfEvaluate(const PtBsdf &bsdf, float3 geometricNormal, float3 light, float &pdf) {
   pdf = 0.0f;
@@ -2089,7 +2067,7 @@ PT_TEST(v7_without_layers_is_bitwise_v6_and_coat_matches_integration) {
     const PtSurface surface = layeredSurface(base, uniform(random), std::max(kMinRoughness, uniform(random)), 0.0f,
                                              1.5f, true, true);
     const float3 view = normalize(float3(uniform(random) - 0.5f, uniform(random) - 0.5f, uniform(random) + 0.05f));
-    const PtBsdf bsdf = ptMakeBsdf(surface, view, table.data());
+    const PtBsdf bsdf = ptMakeBsdf(surface, view, table);
     if (bsdf.f0.x != mix(float3(0.04f), base, surface.metallic).x) return "F0 at IOR 1.5 differs from V6";
     const float3 xi(uniform(random), uniform(random), uniform(random));
     const float3 sampled = ptBsdfSampleDirection(bsdf, xi), reference = v6BsdfSampleDirection(bsdf, xi);
@@ -2259,7 +2237,6 @@ struct RestirReceiver {
   Builder b;
   PtSurface surface;
   PtBsdf bsdf;
-  PtRestirLights lightInfo;
   explicit RestirReceiver(uint pointLights, bool environment) {
     b.material(float3(0.6f, 0.5f, 0.4f), 0.0f, 0.8f);
     if (environment) b.environment([](float3 d) { return float3(1.0f + 0.5f * d.y, 1.0f, 1.0f - 0.25f * d.x); }, 64, 32);
@@ -2277,25 +2254,17 @@ struct RestirReceiver {
       b.frame.uniforms.distribution = float4(0.0f);
     }
     surface = flatSurface(float3(0.0f, 0.0f, 1.0f), float3(0.6f, 0.5f, 0.4f), 0.0f, 0.8f);
-    bsdf = ptMakeBsdf(surface, float3(0.0f, 0.0f, 1.0f), b.scene.specularAlbedo.data());
-    const PathUniforms &u = b.frame.uniforms;
-    lightInfo = ptRestirLights(u.environment, u.distribution, u.sunDirection, u.sunRadiance, u.path, u.counts, u.emissive);
+    bsdf = ptMakeBsdf(surface, float3(0.0f, 0.0f, 1.0f), b.scene.specularAlbedo);
   }
   // f L G W for the initial reservoir of seed `seed` with M candidates, before visibility.
   float3 estimate(uint seed, uint candidates) const {
-    const Light *lights = b.frame.lights.data();
-    const float *environmentDistribution = b.scene.distribution.data();
-    const PtEmissiveTriangle *emissiveTriangles = b.scene.emissiveTriangles.data();
-    const TraceInstance *traceInstances = b.scene.instances.data();
-    const Material *materials = b.frame.materials.data();
-    const HostTextures &maps = b.scene.textures;
-    const HostEnvironment &environmentMap = b.scene.environment;
-    const PtReservoir r = ptRestirInitial(PT_RESTIR_LIGHT_ARGS, lightInfo, bsdf, surface.position, surface.geometricNormal,
-                                          float2(-1.0f, 0.0f), seed, candidates);
+    const FrameView view(b.scene, b.frame);
+    const PtReservoir r = ptRestirInitial(view, bsdf, surface.position, surface.geometricNormal, float2(-1.0f, 0.0f), seed,
+                                          candidates);
     if (r.light == kPtRestirNoLight) return float3(0.0f);
     float3 direction(0.0f);
     float reach = 0.0f, sourcePdf = 0.0f, solidAnglePdf = 0.0f, bsdfPdf = 0.0f;
-    return ptRestirIntegrand(PT_RESTIR_LIGHT_ARGS, lightInfo, bsdf, surface.position, surface.geometricNormal, r.light,
+    return ptRestirIntegrand(view, bsdf, surface.position, surface.geometricNormal, r.light,
                              float2(r.paramX, r.paramY), float2(-1.0f, 0.0f), direction, reach, sourcePdf,
                              solidAnglePdf, bsdfPdf) *
            r.weight;
@@ -2568,6 +2537,38 @@ PT_TEST(emissive_binary_searches_match_linear_scans) {
     if (!(built[i - 1].identity.x < built[i].identity.x ||
           (built[i - 1].identity.x == built[i].identity.x && built[i - 1].identity.y < built[i].identity.y)))
       return "the emitter list is not in strictly increasing (instance, primitive) order";
+  return {};
+}
+
+// The environment CDF search returns the largest i in [0, size - 2] with cdf[i] <= value, as a
+// linear walk does: over many sizes, flat runs (zero-probability cells) and values that equal CDF
+// entries.
+PT_TEST(environment_cdf_search_matches_linear_scan) {
+  uint state = 777u;
+  for (uint size = 2u; size < 1500u; size += (size < 80u ? 1u : 37u)) {
+    std::vector<float> data(3u + size, -1.0f);  // an offset of 3, as the CDFs sit inside one buffer
+    float running = 0.0f;
+    for (uint i = 0; i < size; ++i) {
+      data[3u + i] = running;
+      state = pcgHash(state);
+      if (state % 5u != 0u) running += static_cast<float>(state % 100u + 1u);
+    }
+    const float total = std::max(data[3u + size - 1u], 1.0f);
+    for (uint i = 0; i < size; ++i) data[3u + i] /= total;
+    data[3u + size - 1u] = 1.0f;
+    std::vector<float> values{0.0f, 0.9999999f};
+    for (uint i = 0; i < size; ++i) values.push_back(data[3u + i]);
+    for (uint i = 0; i < 64u; ++i) values.push_back(hashFloat(pcgHash(state + i)));
+    for (const float value : values) {
+      if (value >= 1.0f) continue;
+      uint linear = 0u;
+      while (linear + 2u < size && data[3u + linear + 1u] <= value) ++linear;
+      const uint searched = ptFindInterval(data, 3u, size, value);
+      if (searched != linear)
+        return "size " + std::to_string(size) + format(", value %.9g", value) + ": search " + std::to_string(searched) +
+               ", linear " + std::to_string(linear);
+    }
+  }
   return {};
 }
 

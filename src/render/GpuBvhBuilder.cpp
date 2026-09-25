@@ -12,14 +12,6 @@
 #include <cstring>
 #include <stdexcept>
 
-#define device
-#define thread
-namespace pt {
-#include "pt/bvh_build.h"
-}
-#undef device
-#undef thread
-
 namespace basalt {
 namespace {
 
@@ -118,15 +110,15 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "path.gpu-bvh.status");
   pt::BvhBuildControl control{};
   control.sizes = {instanceCount, triangleOffset, scratchRecords, nodeCapacity};
-  control.geometry = {scene.indexCount, scene.vertexCount, PT_BVH_STACK, pt::kBvhBuildLayoutVersion};
+  control.geometry = {scene.indexCount, scene.vertexCount, pt::kBvhStack, pt::kBvhBuildLayoutVersion};
   Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control),
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "path.gpu-bvh.control");
 
   Program program(context, "bvh_build");
   Pipeline pipeline(context, program, "GPU LBVH build");
   DescriptorPool pool(context, 1);
-  const VkDescriptorSet set = pool.allocate(program.setLayouts[0]);
-  DescriptorWriter(context, program.compute(), set)
+  const VkDescriptorSet set = program.allocate(pool);
+  DescriptorWriter(context, program, set)
       .buffer("descriptors", descriptorBuffer)
       .buffer("instances", instanceBuffer)
       .buffer("indices", scene.indexBuffer)
@@ -141,7 +133,7 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
       .apply();
   uploader.runImmediate([&](VkCommandBuffer command) {
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    program.bind(command, set);
     vkCmdDispatch(command, 1, 1, 1);
     computeBarrier(command);
   });
@@ -218,16 +210,16 @@ pt::LayoutCost gpuBvhSahCost(const Context &context, Uploader &uploader, const B
   Program program(context, wide ? "bvh_wide_cost" : "bvh_cost");
   Pipeline pipeline(context, program, wide ? "BVH wide SAH cost" : "BVH SAH cost");
   DescriptorPool pool(context, 1);
-  const VkDescriptorSet set = pool.allocate(program.setLayouts[0]);
-  DescriptorWriter(context, program.compute(), set)
-      .buffer("nodes", nodes)
+  const VkDescriptorSet set = program.allocate(pool);
+  DescriptorWriter(context, program, set)
+      .buffer(wide ? "wideNodes" : "nodes", nodes)
       .buffer("trees", treeBuffer)
       .buffer("contributions", contributions)
       .buffer("control", controlBuffer)
       .apply();
   uploader.runImmediate([&](VkCommandBuffer command) {
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    program.bind(command, set);
     vkCmdDispatch(command, (nodeCount + 63u) / 64u, 1, 1);
     computeBarrier(command);
   });

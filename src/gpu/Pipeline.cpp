@@ -17,12 +17,12 @@ Pipeline::Pipeline(const Context &ctx, const GraphicsPipelineDescription &descri
   if (!description.depthOnly)
     stages.push_back(program.fragment().stageInfo(description.fragmentSpecialization));
 
-  // Attributes from the reflection, packed in location order into the bindings.
+  // Attributes from the reflection.
   std::vector<VkVertexInputAttributeDescription> attributes;
   std::vector<VkVertexInputBindingDescription> bindings;
   if (!description.bindings.empty() && !description.attributes.empty()) {
     // An explicit layout must place every attribute the entry declares.
-    for (const VertexInput &input : program.vertex().vertexInputs) {
+    for (const VertexInput &input : program.vertex().reflection.vertexInputs) {
       const auto found = std::find_if(description.attributes.begin(), description.attributes.end(),
                                       [&](const VertexAttributeLayout &candidate) {
                                         return candidate.location == input.location;
@@ -37,8 +37,9 @@ Pipeline::Pipeline(const Context &ctx, const GraphicsPipelineDescription &descri
     for (const VertexBinding &binding : description.bindings)
       bindings.push_back({binding.binding, binding.stride, binding.rate});
   } else if (!description.bindings.empty()) {
+    // No explicit layout: packed in location order, each into the first binding with room.
     std::vector<std::uint32_t> offsets(description.bindings.size(), 0);
-    for (const VertexInput &input : program.vertex().vertexInputs) {
+    for (const VertexInput &input : program.vertex().reflection.vertexInputs) {
       std::size_t target = 0;
       for (std::size_t i = 0; i < description.bindings.size(); ++i) {
         if (offsets[i] + input.byteSize() <= description.bindings[i].stride) {
@@ -79,6 +80,8 @@ Pipeline::Pipeline(const Context &ctx, const GraphicsPipelineDescription &descri
   raster.frontFace = description.frontFace;
   raster.lineWidth = 1.0f;
   raster.depthBiasEnable = description.depthBias ? VK_TRUE : VK_FALSE;
+  // Only the shadow pass biases depth; it also clamps, so casters in front of a cascade's near
+  // plane still write depth.
   raster.depthClampEnable = description.depthBias ? VK_TRUE : VK_FALSE;
 
   VkPipelineMultisampleStateCreateInfo multisample{
@@ -104,14 +107,6 @@ Pipeline::Pipeline(const Context &ctx, const GraphicsPipelineDescription &descri
       state.colorBlendOp = VK_BLEND_OP_ADD;
       state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
       state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-      state.alphaBlendOp = VK_BLEND_OP_ADD;
-    } else if (description.additive) {
-      state.blendEnable = VK_TRUE;
-      state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-      state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-      state.colorBlendOp = VK_BLEND_OP_ADD;
-      state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-      state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
       state.alphaBlendOp = VK_BLEND_OP_ADD;
     }
     blendStates.push_back(state);

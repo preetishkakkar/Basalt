@@ -21,9 +21,10 @@ public:
   EmbreeScene(const EmbreeScene &) = delete;
   EmbreeScene &operator=(const EmbreeScene &) = delete;
 
-  // As ptTraceBvh: the closest hit, or with anyHit whether anything solid is in the way.
-  PtHit trace(const CpuScene &scene, const CpuFrame &frame, float3 origin, float3 direction, float tMax, uint mask,
-              uint seed, float2 cone, uint anyHit) const;
+  // As ptTraceBvh: the closest hit, or with anyHit whether anything solid is in the way. The
+  // alpha test reads view's instances, materials, geometry and textures.
+  PtHit trace(const TraceView &view, float3 origin, float3 direction, float tMax, uint mask, uint seed, float2 cone,
+              uint anyHit) const;
   double buildMilliseconds = 0.0;
 
 private:

@@ -1,3 +1,0 @@
-#define BASALT_RAY_PIPELINE 1
-#define PATH_WAVEFRONT_INTERSECT path_wavefront_intersect_pipeline
-#include "path_wavefront_intersect_body.metal"

@@ -16,7 +16,7 @@ void barrier(VkCommandBuffer command) {
 void dispatch(VkCommandBuffer command, const Program &p, const Pipeline &pipeline, VkDescriptorSet set,
               std::uint32_t width, std::uint32_t height) {
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
+  p.bind(command, set);
   vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
 }
 }
@@ -34,26 +34,31 @@ PathReconstruction::PathReconstruction(Context &ctx, std::uint32_t w, std::uint3
   auto buffer = [&](VkDeviceSize bytes, const char *name) { return Buffer(ctx, bytes, usage, VMA_MEMORY_USAGE_AUTO, 0, name); };
   sampleBuffer = buffer(pixels * sizeof(pt::PtReconstructionSample), "path.samples");
   previousSamples = buffer(sampleBuffer.size, "path.previous.samples");
-  previousHistory = buffer(pixels * sizeof(pt::PtTemporalHistory), "path.history");
-  temporalBuffer = buffer(previousHistory.size, "path.temporal");
-  scratchBuffer = buffer(previousHistory.size, "path.scratch");
-  filteredBuffer = buffer(previousHistory.size, "path.filtered");
+  histories[0] = buffer(pixels * sizeof(pt::PtTemporalHistory), "path.history.0");
+  histories[1] = buffer(histories[0].size, "path.history.1");
+  scratchBuffer = buffer(histories[0].size, "path.scratch");
+  filteredBuffer = buffer(histories[0].size, "path.filtered");
   for (auto &f : frames) {
-    for (auto &u : f.uniforms) u = Buffer(ctx, sizeof(pt::PtTemporalUniforms), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    for (auto &u : f.uniforms) u = Buffer(ctx, sizeof(pt::PtTemporalUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
         VMA_ALLOCATION_CREATE_MAPPED_BIT, "path.reconstruction.uniforms");
-    f.temporal = pool.allocate(temporalProgram.setLayouts[0]);
-    DescriptorWriter(ctx, temporalProgram.compute(), f.temporal).buffer("uniforms", f.uniforms[0])
-        .buffer("samples", sampleBuffer).buffer("previousSamples", previousSamples)
-        .buffer("previous", previousHistory).buffer("output", temporalBuffer).apply();
-    const Buffer *inputs[] = {&temporalBuffer, &scratchBuffer, &filteredBuffer};
-    const Buffer *outputs[] = {&scratchBuffer, &filteredBuffer, &scratchBuffer};
-    for (std::uint32_t i = 0; i < 3; ++i) {
-      f.atrous[i] = pool.allocate(atrousProgram.setLayouts[0]);
-      DescriptorWriter(ctx, atrousProgram.compute(), f.atrous[i]).buffer("uniforms", f.uniforms[i + 1])
-          .buffer("samples", sampleBuffer).buffer("input", *inputs[i]).buffer("output", *outputs[i]).apply();
+    for (std::uint32_t parity = 0; parity < 2; ++parity) {
+      const Buffer &previous = histories[parity], &current = histories[1 - parity];
+      f.temporal[parity] = temporalProgram.allocate(pool);
+      DescriptorWriter(ctx, temporalProgram, f.temporal[parity]).buffer("uniforms", f.uniforms[0])
+          .buffer("samples", sampleBuffer).buffer("previousSamples", previousSamples)
+          .buffer("previous", previous).buffer("history", current).apply();
+      // The a-trous chain: the new history, scratch, then the old history (no longer read once
+      // the temporal pass has run), and the last pass into the filtered result.
+      const Buffer *inputs[] = {&current, &scratchBuffer, &previous};
+      const Buffer *outputs[] = {&scratchBuffer, &previous, &filteredBuffer};
+      for (std::uint32_t i = 0; i < 3; ++i) {
+        f.atrous[parity][i] = atrousProgram.allocate(pool);
+        DescriptorWriter(ctx, atrousProgram, f.atrous[parity][i]).buffer("uniforms", f.uniforms[i + 1])
+            .buffer("samples", sampleBuffer).buffer("input", *inputs[i]).buffer("history", *outputs[i]).apply();
+      }
     }
-    f.composite = pool.allocate(compositeProgram.setLayouts[0]);
+    f.composite = compositeProgram.allocate(pool);
   }
   VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
   q.queryType = VK_QUERY_TYPE_TIMESTAMP; q.queryCount = kFramesInFlight * 2;
@@ -131,21 +136,19 @@ bool PathReconstruction::record(VkCommandBuffer command, std::uint32_t slot, Ima
   }
   barrier(command);
   if (fresh) {
-    dispatch(command, temporalProgram, temporalPipeline, f.temporal, width, height);
+    const std::uint32_t parity = static_cast<std::uint32_t>(updateCount & 1u);
+    dispatch(command, temporalProgram, temporalPipeline, f.temporal[parity], width, height);
     for (std::uint32_t i = 0; i < 3; ++i) {
       barrier(command);
-      dispatch(command, atrousProgram, atrousPipeline, f.atrous[i], width, height);
+      dispatch(command, atrousProgram, atrousPipeline, f.atrous[parity][i], width, height);
     }
     barrier(command);
-    VkBufferCopy copy{0, 0, sampleBuffer.size};
+    const VkBufferCopy copy{0, 0, sampleBuffer.size};
     vkCmdCopyBuffer(command, sampleBuffer.handle, previousSamples.handle, 1, &copy);
-    copy.size = temporalBuffer.size;
-    vkCmdCopyBuffer(command, temporalBuffer.handle, previousHistory.handle, 1, &copy);
-    vkCmdCopyBuffer(command, scratchBuffer.handle, filteredBuffer.handle, 1, &copy);
     previousCamera = camera; previousKey = key; valid = true; ++updateCount;
     barrier(command);
   }
-  DescriptorWriter(context, compositeProgram.compute(), f.composite).buffer("uniforms", f.uniforms[0])
+  DescriptorWriter(context, compositeProgram, f.composite).buffer("uniforms", f.uniforms[0])
       .buffer("filtered", filteredBuffer).storageTexture("output", lit.view).apply();
   transitionImage(command, lit, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
       VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -159,7 +162,7 @@ bool PathReconstruction::record(VkCommandBuffer command, std::uint32_t slot, Ima
 }
 
 std::uint64_t PathReconstruction::bytes() const {
-  std::uint64_t total = sampleBuffer.size + previousSamples.size + previousHistory.size + temporalBuffer.size +
+  std::uint64_t total = sampleBuffer.size + previousSamples.size + histories[0].size + histories[1].size +
                         scratchBuffer.size + filteredBuffer.size;
   for (const auto &f : frames) { total += f.staging.size; for (const auto &u : f.uniforms) total += u.size; }
   return total;

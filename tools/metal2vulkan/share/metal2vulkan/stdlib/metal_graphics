@@ -1,3 +1,0 @@
-#pragma once
-#include "msl_graphics.h"
-#include "msl_rate_map.h"

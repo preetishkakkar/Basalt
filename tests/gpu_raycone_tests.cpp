@@ -1,4 +1,4 @@
-// The ray-cone level-of-detail functions of shaders/pt/raycone.h are
+// The ray-cone level-of-detail functions of pt_raycone.slang are
 // bitwise identical on the CPU and the GPU over a fixed corpus of 10,000 hits.
 #include "core/Log.h"
 #include "platform/Window.h"
@@ -99,12 +99,12 @@ int run() {
     Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                                  "raycone.control");
     DescriptorPool pool(context, 1u);
-    const VkDescriptorSet set = pool.allocate(program.setLayouts[0]);
-    DescriptorWriter(context, program.compute(), set)
+    const VkDescriptorSet set = program.allocate(pool);
+    DescriptorWriter(context, program, set)
         .buffer("cases", caseBuffer).buffer("results", resultBuffer).buffer("control", controlBuffer).apply();
     uploader.runImmediate([&](VkCommandBuffer cmd) {
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+      program.bind(cmd, set);
       vkCmdDispatch(cmd, static_cast<std::uint32_t>((cases.size() + 63) / 64), 1, 1);
     });
     const auto bytes = uploader.readBuffer(resultBuffer, resultBuffer.size);

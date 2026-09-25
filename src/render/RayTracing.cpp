@@ -43,7 +43,8 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene, c
   const VkDeviceAddress indexAddress = scene.indexBuffer.deviceAddress();
   const VkDeviceSize scratchAlignment = std::max<VkDeviceSize>(ctx.scratchAlignment, 16);
 
-  // One BLAS per instance. Masked and blended ones are non-opaque, so queries run the candidate test.
+  // One BLAS per instance. Masked and blended ones are non-opaque, so queries run the candidate
+  // test; single-sided back faces are culled by the path tracers' rays (kPtRayFlags), below.
   struct Build {
     VkAccelerationStructureGeometryKHR geometry{};
     VkAccelerationStructureBuildRangeInfoKHR range{};
@@ -56,8 +57,7 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene, c
   for (std::size_t b = 0; b < trace.instances.size(); ++b) {
     const std::uint32_t i = trace.primitives[b];
     const Primitive &primitive = scene.primitives[i];
-    const bool opaque = (trace.instances[b].flags & (pt::kInstanceMasked | pt::kInstanceBlended)) == 0 &&
-                        (trace.instances[b].flags & pt::kInstanceDoubleSided) != 0;
+    const bool opaque = (trace.instances[b].flags & (pt::kInstanceMasked | pt::kInstanceBlended)) == 0;
 
     Build build;
     build.primitive = i;
@@ -150,7 +150,11 @@ void SceneAccelerationStructure::build(Uploader &uploader, const Scene &scene, c
     }
     instance.instanceCustomIndex = builds[b].primitive;
     instance.mask = trace.instances[b].mask;
-    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    // A path tracer's ray skips a single-sided instance's back faces, as ptCandidateSolid would. A
+    // blended instance keeps both: its back faces still mark the hit ambiguous. Rays that set no
+    // cull flag (the rasteriser's) see every face either way.
+    if ((trace.instances[b].flags & (pt::kInstanceDoubleSided | pt::kInstanceBlended)) != 0)
+      instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
     addressInfo.accelerationStructure = bottomLevels[b];

@@ -1,4 +1,4 @@
-// The environment: sky cube and prefiltered chain baked by ibl.metal, irradiance as SH coefficients projected on the host.
+// The environment: sky cube and prefiltered chain baked by ibl.slang, irradiance as SH coefficients projected on the host.
 #pragma once
 #include "core/Math.h"
 #include "gpu/Descriptors.h"
@@ -31,7 +31,7 @@ public:
   const std::string &name() const { return sourceName; }
   bool procedural() const { return isProcedural; }
   // What the path tracer reads: the equirect it shades escaped rays with, and that image's
-  // luminance distribution (shaders/pt/lights.h) with its (columns, rows, integral, present).
+  // luminance distribution (pt_lights.slang) with its (columns, rows, integral, present).
   // The procedural sky's has no sun disc painted in: the tracer's analytic sun is the disc.
   Image &traceImage() { return isProcedural ? traceEquirectangular : equirectangular; }
   const std::vector<float> &traceDistribution() const { return distribution; }
@@ -70,7 +70,6 @@ private:
   Pipeline equirectPipeline, prefilterPipeline;
   std::unique_ptr<DescriptorPool> pool;
   std::vector<VkImageView> temporaryViews;
-  std::vector<Buffer> temporaryBuffers;
 
   std::string sourceName = "procedural sky";
   bool isProcedural = true;

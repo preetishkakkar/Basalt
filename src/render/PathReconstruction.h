@@ -13,7 +13,8 @@ public:
   PathReconstruction(Context &context, std::uint32_t width, std::uint32_t height);
   ~PathReconstruction();
   Buffer &samples() { return sampleBuffer; }
-  const Buffer &history() const { return previousHistory; }
+  // The latest temporal pass's output, which the next one reads as its history.
+  const Buffer &history() const { return histories[updateCount & 1u]; }
   const Buffer &filtered() const { return filteredBuffer; }
   void upload(VkCommandBuffer command, std::uint32_t slot, const std::vector<pt::PtReconstructionSample> &samples);
   bool record(VkCommandBuffer command, std::uint32_t slot, Image &lit, const pt::PathUniforms &camera,
@@ -31,12 +32,17 @@ private:
   Program temporalProgram, atrousProgram, compositeProgram;
   Pipeline temporalPipeline, atrousPipeline, compositePipeline;
   DescriptorPool pool;
-  Buffer sampleBuffer, previousSamples, previousHistory, temporalBuffer, scratchBuffer, filteredBuffer;
+  Buffer sampleBuffer, previousSamples, scratchBuffer, filteredBuffer;
+  // The temporal history alternates by update parity p (updateCount & 1): the temporal pass reads
+  // histories[p] and writes histories[1 - p], which the next update reads, so nothing is copied.
+  std::array<Buffer, 2> histories;
   struct Frame {
     std::array<Buffer, 4> uniforms;
     Buffer staging;
-    VkDescriptorSet temporal{}, composite{};
-    std::array<VkDescriptorSet, 3> atrous{};
+    VkDescriptorSet composite{};
+    // Per parity: the temporal pass and the three a-trous passes.
+    std::array<VkDescriptorSet, 2> temporal{};
+    std::array<std::array<VkDescriptorSet, 3>, 2> atrous{};
   };
   std::array<Frame, kFramesInFlight> frames;
   pt::PathUniforms previousCamera{};

@@ -6,14 +6,6 @@
 #include "pt/Tables.h"
 #include "render/GpuBvhBuilder.h"
 
-#define device
-#define thread
-namespace pt {
-#include "pt/animate.h"
-}
-#undef device
-#undef thread
-
 #include <algorithm>
 #include <chrono>
 #include <array>
@@ -27,8 +19,6 @@ namespace basalt {
 namespace {
 
 constexpr std::uint32_t kShadowResolution = 2048;
-constexpr std::uint32_t kCascadeCount = 4;
-constexpr std::uint32_t kHitTextureSlots = 120; // Matches kHitTextureSlots in shaders/common.metal.
 constexpr VkFormat kHdrFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 // Sixty-four pixel tiles by twenty-four depth slices. A cell holds at most this many
 // lights; past that they are dropped by index, not by nearness.
@@ -45,7 +35,7 @@ VkFrontFace frontFaceOf(const Mat4 &transform) {
   return determinant < 0.0f ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
 }
 
-// Mirrors FrameUniforms in shaders/common.metal.
+// Mirrors FrameUniforms in shaders/slang/basalt/basalt_common.slang.
 struct FrameUniforms {
   Mat4 viewProjection;
   Mat4 view;
@@ -65,7 +55,7 @@ struct FrameUniforms {
 };
 static_assert(sizeof(FrameUniforms) == 512, "the frame uniforms must match the shader");
 
-// Mirrors ClusterUniforms in shaders/cluster.metal.
+// Mirrors ClusterUniforms in shaders/slang/entries/cluster.slang.
 struct ClusterUniforms {
   Mat4 view;
   Vec4 grid;
@@ -74,7 +64,7 @@ struct ClusterUniforms {
 };
 static_assert(sizeof(ClusterUniforms) == 112, "the cluster uniforms must match the shader");
 
-// Mirrors PostUniforms in shaders/post.metal.
+// Mirrors PostUniforms in shaders/slang/entries/post.slang.
 struct PostUniforms {
   Vec4 parameters;
   Vec4 target;
@@ -82,13 +72,14 @@ struct PostUniforms {
   Vec4 antialias;
 };
 
-// Mirrors BloomUniforms in shaders/bloom.metal.
+// Mirrors BloomUniforms in shaders/slang/entries/bloom.slang: a dispatch's push constants.
 struct BloomUniforms {
   Vec4 parameters;
   Vec4 source;
 };
+static_assert(sizeof(BloomUniforms) == 32, "the bloom push constants must match the shader");
 
-// Mirrors ReflectionUniforms in shaders/reflect_body.metal.
+// Mirrors ReflectionUniforms in shaders/slang/entries/reflect.slang.
 struct ReflectionUniforms {
   Mat4 viewProjection;
   Mat4 inverseViewProjection;
@@ -104,7 +95,7 @@ struct ReflectionUniforms {
 };
 static_assert(sizeof(ReflectionUniforms) == 400, "the reflection uniforms must match the shader");
 
-// Mirrors TemporalUniforms in shaders/taa.metal.
+// Mirrors TemporalUniforms in shaders/slang/entries/taa.slang.
 struct TemporalUniforms {
   Mat4 inverseViewProjection;
   Mat4 viewProjection;
@@ -240,7 +231,6 @@ Renderer::Renderer(Context &ctx, Swapchain &chain, Uploader &up)
     : context(ctx), swapchain(chain), uploader(up) {
   depthFormat = ctx.selectFormat({VK_FORMAT_D32_SFLOAT, VK_FORMAT_D24_UNORM_S8_UINT},
                                  VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
-  cascadeStride = alignUp(4 * sizeof(Vec4), ctx.properties.limits.minStorageBufferOffsetAlignment);
 
   pool = std::make_unique<DescriptorPool>(ctx, 1024);
   // The traced pair binds the acceleration structure; a device without ray queries never loads it.
@@ -262,15 +252,14 @@ Renderer::Renderer(Context &ctx, Swapchain &chain, Uploader &up)
   pathTraceWideEmissiveProgram = std::make_unique<Program>(ctx, "path_trace_wide_emissive");
   pathCompareProgram = std::make_unique<Program>(ctx, "path_compare");
   pathGuideExportProgram = std::make_unique<Program>(ctx, "path_export_guides");
-  pathWaveShadeProgram = std::make_unique<Program>(ctx, "path_wavefront_shade");
+  waveSubgroupAllocationSupported =
+      deviceSupports(ctx, Shader(ctx, "path_wavefront_shade", VK_SHADER_STAGE_COMPUTE_BIT));
+  if (waveSubgroupAllocationSupported)
+    pathWaveShadeProgram = std::make_unique<Program>(ctx, "path_wavefront_shade");
   pathWaveShadeAtomicProgram = std::make_unique<Program>(ctx, "path_wavefront_shade_atomic");
   if (ctx.rayQuerySupported) pathWaveFusedRtProgram = std::make_unique<Program>(ctx, "path_wavefront_fused_rt");
   pathWaveFusedProgram = std::make_unique<Program>(ctx, "path_wavefront_fused");
   pathWaveFusedWideProgram = std::make_unique<Program>(ctx, "path_wavefront_fused_wide");
-  // The subgroup variant needs every property its reflection names, in compute.
-  waveSubgroupAllocationSupported = true;
-  for (const std::string &property : pathWaveShadeProgram->compute().reflection.requiredProperties)
-    if (!m2v::host::supportsProperty(ctx.physical, property)) waveSubgroupAllocationSupported = false;
   pathWaveResolveProgram = std::make_unique<Program>(ctx, "path_wavefront_resolve");
   pathWaveIntersectProgram = std::make_unique<Program>(ctx, "path_wavefront_intersect");
   pathWaveIntersectWideProgram = std::make_unique<Program>(ctx, "path_wavefront_intersect_wide");
@@ -391,6 +380,8 @@ void Renderer::createStaticResources() {
   shadowInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
   check(vkCreateSampler(context.device, &shadowInfo, nullptr, &shadowSampler), "vkCreateSampler");
 
+  pathSamplers = std::make_unique<GltfSamplers>(context);
+
   for (FrameResources &frame : frames) {
     const VmaAllocationCreateFlags hostFlags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                                VMA_ALLOCATION_CREATE_MAPPED_BIT;
@@ -410,12 +401,9 @@ void Renderer::createStaticResources() {
                                                 VMA_MEMORY_USAGE_AUTO, hostFlags, "hybrid.inverse-view-projection");
     frame.pathComparisonUniforms = Buffer(context, sizeof(std::uint32_t) * 4,
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO, hostFlags, "path.comparison.uniforms");
-    frame.cascadePacked = Buffer(context, kCascadeCount * 4 * sizeof(Vec4),
+    frame.cascadePacked = Buffer(context, pt::kCascadeCount * 4 * sizeof(Vec4),
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
                                  hostFlags, "cascades.packed");
-    frame.cascadeStrided = Buffer(context, kCascadeCount * cascadeStride,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
-                                  hostFlags, "cascades.strided");
   }
 }
 
@@ -462,9 +450,6 @@ void Renderer::createPipelines() {
 
   GraphicsPipelineDescription shadow;
   shadow.program = shadowProgram.get();
-  // The masked entry returns a colour because the bundled compiler has no fragment-void
-  // profile. A throwaway target keeps the depth-only pass validation-clean.
-  shadow.colorFormats = {kHdrFormat};
   shadow.depthFormat = depthFormat;
   shadow.bindings = geometryBinding;
   shadow.attributes = vertexLayout(true);
@@ -550,15 +535,13 @@ void Renderer::createPipelines() {
         {"path_pipeline_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
         {"path_pipeline_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
         {"path_pipeline_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
-    const std::vector<m2v::host::RayShaderGroup> groups{
+    const std::vector<RayShaderGroup> groups{
         {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0u},
         {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1u},
         {VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
          VK_SHADER_UNUSED_KHR, 2u, 3u, VK_SHADER_UNUSED_KHR}};
     pathRayPipeline = std::make_unique<RayPipeline>(
-        context, stages, groups, m2v::host::ShaderBindingRecord{0u, {}},
-        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
-        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+        context, stages, groups, ShaderBindingRecords{0u, {1u}, {2u}});
 
     const std::vector<RayStageDescription> intersectStages{
         {"path_wavefront_intersect_pipeline", VK_SHADER_STAGE_RAYGEN_BIT_KHR},
@@ -568,16 +551,17 @@ void Renderer::createPipelines() {
     const std::vector<RayStageDescription> shadowStages{
         {"path_wavefront_shadow_pipeline", VK_SHADER_STAGE_RAYGEN_BIT_KHR},
         {"path_wave_shadow_pipeline_miss", VK_SHADER_STAGE_MISS_BIT_KHR},
-        {"path_wave_shadow_pipeline_closest", VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
         {"path_wave_shadow_pipeline_alpha", VK_SHADER_STAGE_ANY_HIT_BIT_KHR}};
+    // Shadow rays run no closest-hit stage: the hit group is the alpha test alone.
+    const std::vector<RayShaderGroup> shadowGroups{
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0u},
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1u},
+        {VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, 2u,
+         VK_SHADER_UNUSED_KHR}};
     pathWaveIntersectRayPipeline = std::make_unique<RayPipeline>(
-        context, intersectStages, groups, m2v::host::ShaderBindingRecord{0u, {}},
-        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
-        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+        context, intersectStages, groups, ShaderBindingRecords{0u, {1u}, {2u}});
     pathWaveShadowRayPipeline = std::make_unique<RayPipeline>(
-        context, shadowStages, groups, m2v::host::ShaderBindingRecord{0u, {}},
-        std::vector<m2v::host::ShaderBindingRecord>{{1u, {}}},
-        std::vector<m2v::host::ShaderBindingRecord>{{2u, {}}});
+        context, shadowStages, shadowGroups, ShaderBindingRecords{0u, {1u}, {2u}});
   } catch (const std::exception &failure) {
     // The other renderers stay usable; this one reports itself unavailable.
     logError("the full ray pipeline renderer is unavailable: {}", failure.what());
@@ -683,17 +667,12 @@ void Renderer::createTargets(std::uint32_t newWidth, std::uint32_t newHeight) {
     shadowDescription.format = depthFormat;
     shadowDescription.width = kShadowResolution;
     shadowDescription.height = kShadowResolution;
-    shadowDescription.arrayLayers = kCascadeCount;
+    shadowDescription.arrayLayers = pt::kCascadeCount;
     shadowDescription.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     shadowDescription.name = "shadow.cascades";
     shadowMap = Image(context, shadowDescription);
-    shadowDescription.format = kHdrFormat;
-    shadowDescription.arrayLayers = 1;
-    shadowDescription.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    shadowDescription.name = "shadow.dummy-color";
-    shadowDummyColor = Image(context, shadowDescription);
   }
-  for (std::uint32_t layer = 0; layer < kCascadeCount; ++layer)
+  for (std::uint32_t layer = 0; layer < pt::kCascadeCount; ++layer)
     shadowLayerViews[layer] = shadowMap.createView(0, 1, layer, 1, VK_IMAGE_VIEW_TYPE_2D);
 
   // Half resolution, halving until a level would be under one compute group.
@@ -851,8 +830,8 @@ void Renderer::buildLights() {
 void Renderer::buildHitTextureTable(Scene &scene, std::vector<VkImageView> &views,
                                     std::vector<std::uint32_t> &slots, std::vector<Image *> &images) {
   // Slot zero is white for missing maps; a scene with more textures than slots shades the rest white and says so.
-  views.assign(kHitTextureSlots, whiteTexture.view);
-  images.assign(kHitTextureSlots, &whiteTexture);
+  views.assign(pt::kHitTextureSlots, whiteTexture.view);
+  images.assign(pt::kHitTextureSlots, &whiteTexture);
   // Slot one is the flat normal; white would tilt every hit.
   views[1] = normalTexture.view;
   images[1] = &normalTexture;
@@ -864,7 +843,7 @@ void Renderer::buildHitTextureTable(Scene &scene, std::vector<VkImageView> &view
     if (texture < 0 || static_cast<std::size_t>(texture) >= scene.textures.size()) return 0;
     const auto found = slotOf.find(texture);
     if (found != slotOf.end()) return found->second;
-    if (nextSlot >= kHitTextureSlots) {
+    if (nextSlot >= pt::kHitTextureSlots) {
       overflowed = true;
       return 0;
     }
@@ -892,7 +871,7 @@ void Renderer::buildHitTextureTable(Scene &scene, std::vector<VkImageView> &view
   }
   if (overflowed)
     logWarning("more than {} textures reachable by rays: some reflections and traced cut-outs use white",
-               kHitTextureSlots - 2);
+               pt::kHitTextureSlots - 2);
 }
 
 void Renderer::applyGroundMaterial() {
@@ -940,129 +919,117 @@ void Renderer::rebuildSceneResources() {
     return defaultSampler;
   };
 
+  // Scene-lifetime sets: what the draws of every frame share.
+  shadowSceneSet = shadowProgram->allocate(*pool, "scene");
+  DescriptorWriter(context, *shadowProgram, shadowSceneSet, "scene")
+      .buffer("instances", instanceBuffer)
+      .buffer("materials", materialBuffer)
+      .apply();
   shadowMaterialSets.assign(materialCount, VK_NULL_HANDLE);
+  forwardMaterialSets.assign(materialCount, VK_NULL_HANDLE);
   for (std::size_t m = 0; m < materialCount; ++m) {
     const Material &material = activeScene->materials[std::min(m, activeScene->materials.size() - 1)];
-    shadowMaterialSets[m] = pool->allocate(shadowProgram->setLayouts[1]);
-    DescriptorWriter(context, shadowProgram->fragment(), shadowMaterialSets[m])
-        .buffer("materials", materialBuffer)
+    shadowMaterialSets[m] = shadowProgram->allocate(*pool, "material");
+    DescriptorWriter(context, *shadowProgram, shadowMaterialSets[m], "material")
         .texture("baseColorMap", textureOr(material.baseColor, whiteTexture))
         .sampler("materialSampler", samplerOr(material.sampler))
         .apply();
+    forwardMaterialSets[m] = forwardProgram->allocate(*pool, "material");
+    DescriptorWriter(context, *forwardProgram, forwardMaterialSets[m], "material")
+        .texture("baseColorMap", textureOr(material.baseColor, whiteTexture))
+        .texture("metallicRoughnessMap", textureOr(material.metallicRoughness, whiteTexture))
+        .texture("normalMap", textureOr(material.normal, normalTexture))
+        .texture("occlusionMap", textureOr(material.occlusion, whiteTexture))
+        .texture("emissiveMap", textureOr(material.emissive, whiteTexture))
+        .sampler("materialSampler", samplerOr(material.sampler))
+        .apply();
   }
+  // The traced entries' scene: the acceleration structure and what an alpha test reads.
+  auto writeTraceScene = [&](const Program &program, VkDescriptorSet &set) {
+    set = VK_NULL_HANDLE;
+    if (!program.uses("trace")) return;
+    if (!acceleration) throw Error("the ray tracing entry " + program.describe() + " needs an acceleration structure");
+    set = program.allocate(*pool, "trace");
+    DescriptorWriter(context, program, set, "trace")
+        .accelerationStructure("scene", acceleration->topLevel)
+        .buffer("traceInstances", traceInstanceBuffer)
+        .buffer("materials", materialBuffer)
+        .buffer("indices", activeScene->indexBuffer)
+        .buffer("vertices", activeScene->vertexBuffer)
+        .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        .sampler("tableSampler", defaultSampler)
+        .apply();
+  };
+  writeTraceScene(*forwardProgram, forwardTraceSet);
+  writeTraceScene(*resolveProgram, resolveTraceSet);
 
   for (FrameResources &frame : frames) {
-    frame.forwardVertexSet = pool->allocate(forwardProgram->setLayouts[0]);
-    DescriptorWriter(context, forwardProgram->vertex(), frame.forwardVertexSet)
+    frame.forwardViewSet = forwardProgram->allocate(*pool, "view");
+    DescriptorWriter(context, *forwardProgram, frame.forwardViewSet, "view")
         .buffer("frame", frame.frameUniforms)
         .buffer("instances", instanceBuffer)
+        .buffer("materials", materialBuffer)
+        .buffer("cascadeRows", frame.cascadePacked)
+        .buffer("lights", lightBuffer)
+        .buffer("lightClusters", lightClusters)
+        .texture("shadowMap", shadowMap.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        .sampler("shadowSampler", shadowSampler)
         .apply();
 
-    for (std::uint32_t cascade = 0; cascade < kCascadeCount; ++cascade) {
-      frame.shadowVertexSets[cascade] = pool->allocate(shadowProgram->setLayouts[0]);
-      DescriptorWriter(context, shadowProgram->vertex(), frame.shadowVertexSets[cascade])
-          .buffer("instances", instanceBuffer)
-          .buffer("cascadeRows", frame.cascadeStrided, cascade * cascadeStride, 4 * sizeof(Vec4))
-          .apply();
-    }
-
-    frame.forwardMaterialSets.assign(materialCount, VK_NULL_HANDLE);
-    for (std::size_t m = 0; m < materialCount; ++m) {
-      const Material &material = activeScene->materials[std::min(m, activeScene->materials.size() - 1)];
-      frame.forwardMaterialSets[m] = pool->allocate(forwardProgram->setLayouts[1]);
-      DescriptorWriter writer(context, forwardProgram->fragment(), frame.forwardMaterialSets[m]);
-      writer.buffer("frame", frame.frameUniforms)
-          .buffer("materials", materialBuffer)
-          .buffer("cascadeRows", frame.cascadePacked)
-          .buffer("lights", lightBuffer)
-          .texture("baseColorMap", textureOr(material.baseColor, whiteTexture))
-          .texture("metallicRoughnessMap", textureOr(material.metallicRoughness, whiteTexture))
-          .texture("normalMap", textureOr(material.normal, normalTexture))
-          .texture("occlusionMap", textureOr(material.occlusion, whiteTexture))
-          .texture("emissiveMap", textureOr(material.emissive, whiteTexture))
-          .texture("prefilteredCube", environmentState->prefiltered())
-          .texture("shadowMap", shadowMap.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler", samplerOr(material.sampler))
-          .sampler("clampSampler", clampSampler)
-          .sampler("shadowSampler", shadowSampler);
-      if (context.rayTracingSupported) {
-        if (!acceleration)
-          throw Error("the ray tracing forward entry needs an acceleration structure for the scene");
-        writer.accelerationStructure("scene", acceleration->topLevel)
-            .buffer("traceInstances", traceInstanceBuffer)
-            .buffer("indices", activeScene->indexBuffer)
-            .buffer("vertices", activeScene->vertexBuffer)
-            .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-            .sampler("tableSampler", defaultSampler);
-      }
-      writer.buffer("lightClusters", lightClusters);
-      writer.apply();
-    }
-
-    frame.skyVertexSet = pool->allocate(skyProgram->setLayouts[0]);
-    frame.skySet = pool->allocate(skyProgram->setLayouts[1]);
-    DescriptorWriter(context, skyProgram->fragment(), frame.skySet)
+    frame.skySet = skyProgram->allocate(*pool);
+    DescriptorWriter(context, *skyProgram, frame.skySet)
         .buffer("frame", frame.frameUniforms)
         .texture("environmentCube", environmentState->cube())
         .sampler("clampSampler", clampSampler)
         .apply();
 
-    frame.resolveSet = pool->allocate(resolveProgram->setLayouts[0]);
-    DescriptorWriter resolveWriter(context, resolveProgram->compute(), frame.resolveSet);
-    resolveWriter.texture("depthBuffer", depthBuffer.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    frame.resolveSet = resolveProgram->allocate(*pool);
+    DescriptorWriter(context, *resolveProgram, frame.resolveSet)
+        .texture("depthBuffer", depthBuffer.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         .texture("normalRoughness", normalRoughness)
         .texture("reflectionWeight", reflectionWeight)
         .texture("sceneColor", hdrColor)
         .texture("prefilteredCube", environmentState->prefiltered())
         .storageTexture("reflection", reflectionMipZero)
         .buffer("uniforms", frame.reflectionUniforms)
+        .buffer("lights", lightBuffer)
         .sampler("clampSampler", clampSampler)
         .sampler("pointSampler", pointSampler)
-        .sampler("materialSampler", defaultSampler);
-    if (traced) {
-      resolveWriter.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .accelerationStructure("scene", acceleration->topLevel)
-          .buffer("traceInstances", traceInstanceBuffer)
-          .buffer("materials", materialBuffer)
-          .buffer("indices", activeScene->indexBuffer)
-          .buffer("vertices", activeScene->vertexBuffer)
-          .buffer("lights", lightBuffer);
-    }
-    resolveWriter.apply();
+        .apply();
 
     const std::size_t slot = static_cast<std::size_t>(&frame - frames.data());
     const Image &lit = litColor[slot];
     const Image &history = litColor[(slot + 1) % kFramesInFlight];
 
-    frame.compositeSet = pool->allocate(compositeProgram->setLayouts[0]);
-    DescriptorWriter(context, compositeProgram->compute(), frame.compositeSet)
+    frame.compositeSet = compositeProgram->allocate(*pool);
+    DescriptorWriter(context, *compositeProgram, frame.compositeSet)
         .texture("sceneColor", hdrColor)
         .texture("reflectionWeight", reflectionWeight)
         .texture("normalRoughness", normalRoughness)
-        .texture("reflection", reflection)
+        .texture("resolvedReflection", reflection)
         .storageTexture("lit", litCurrent.view)
         .buffer("uniforms", frame.reflectionUniforms)
         .sampler("clampSampler", clampSampler)
         .sampler("pointSampler", pointSampler)
         .apply();
 
-    frame.pathComparisonSet = pool->allocate(pathCompareProgram->setLayouts[0]);
-    DescriptorWriter(context, pathCompareProgram->compute(), frame.pathComparisonSet)
+    frame.pathComparisonSet = pathCompareProgram->allocate(*pool);
+    DescriptorWriter(context, *pathCompareProgram, frame.pathComparisonSet)
         .texture("raster", pathComparisonRaster)
         .texture("traced", lit)
         .storageTexture("output", litCurrent.view)
         .buffer("control", frame.pathComparisonUniforms)
         .apply();
 
-    frame.clusterSet = pool->allocate(clusterProgram->setLayouts[0]);
-    DescriptorWriter(context, clusterProgram->compute(), frame.clusterSet)
+    frame.clusterSet = clusterProgram->allocate(*pool);
+    DescriptorWriter(context, *clusterProgram, frame.clusterSet)
         .buffer("lights", lightBuffer)
         .buffer("clusters", lightClusters)
         .buffer("cluster", frame.clusterUniforms)
         .apply();
 
-    frame.temporalSet = pool->allocate(temporalProgram->setLayouts[0]);
-    DescriptorWriter(context, temporalProgram->compute(), frame.temporalSet)
+    frame.temporalSet = temporalProgram->allocate(*pool);
+    DescriptorWriter(context, *temporalProgram, frame.temporalSet)
         .texture("currentColor", litCurrent)
         .texture("history", history.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         .texture("depthBuffer", depthBuffer.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -1073,9 +1040,8 @@ void Renderer::rebuildSceneResources() {
         .sampler("pointSampler", pointSampler)
         .apply();
 
-    frame.postVertexSet = pool->allocate(postProgram->setLayouts[0]);
-    frame.postSet = pool->allocate(postProgram->setLayouts[1]);
-    DescriptorWriter(context, postProgram->fragment(), frame.postSet)
+    frame.postSet = postProgram->allocate(*pool);
+    DescriptorWriter(context, *postProgram, frame.postSet)
         .buffer("post", frame.postUniforms)
         .texture("hdrColor", lit)
         .texture("bloom", bloomChain.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
@@ -1083,71 +1049,34 @@ void Renderer::rebuildSceneResources() {
         .apply();
   }
 
-  // One set and parameter buffer per level and direction: a dispatch has no push constants.
-  builtBloom = {settings.bloomThreshold, settings.bloomKnee, settings.bloomRadius};
-  bloomUniformBuffers.clear();
+  // One set per level and direction; the parameters are push constants, set as each level is recorded.
   bloomDownSets.assign(bloomMipCount, VK_NULL_HANDLE);
   bloomUpSets.assign(bloomMipCount, VK_NULL_HANDLE);
-  bloomUniformBuffers.reserve(bloomMipCount * 2);
-
-  auto bloomBuffer = [&](const BloomUniforms &uniforms) -> const Buffer & {
-    Buffer buffer(context, sizeof(BloomUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  VMA_MEMORY_USAGE_AUTO,
-                  VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                      VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                  "bloom.parameters");
-    buffer.write(&uniforms, sizeof(uniforms));
-    bloomUniformBuffers.push_back(std::move(buffer));
-    return bloomUniformBuffers.back();
-  };
-
   for (std::uint32_t mip = 0; mip < bloomMipCount; ++mip) {
-    const float destinationWidth = static_cast<float>(std::max(1u, bloomChain.description.width >> mip));
-    const float destinationHeight = static_cast<float>(std::max(1u, bloomChain.description.height >> mip));
-    const float sourceWidth = mip == 0 ? static_cast<float>(width)
-                                       : static_cast<float>(std::max(1u, bloomChain.description.width >> (mip - 1)));
-    const float sourceHeight = mip == 0 ? static_cast<float>(height)
-                                        : static_cast<float>(std::max(1u, bloomChain.description.height >> (mip - 1)));
-    BloomUniforms downUniforms;
-    // Only the first level thresholds; a negative threshold means none.
-    downUniforms.parameters = {destinationWidth, destinationHeight,
-                               mip == 0 ? settings.bloomThreshold : -1.0f, 0.0f};
-    downUniforms.source = {sourceWidth, sourceHeight, mip == 0 ? 0.0f : static_cast<float>(mip - 1),
-                           settings.bloomKnee};
-
-    const Buffer &downBuffer = bloomBuffer(downUniforms);
     if (mip == 0) {
       // The first level reads the lit image, which alternates with the frame.
       for (std::size_t f = 0; f < frames.size(); ++f) {
-        frames[f].bloomFirstSet = pool->allocate(bloomDownProgram->setLayouts[0]);
-        DescriptorWriter(context, bloomDownProgram->compute(), frames[f].bloomFirstSet)
+        frames[f].bloomFirstSet = bloomDownProgram->allocate(*pool);
+        DescriptorWriter(context, *bloomDownProgram, frames[f].bloomFirstSet)
             .storageTexture("destination", bloomMipViews[0])
             .texture("source", litColor[f].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-            .buffer("bloom", downBuffer)
             .sampler("clampSampler", clampSampler)
             .apply();
       }
     } else {
-      bloomDownSets[mip] = pool->allocate(bloomDownProgram->setLayouts[0]);
-      DescriptorWriter(context, bloomDownProgram->compute(), bloomDownSets[mip])
+      bloomDownSets[mip] = bloomDownProgram->allocate(*pool);
+      DescriptorWriter(context, *bloomDownProgram, bloomDownSets[mip])
           .storageTexture("destination", bloomMipViews[mip])
           .texture("source", bloomChain.view, VK_IMAGE_LAYOUT_GENERAL)
-          .buffer("bloom", downBuffer)
           .sampler("clampSampler", clampSampler)
           .apply();
     }
 
     if (mip + 1 < bloomMipCount) {
-      BloomUniforms upUniforms;
-      upUniforms.parameters = {destinationWidth, destinationHeight, -1.0f, settings.bloomRadius};
-      upUniforms.source = {static_cast<float>(std::max(1u, bloomChain.description.width >> (mip + 1))),
-                           static_cast<float>(std::max(1u, bloomChain.description.height >> (mip + 1))),
-                           static_cast<float>(mip + 1), 0.0f};
-      bloomUpSets[mip] = pool->allocate(bloomUpProgram->setLayouts[0]);
-      DescriptorWriter(context, bloomUpProgram->compute(), bloomUpSets[mip])
+      bloomUpSets[mip] = bloomUpProgram->allocate(*pool);
+      DescriptorWriter(context, *bloomUpProgram, bloomUpSets[mip])
           .storageTexture("destination", bloomMipViews[mip])
           .texture("source", bloomChain.view, VK_IMAGE_LAYOUT_GENERAL)
-          .buffer("bloom", bloomBuffer(upUniforms))
           .sampler("clampSampler", clampSampler)
           .apply();
     }
@@ -1173,9 +1102,9 @@ void Renderer::computeCascades(const Camera &camera) {
                              nearPlane * 1.01f);
 
   // Practical split scheme: a blend of logarithmic and uniform.
-  std::array<float, kCascadeCount> splits{};
-  for (std::uint32_t i = 0; i < kCascadeCount; ++i) {
-    const float fraction = static_cast<float>(i + 1) / static_cast<float>(kCascadeCount);
+  std::array<float, pt::kCascadeCount> splits{};
+  for (std::uint32_t i = 0; i < pt::kCascadeCount; ++i) {
+    const float fraction = static_cast<float>(i + 1) / static_cast<float>(pt::kCascadeCount);
     const float logarithmic = nearPlane * std::pow(far / nearPlane, fraction);
     const float uniform = nearPlane + (far - nearPlane) * fraction;
     splits[i] = lerp(uniform, logarithmic, settings.cascadeSplitLambda);
@@ -1185,7 +1114,7 @@ void Renderer::computeCascades(const Camera &camera) {
   const Mat4 inverseView = inverse(view);
   const float tanHalf = std::tan(camera.fieldOfView * 0.5f);
   float previous = nearPlane;
-  for (std::uint32_t i = 0; i < kCascadeCount; ++i) {
+  for (std::uint32_t i = 0; i < pt::kCascadeCount; ++i) {
     const float sliceNear = previous;
     const float sliceFar = splits[i];
     previous = sliceFar;
@@ -1295,7 +1224,7 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   uniforms.view = view;
   uniforms.inverseViewProjection = inverseViewProjection;
   uniforms.cameraPosition = Vec4(camera.position(), settings.exposure);
-  // An .hdr has no disc left in its cube: the sky draws the analytic one (sky.metal).
+  // An .hdr has no disc left in its cube: the sky draws the analytic one (sky.slang).
   const bool analyticDisc = !environmentState->procedural() && settings.sunIntensity > 0.0f;
   uniforms.sunDirection = Vec4(sunDirection(), analyticDisc ? std::cos(std::max(settings.sunAngularRadius, 1e-4f)) : 0.0f);
   uniforms.sunColor = Vec4(settings.sunColor, settings.sunIntensity);
@@ -1373,14 +1302,11 @@ void Renderer::updateFrameData(const Camera &camera, float deltaSeconds) {
   for (std::size_t i = 0; i < 9; ++i) uniforms.sh[i] = harmonics[i];
   frame.frameUniforms.write(&uniforms, sizeof(uniforms));
 
-  // The cascade transforms, as the rows the shaders apply with dot products.
-  std::array<Vec4, kCascadeCount * 4> packed{};
-  for (std::uint32_t cascade = 0; cascade < kCascadeCount; ++cascade) {
+  // The cascade transforms, as the rows the forward pass applies with dot products; the shadow
+  // pass pushes each cascade's own as it draws it.
+  std::array<Vec4, pt::kCascadeCount * 4> packed{};
+  for (std::uint32_t cascade = 0; cascade < pt::kCascadeCount; ++cascade)
     for (int row = 0; row < 4; ++row) packed[cascade * 4 + row] = cascadeMatrices[cascade].row(row);
-    std::array<Vec4, 4> rows{cascadeMatrices[cascade].row(0), cascadeMatrices[cascade].row(1),
-                             cascadeMatrices[cascade].row(2), cascadeMatrices[cascade].row(3)};
-    frame.cascadeStrided.write(rows.data(), sizeof(rows), cascade * cascadeStride);
-  }
   frame.cascadePacked.write(packed.data(), sizeof(packed));
 
   int reflectionMode = settings.reflectionMode;
@@ -1471,13 +1397,8 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-  transitionImage(command, shadowDummyColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
-  for (std::uint32_t cascade = 0; cascade < kCascadeCount; ++cascade) {
+  for (std::uint32_t cascade = 0; cascade < pt::kCascadeCount; ++cascade) {
     VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     depthAttachment.imageView = shadowLayerViews[cascade];
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
@@ -1488,13 +1409,6 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea = {{0, 0}, {kShadowResolution, kShadowResolution}};
     rendering.layerCount = 1;
-    VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    colorAttachment.imageView = shadowDummyColor.view;
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &colorAttachment;
     rendering.pDepthAttachment = &depthAttachment;
     vkCmdBeginRendering(command, &rendering);
 
@@ -1505,8 +1419,9 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
       vkCmdSetViewport(command, 0, 1, &viewport);
       vkCmdSetScissor(command, 0, 1, &scissor);
       vkCmdSetDepthBias(command, 1.25f, 0.0f, 2.0f);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowProgram->layout, 0, 1,
-                              &frame.shadowVertexSets[cascade], 0, nullptr);
+      // The cascade's view-projection rows, as the vertex stage applies them.
+      const std::array<Vec4, 4> cascadeRows{cascadeMatrices[cascade].row(0), cascadeMatrices[cascade].row(1),
+                                            cascadeMatrices[cascade].row(2), cascadeMatrices[cascade].row(3)};
 
       const VkDeviceSize offset = 0;
       vkCmdBindVertexBuffers(command, 0, 1, &activeScene->vertexBuffer.handle, &offset);
@@ -1528,12 +1443,15 @@ void Renderer::recordShadowPass(VkCommandBuffer command) {
                      : (material.doubleSided ? shadowTwoSidedPipeline.handle : shadowPipeline.handle);
           if (wanted != boundPipeline) {
             vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, wanted);
+            if (boundPipeline == VK_NULL_HANDLE) {
+              shadowProgram->bind(command, shadowSceneSet, "scene");
+              shadowProgram->push(command, cascadeRows);
+            }
             boundPipeline = wanted;
             boundMaterial = UINT32_MAX;
           }
           if (masked && primitive.material != boundMaterial) {
-            vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowProgram->layout,
-                                    1, 1, &shadowMaterialSets[primitive.material], 0, nullptr);
+            shadowProgram->bind(command, shadowMaterialSets[primitive.material], "material");
             boundMaterial = primitive.material;
           }
           if (const VkFrontFace face = frontFaceOf(primitive.transform); face != boundFace) {
@@ -1607,9 +1525,7 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
   auto drawSky = [&] {
     if (!settings.drawSky || settings.wireframe) return;
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline.handle);
-    const VkDescriptorSet sets[2]{frame.skyVertexSet, frame.skySet};
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, skyProgram->layout, 0, 2, sets,
-                            0, nullptr);
+    skyProgram->bind(command, frame.skySet);
     vkCmdDraw(command, 3, 1, 0, 0);
   };
 
@@ -1617,8 +1533,12 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(command, 0, 1, &activeScene->vertexBuffer.handle, &offset);
     vkCmdBindIndexBuffer(command, activeScene->indexBuffer.handle, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, forwardProgram->layout, 0, 1,
-                            &frame.forwardVertexSet, 0, nullptr);
+    // The frame's and the scene's sets; the materials' are bound per draw.
+    auto bindForward = [&] {
+      forwardProgram->bind(command, frame.forwardViewSet, "view");
+      if (forwardTraceSet) forwardProgram->bind(command, forwardTraceSet, "trace");
+    };
+    bindForward();
 
     // One pipeline per sidedness, rebound only where they alternate.
     auto drawList = [&](const std::vector<std::uint32_t> &list, const Pipeline &oneSided,
@@ -1636,8 +1556,7 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
           boundPipeline = wanted;
         }
         if (primitive.material != boundMaterial) {
-          vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, forwardProgram->layout, 1,
-                                  1, &frame.forwardMaterialSets[primitive.material], 0, nullptr);
+          forwardProgram->bind(command, forwardMaterialSets[primitive.material], "material");
           boundMaterial = primitive.material;
         }
         if (const VkFrontFace face = frontFaceOf(primitive.transform); face != boundFace) {
@@ -1658,8 +1577,7 @@ void Renderer::recordForwardPass(VkCommandBuffer command) {
     // The sky fills the far plane before blended surfaces draw over it.
     drawSky();
 
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, forwardProgram->layout, 0, 1,
-                            &frame.forwardVertexSet, 0, nullptr);
+    bindForward();
     // Blended geometry already draws both faces.
     drawList(visibleBlended, wire ? forwardWirePipeline : forwardBlendPipeline,
              wire ? forwardWirePipeline : forwardBlendPipeline);
@@ -1686,8 +1604,7 @@ void Renderer::recordLightCulling(VkCommandBuffer command) {
   vkCmdPipelineBarrier2(command, &dependency);
 
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, clusterPipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, clusterProgram->layout, 0, 1,
-                          &frame.clusterSet, 0, nullptr);
+  clusterProgram->bind(command, frame.clusterSet);
   vkCmdDispatch(command, (clusterCount + 63) / 64, 1, 1);
 
   VkMemoryBarrier2 after{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -1717,8 +1634,8 @@ void Renderer::recordReflections(VkCommandBuffer command) {
 
   const std::uint32_t groupsX = (width + 7) / 8, groupsY = (height + 7) / 8;
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, resolvePipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, resolveProgram->layout, 0, 1,
-                          &frame.resolveSet, 0, nullptr);
+  resolveProgram->bind(command, frame.resolveSet);
+  if (resolveTraceSet) resolveProgram->bind(command, resolveTraceSet, "trace");
   vkCmdDispatch(command, groupsX, groupsY, 1);
 
   generateMips(command, reflection);
@@ -1735,8 +1652,7 @@ void Renderer::recordReflections(VkCommandBuffer command) {
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                   VK_ACCESS_2_SHADER_WRITE_BIT);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, compositePipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, compositeProgram->layout, 0, 1,
-                          &frame.compositeSet, 0, nullptr);
+  compositeProgram->bind(command, frame.compositeSet);
   vkCmdDispatch(command, groupsX, groupsY, 1);
   transitionImage(command, litCurrent, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -1747,8 +1663,7 @@ void Renderer::recordReflections(VkCommandBuffer command) {
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                   VK_ACCESS_2_SHADER_WRITE_BIT);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, temporalPipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, temporalProgram->layout, 0, 1,
-                          &frame.temporalSet, 0, nullptr);
+  temporalProgram->bind(command, frame.temporalSet);
   vkCmdDispatch(command, groupsX, groupsY, 1);
   transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -1763,25 +1678,43 @@ void Renderer::recordBloom(VkCommandBuffer command) {
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                   VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT);
 
+  auto mipSize = [&](std::uint32_t mip) {
+    return std::array<std::uint32_t, 2>{std::max(1u, bloomChain.description.width >> mip),
+                                        std::max(1u, bloomChain.description.height >> mip)};
+  };
   auto dispatchMip = [&](std::uint32_t mip) {
-    const std::uint32_t mipWidth = std::max(1u, bloomChain.description.width >> mip);
-    const std::uint32_t mipHeight = std::max(1u, bloomChain.description.height >> mip);
+    const auto [mipWidth, mipHeight] = mipSize(mip);
     vkCmdDispatch(command, (mipWidth + 7) / 8, (mipHeight + 7) / 8, 1);
   };
 
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, bloomDownPipeline.handle);
   for (std::uint32_t mip = 0; mip < bloomMipCount; ++mip) {
-    const VkDescriptorSet set = mip == 0 ? frames[frameIndex].bloomFirstSet : bloomDownSets[mip];
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, bloomDownProgram->layout, 0, 1,
-                            &set, 0, nullptr);
+    const auto [destinationWidth, destinationHeight] = mipSize(mip);
+    // The first level reads the lit image at full size, the rest the level above.
+    const auto [sourceWidth, sourceHeight] = mip == 0 ? std::array<std::uint32_t, 2>{width, height} : mipSize(mip - 1);
+    BloomUniforms uniforms;
+    // Only the first level thresholds; a negative threshold means none.
+    uniforms.parameters = {static_cast<float>(destinationWidth), static_cast<float>(destinationHeight),
+                           mip == 0 ? settings.bloomThreshold : -1.0f, 0.0f};
+    uniforms.source = {static_cast<float>(sourceWidth), static_cast<float>(sourceHeight),
+                       mip == 0 ? 0.0f : static_cast<float>(mip - 1), settings.bloomKnee};
+    bloomDownProgram->bind(command, mip == 0 ? frames[frameIndex].bloomFirstSet : bloomDownSets[mip]);
+    bloomDownProgram->push(command, uniforms);
     dispatchMip(mip);
     computeImageBarrier(command, bloomChain.handle, VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 1);
   }
 
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, bloomUpPipeline.handle);
   for (std::uint32_t mip = bloomMipCount - 1; mip-- > 0;) {
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, bloomUpProgram->layout, 0, 1,
-                            &bloomUpSets[mip], 0, nullptr);
+    const auto [destinationWidth, destinationHeight] = mipSize(mip);
+    const auto [sourceWidth, sourceHeight] = mipSize(mip + 1);
+    BloomUniforms uniforms;
+    uniforms.parameters = {static_cast<float>(destinationWidth), static_cast<float>(destinationHeight), -1.0f,
+                           settings.bloomRadius};
+    uniforms.source = {static_cast<float>(sourceWidth), static_cast<float>(sourceHeight), static_cast<float>(mip + 1),
+                       0.0f};
+    bloomUpProgram->bind(command, bloomUpSets[mip]);
+    bloomUpProgram->push(command, uniforms);
     dispatchMip(mip);
     computeImageBarrier(command, bloomChain.handle, VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 1);
   }
@@ -1831,9 +1764,7 @@ void Renderer::recordPost(VkCommandBuffer command, std::uint32_t imageIndex) {
   vkCmdSetScissor(command, 0, 1, &scissor);
 
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipeline.handle);
-  const VkDescriptorSet sets[2]{frame.postVertexSet, frame.postSet};
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, postProgram->layout, 0, 2, sets,
-                          0, nullptr);
+  postProgram->bind(command, frame.postSet);
   vkCmdDraw(command, 3, 1, 0, 0);
   // The render pass stays open: the interface is drawn into it by the caller.
 }
@@ -1958,8 +1889,7 @@ void Renderer::recordPathComparison(VkCommandBuffer command) {
                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
   vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathComparePipeline.handle);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathCompareProgram->layout,
-                          0, 1, &frame.pathComparisonSet, 0, nullptr);
+  pathCompareProgram->bind(command, frame.pathComparisonSet);
   vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
   transitionImage(command, litCurrent, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
@@ -2032,11 +1962,7 @@ void Renderer::render(VkCommandBuffer command, std::uint32_t imageIndex, const C
                       float deltaSeconds) {
   frameIndex = swapchain.frameIndex();
 
-  // Bloom parameters are baked into the sets' buffers, so a slider rebuilds them; safe here, before any recording.
-  if (builtBloom[0] != settings.bloomThreshold || builtBloom[1] != settings.bloomKnee ||
-      builtBloom[2] != settings.bloomRadius)
-    rebuildSceneResources();
-  // Same for the light count.
+  // The light count is baked into the scene's sets, so a slider rebuilds them; safe here, before any recording.
   if (builtTestLights != std::max(0, settings.testLights)) {
     buildLights();
     rebuildSceneResources();
@@ -2517,7 +2443,7 @@ void Renderer::buildSoftwareBvh() {
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
 }
 
-// The wide kernels come with 64- and 96-entry (*_deep, PT_WIDE_BVH_STACK_DEEP) traversal stacks.
+// The wide kernels come with 64- and 96-entry (*_deep, kWideStackDeep) traversal stacks.
 // A tree whose proven bound exceeds 64 needs the deep ones. Otherwise auto uses 96 in the
 // megakernel only: there the driver allocates the deep variant fewer registers and it runs faster,
 // while the wavefront stages gain nothing from it.
@@ -2539,7 +2465,7 @@ void Renderer::selectWideStack(bool deep) {
   pathWaveShadowWidePipeline = Pipeline(context, *pathWaveShadowWideProgram, "path.wavefront.shadow.wide" + suffix);
   wideStackDeep = deep;
   pathSetsGeneration = ~0u;
-  logInfo("wide traversal kernels: {}-entry stack (tree bound {})", deep ? PT_WIDE_BVH_STACK_DEEP : 64,
+  logInfo("wide traversal kernels: {}-entry stack (tree bound {})", deep ? pt::kWideStackDeep : 64,
           softwareWideStack);
 }
 
@@ -2689,16 +2615,15 @@ void Renderer::animateScene(VkCommandBuffer command, bool inFrame) {
                                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
                                              VMA_ALLOCATION_CREATE_MAPPED_BIT,
                                          "animation.frame-control");
-        animationSets[slot] = animationPool->allocate(animateProgram->setLayouts[0]);
-        DescriptorWriter(context, animateProgram->compute(), animationSets[slot])
+        animationSets[slot] = animateProgram->allocate(*animationPool);
+        DescriptorWriter(context, *animateProgram, animationSets[slot])
             .buffer("rest", animationRestVertices).buffer("vertices", activeScene->vertexBuffer)
             .buffer("control", animationControls[slot]).apply();
       }
       animationControls[slot].write(&control, sizeof(control));
       computeTransferBarrier(command);
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, animatePipeline.handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, animateProgram->layout, 0, 1,
-                              &animationSets[slot], 0, nullptr);
+      animateProgram->bind(command, animationSets[slot]);
       vkCmdDispatch(command, (activeScene->vertexCount + 63u) / 64u, 1, 1);
       computeTransferBarrier(command);
       ++animationGeometry;
@@ -2709,18 +2634,60 @@ void Renderer::animateScene(VkCommandBuffer command, bool inFrame) {
     Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                                  "animation.control");
     DescriptorPool pool(context, 1);
-    const VkDescriptorSet set = pool.allocate(animateProgram->setLayouts[0]);
-    DescriptorWriter(context, animateProgram->compute(), set)
+    const VkDescriptorSet set = animateProgram->allocate(pool);
+    DescriptorWriter(context, *animateProgram, set)
         .buffer("rest", animationRestVertices).buffer("vertices", activeScene->vertexBuffer)
         .buffer("control", controlBuffer).apply();
     uploader.runImmediate([&](VkCommandBuffer command) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, animatePipeline.handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, animateProgram->layout, 0, 1, &set, 0, nullptr);
+      animateProgram->bind(command, set);
       vkCmdDispatch(command, (activeScene->vertexCount + 63u) / 64u, 1, 1);
     });
     ++animationGeometry;
   }
   ++animationFrame;
+}
+
+void Renderer::writePathScene(const ShaderLayout &layout, VkDescriptorSet set, const Buffer &instanceRows) {
+  DescriptorWriter writer(context, layout, set, "scene");
+  writer.buffer("geometry.traceInstances", instanceRows)
+      .buffer("geometry.materials", materialBuffer)
+      .buffer("geometry.indices", activeScene->indexBuffer)
+      .buffer("geometry.vertices", activeScene->vertexBuffer)
+      .textureArray("maps.table", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  for (int i = 0; i < 6; ++i) writer.sampler(std::string("maps.") + GltfSamplers::names[i], pathSamplers->handles[i]);
+  writer.texture("maps.environmentMap", environmentState->traceImage())
+      .sampler("maps.environmentSampler", environmentState->linearSampler())
+      .buffer("lights", lightBuffer)
+      .buffer("environmentDistribution", pathDistribution)
+      .buffer("specularAlbedo", pathAlbedoTable)
+      .buffer("emissiveTriangles", pathEmissiveBuffer)
+      .apply();
+}
+
+Renderer::PathSets Renderer::allocatePathSets(const ShaderLayout &layout, const Buffer &instanceRows, bool software,
+                                              bool wideSoftware) {
+  PathSets sets;
+  sets.frame = layout.allocate(*pool);
+  if (layout.declares("scene") && layout.uses("scene")) {
+    sets.scene = layout.allocate(*pool, "scene");
+    writePathScene(layout, sets.scene, instanceRows);
+  }
+  if (layout.declares("structure") && layout.uses("structure")) {
+    sets.structure = layout.allocate(*pool, "structure");
+    DescriptorWriter structure(context, layout, sets.structure, "structure");
+    if (software)
+      structure.buffer(wideSoftware ? "wideNodes" : "bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
+    else structure.accelerationStructure("accelerationStructure", acceleration->topLevel);
+    structure.apply();
+  }
+  return sets;
+}
+
+void Renderer::bindPathSets(VkCommandBuffer command, const ShaderLayout &layout, const PathSets &sets) {
+  layout.bind(command, sets.frame);
+  if (sets.scene) layout.bind(command, sets.scene, "scene");
+  if (sets.structure) layout.bind(command, sets.structure, "structure");
 }
 
 void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
@@ -2878,172 +2845,106 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
                           : wideSoftware ? pathWaveFusedWideProgram.get() : pathWaveFusedProgram.get();
   Program *shadeProgram = fused ? fusedProgram :
                           waveSubgroupAllocationActive() ? pathWaveShadeProgram.get() : pathWaveShadeAtomicProgram.get();
+  // The wavefront's intersect and shadow stages, which ReSTIR DI's passes reuse: compute programs,
+  // or the backend's ray pipelines.
+  const ShaderLayout *intersectLayout = nullptr, *shadowLayout = nullptr;
+  if (pipelineBackend) {
+    if (pathWaveIntersectRayPipeline) intersectLayout = &pathWaveIntersectRayPipeline->shaderLayout();
+    if (pathWaveShadowRayPipeline) shadowLayout = &pathWaveShadowRayPipeline->shaderLayout();
+  } else {
+    const Program *intersect = software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get())
+                                        : pathWaveIntersectRtProgram.get();
+    const Program *shadow = software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get())
+                                     : pathWaveShadowRtProgram.get();
+    if (intersect) intersectLayout = &intersect->shaderLayout();
+    if (shadow) shadowLayout = &shadow->shaderLayout();
+  }
   if (pathSetsGeneration != resourceGeneration || pathSetsEnvironment != environmentState->version() ||
       pathSetsBackend != backendKey) {
     for (std::size_t f = 0; f < frames.size(); ++f) {
+      FrameResources &target = frames[f];
+      const Buffer &guides = pathReconstruction ? pathReconstruction->samples() : pathReconstructionSamples;
       if (restir) {
-        Program *intersectProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get()) : pathWaveIntersectRtProgram.get();
-        Program *waveShadowProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get()) : pathWaveShadowRtProgram.get();
-        if (pipelineBackend ? (!pathWaveIntersectRayPipeline || !pathWaveShadowRayPipeline)
-                            : (!intersectProgram || !waveShadowProgram))
-          throw std::runtime_error("ReSTIR DI needs the backend's wavefront intersector");
-        frames[f].restirIntersectSet = pool->allocate(pipelineBackend ? pathWaveIntersectRayPipeline->setLayout : intersectProgram->setLayouts[0]);
-        DescriptorWriter iw(context, pipelineBackend ? pathWaveIntersectRayPipeline->shader(0) : intersectProgram->compute(), frames[f].restirIntersectSet);
-        iw.buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
-          .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
-          .buffer("vertices", activeScene->vertexBuffer).buffer("statesA", restirShadows)
-          .buffer("statesB", restirShadows).buffer("counters", restirCounters)
-          .buffer("waveControl", restirControl).buffer("costs", restirCosts).buffer("hits", restirShadows);
-        if (software) iw.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
-        else iw.accelerationStructure("scene", acceleration->topLevel);
-        iw.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler", defaultSampler).apply();
-        frames[f].restirShadowSet = pool->allocate(pipelineBackend ? pathWaveShadowRayPipeline->setLayout : waveShadowProgram->setLayouts[0]);
-        DescriptorWriter sw(context, pipelineBackend ? pathWaveShadowRayPipeline->shader(0) : waveShadowProgram->compute(), frames[f].restirShadowSet);
-        sw.buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
-          .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
-          .buffer("vertices", activeScene->vertexBuffer).buffer("counters", restirCounters)
-          .buffer("waveControl", restirControl).buffer("results", restirResults).buffer("shadows", restirShadows)
-          .buffer("costs", restirCosts).buffer("waveGuides", restirGuides);
-        if (software) sw.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
-        else sw.accelerationStructure("scene", acceleration->topLevel);
-        sw.textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler", defaultSampler).apply();
+        if (!intersectLayout || !shadowLayout) throw std::runtime_error("ReSTIR DI needs the backend's wavefront intersector");
+        // The per-pixel records stand in for the wavefront's queues.
+        target.restirIntersectSets = allocatePathSets(*intersectLayout, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, *intersectLayout, target.restirIntersectSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("statesA", restirShadows).buffer("statesB", restirShadows)
+            .buffer("counters", restirCounters).buffer("waveControl", restirControl).buffer("costs", restirCosts)
+            .buffer("hits", restirShadows).apply();
+        target.restirShadowSets = allocatePathSets(*shadowLayout, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, *shadowLayout, target.restirShadowSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("counters", restirCounters).buffer("waveControl", restirControl)
+            .buffer("results", restirResults).buffer("shadows", restirShadows).buffer("costs", restirCosts)
+            .buffer("waveGuides", restirGuides).apply();
+        const ShaderLayout &initial = pathRestirInitialProgram->shaderLayout();
+        const ShaderLayout &spatial = pathRestirSpatialProgram->shaderLayout();
         for (std::uint32_t parity = 0; parity < 2; ++parity) {
-          frames[f].restirInitialSet[parity] = pool->allocate(pathRestirInitialProgram->setLayouts[0]);
-          DescriptorWriter(context, pathRestirInitialProgram->compute(), frames[f].restirInitialSet[parity])
-            .buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
-            .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
-            .buffer("vertices", activeScene->vertexBuffer).buffer("lights", lightBuffer)
-            .buffer("environmentDistribution", pathDistribution).buffer("specularAlbedo", pathAlbedoTable)
-            .buffer("emissiveTriangles", pathEmissiveBuffer).buffer("hits", restirShadows)
-            .buffer("restirCamera", restirCamera).buffer("previousSurfaces", restirSurfaces[1 - parity])
-            .buffer("previousReservoirs", restirFinals[1 - parity]).buffer("surfaces", restirSurfaces[parity])
-            .buffer("reservoirs", restirReservoirs)
-            .texture("environmentMap", environmentState->traceImage())
-            .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-            .sampler("environmentSampler", environmentState->linearSampler()).sampler("materialSampler", defaultSampler)
-            .apply();
-          frames[f].restirSpatialSet[parity] = pool->allocate(pathRestirSpatialProgram->setLayouts[0]);
-          DescriptorWriter(context, pathRestirSpatialProgram->compute(), frames[f].restirSpatialSet[parity])
-            .buffer("uniforms", frames[f].pathUniforms).buffer("traceInstances", instanceRows)
-            .buffer("materials", materialBuffer).buffer("indices", activeScene->indexBuffer)
-            .buffer("vertices", activeScene->vertexBuffer).buffer("lights", lightBuffer)
-            .buffer("environmentDistribution", pathDistribution).buffer("specularAlbedo", pathAlbedoTable)
-            .buffer("emissiveTriangles", pathEmissiveBuffer).buffer("results", restirResults)
-            .buffer("shadows", restirShadows).buffer("waveGuides", restirGuides)
-            .buffer("surfaces", restirSurfaces[parity]).buffer("reservoirs", restirReservoirs)
-            .buffer("finals", restirFinals[parity])
-            .texture("environmentMap", environmentState->traceImage())
-            .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-            .sampler("environmentSampler", environmentState->linearSampler()).sampler("materialSampler", defaultSampler)
-            .apply();
+          target.restirInitialSets[parity] = allocatePathSets(initial, instanceRows, software, wideSoftware);
+          DescriptorWriter(context, initial, target.restirInitialSets[parity].frame)
+              .buffer("uniforms", target.pathUniforms).buffer("hits", restirShadows).buffer("restirCamera", restirCamera)
+              .buffer("previousSurfaces", restirSurfaces[1 - parity]).buffer("previousReservoirs", restirFinals[1 - parity])
+              .buffer("surfaces", restirSurfaces[parity]).buffer("reservoirs", restirReservoirs).apply();
+          target.restirSpatialSets[parity] = allocatePathSets(spatial, instanceRows, software, wideSoftware);
+          DescriptorWriter(context, spatial, target.restirSpatialSets[parity].frame)
+              .buffer("uniforms", target.pathUniforms).buffer("results", restirResults).buffer("shadows", restirShadows)
+              .buffer("waveGuides", restirGuides).buffer("surfaces", restirSurfaces[parity])
+              .buffer("reservoirs", restirReservoirs).buffer("finals", restirFinals[parity]).apply();
         }
       }
       if (wavefront) {
-        Program *intersectProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveIntersectWideProgram.get() : pathWaveIntersectProgram.get()) : pathWaveIntersectRtProgram.get();
-        Program *waveShadowProgram = pipelineBackend ? nullptr : software ? (wideSoftware ? pathWaveShadowWideProgram.get() : pathWaveShadowProgram.get()) : pathWaveShadowRtProgram.get();
-        if (pipelineBackend ? (!pathWaveIntersectRayPipeline || !pathWaveShadowRayPipeline)
-                            : (!intersectProgram || !waveShadowProgram))
-          throw std::runtime_error("wavefront intersector is unavailable");
-        frames[f].pathWaveIntersectSet=pool->allocate(pipelineBackend ? pathWaveIntersectRayPipeline->setLayout : intersectProgram->setLayouts[0]);
-        DescriptorWriter iw(context,pipelineBackend ? pathWaveIntersectRayPipeline->shader(0) : intersectProgram->compute(),frames[f].pathWaveIntersectSet);
-        iw.buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
-          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
-          .buffer("vertices",activeScene->vertexBuffer).buffer("statesA",pathWaveStatesA)
-          .buffer("statesB",pathWaveStatesB).buffer("counters",pathWaveCounters)
-          .buffer("waveControl",pathWaveControl).buffer("costs",pathWaveCosts).buffer("hits",pathWaveHits);
-        if(software)iw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
-        else iw.accelerationStructure("scene",acceleration->topLevel);
-        iw.textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler",defaultSampler).apply();
-        frames[f].pathWaveShadeSet=pool->allocate(shadeProgram->setLayouts[0]);
-        DescriptorWriter(context,shadeProgram->compute(),frames[f].pathWaveShadeSet)
-          .buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
-          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
-          .buffer("vertices",activeScene->vertexBuffer).buffer("lights",lightBuffer)
-          .buffer("environmentDistribution",pathDistribution).buffer("specularAlbedo",pathAlbedoTable)
-          .buffer("guides",pathReconstruction?pathReconstruction->samples():pathReconstructionSamples)
-          .buffer("emissiveTriangles",pathEmissiveBuffer).buffer("statesA",pathWaveStatesA)
-          .buffer("statesB",pathWaveStatesB).buffer("counters",pathWaveCounters)
-          .buffer("waveControl",pathWaveControl).buffer("results",pathWaveResults)
-          .buffer("shadows",pathWaveShadows).buffer("hits",pathWaveHits).buffer("waveGuides",pathWaveGuides)
-          .buffer("restirResults",restirResults).buffer("restirGuides",restirGuides)
-          .apply();
-        if (fused) {
-          DescriptorWriter fw(context,shadeProgram->compute(),frames[f].pathWaveShadeSet);
-          if(software)fw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
-          else fw.accelerationStructure("scene",acceleration->topLevel);
-          fw.buffer("costs",pathWaveCosts).apply();
-        }
-        DescriptorWriter(context,shadeProgram->compute(),frames[f].pathWaveShadeSet)
-          .texture("environmentMap",environmentState->traceImage())
-          .textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("environmentSampler",environmentState->linearSampler()).sampler("materialSampler",defaultSampler).apply();
-        frames[f].pathWaveShadowSet=pool->allocate(pipelineBackend ? pathWaveShadowRayPipeline->setLayout : waveShadowProgram->setLayouts[0]);
-        DescriptorWriter sw(context,pipelineBackend ? pathWaveShadowRayPipeline->shader(0) : waveShadowProgram->compute(),frames[f].pathWaveShadowSet);
-        sw.buffer("uniforms",frames[f].pathUniforms).buffer("traceInstances",instanceRows)
-          .buffer("materials",materialBuffer).buffer("indices",activeScene->indexBuffer)
-          .buffer("vertices",activeScene->vertexBuffer).buffer("counters",pathWaveCounters)
-          .buffer("waveControl",pathWaveControl).buffer("results",pathWaveResults).buffer("shadows",pathWaveShadows)
-          .buffer("costs",pathWaveCosts).buffer("waveGuides",pathWaveGuides);
-        if(software)sw.buffer("bvhNodes",softwareBvhNodes).buffer("bvhTriangles",softwareBvhTriangles);
-        else sw.accelerationStructure("scene",acceleration->topLevel);
-        sw.textureArray("maps",hitTextureViews,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-          .sampler("materialSampler",defaultSampler).apply();
-        frames[f].pathWaveResolveSet=pool->allocate(pathWaveResolveProgram->setLayouts[0]);
-        DescriptorWriter(context,pathWaveResolveProgram->compute(),frames[f].pathWaveResolveSet)
-          .buffer("uniforms",frames[f].pathUniforms).buffer("results",pathWaveResults)
-          .buffer("guides",pathReconstruction?pathReconstruction->samples():pathReconstructionSamples)
-          .buffer("waveControl",pathWaveControl).buffer("costs",pathWaveCosts).buffer("waveGuides",pathWaveGuides)
-          .storageTexture("accumulation",pathAccumulation.view).storageTexture("output",litColor[f].view)
-          .storageTexture("albedoAccumulation",pathAlbedoAccumulation.view)
-          .storageTexture("normalAccumulation",pathNormalAccumulation.view).apply();
+        if (!intersectLayout || !shadowLayout) throw std::runtime_error("wavefront intersector is unavailable");
+        target.pathWaveIntersectSets = allocatePathSets(*intersectLayout, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, *intersectLayout, target.pathWaveIntersectSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("statesA", pathWaveStatesA).buffer("statesB", pathWaveStatesB)
+            .buffer("counters", pathWaveCounters).buffer("waveControl", pathWaveControl).buffer("costs", pathWaveCosts)
+            .buffer("hits", pathWaveHits).apply();
+        const ShaderLayout &shade = shadeProgram->shaderLayout();
+        target.pathWaveShadeSets = allocatePathSets(shade, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, shade, target.pathWaveShadeSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("guides", guides).buffer("statesA", pathWaveStatesA)
+            .buffer("statesB", pathWaveStatesB).buffer("counters", pathWaveCounters).buffer("waveControl", pathWaveControl)
+            .buffer("results", pathWaveResults).buffer("shadows", pathWaveShadows).buffer("hits", pathWaveHits)
+            .buffer("waveGuides", pathWaveGuides).buffer("costs", pathWaveCosts)
+            .buffer("restirResults", restirResults).buffer("restirGuides", restirGuides).apply();
+        target.pathWaveShadowSets = allocatePathSets(*shadowLayout, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, *shadowLayout, target.pathWaveShadowSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("counters", pathWaveCounters).buffer("waveControl", pathWaveControl)
+            .buffer("results", pathWaveResults).buffer("shadows", pathWaveShadows).buffer("costs", pathWaveCosts)
+            .buffer("waveGuides", pathWaveGuides).apply();
+        const ShaderLayout &resolve = pathWaveResolveProgram->shaderLayout();
+        target.pathWaveResolveSets = allocatePathSets(resolve, instanceRows, software, wideSoftware);
+        DescriptorWriter(context, resolve, target.pathWaveResolveSets.frame)
+            .buffer("uniforms", target.pathUniforms).buffer("results", pathWaveResults).buffer("guides", guides)
+            .buffer("waveControl", pathWaveControl).buffer("costs", pathWaveCosts).buffer("waveGuides", pathWaveGuides)
+            .storageTexture("accumulation", pathAccumulation.view).storageTexture("output", litColor[f].view)
+            .storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
+            .storageTexture("normalAccumulation", pathNormalAccumulation.view).apply();
         continue;
       }
-      const Shader &pathShader = pipelineBackend ? pathRayPipeline->shader(0) : program->compute();
-      VkDescriptorSet &pathSet = pipelineBackend ? frames[f].pathPipelineSet : frames[f].pathSet;
-      pathSet = pool->allocate(pipelineBackend ? pathRayPipeline->setLayout : program->setLayouts[0]);
-      DescriptorWriter writer(context, pathShader, pathSet);
-      writer
-          .buffer("uniforms", frames[f].pathUniforms)
-          .buffer("traceInstances", instanceRows)
-          .buffer("materials", materialBuffer)
-          .buffer("indices", activeScene->indexBuffer)
-          .buffer("vertices", activeScene->vertexBuffer)
-          .buffer("lights", lightBuffer)
-          .buffer("environmentDistribution", pathDistribution)
-          .buffer("specularAlbedo", pathAlbedoTable)
-          .buffer("emissiveTriangles", pathEmissiveBuffer)
-          .buffer("reconstructionSamples", pathReconstruction ? pathReconstruction->samples() : pathReconstructionSamples);
-      if (hybrid)
-        writer.buffer("hybridInverseViewProjection", frames[f].hybridInverseViewProjection);
-      else
-        writer.buffer("restirResults", restirResults).buffer("restirGuides", restirGuides);
-      if (software)
-        writer.buffer("bvhNodes", softwareBvhNodes).buffer("bvhTriangles", softwareBvhTriangles);
-      else
-        writer.accelerationStructure("scene", acceleration->topLevel);
-      writer
-          .texture("environmentMap", environmentState->traceImage())
+      // The megakernel and the ray pipeline declare the same blocks; each allocates from its own layout.
+      const ShaderLayout &layout = pipelineBackend ? pathRayPipeline->shaderLayout() : program->shaderLayout();
+      target.pathSets = allocatePathSets(layout, instanceRows, software, wideSoftware);
+      DescriptorWriter frameWriter(context, layout, target.pathSets.frame);
+      frameWriter.buffer("uniforms", target.pathUniforms)
+          .buffer("reconstructionSamples", guides)
           .storageTexture("accumulation", pathAccumulation.view)
-          .storageTexture("output", litColor[f].view)
-          .textureArray("maps", hitTextureViews, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-      if (!hybrid)
-        writer.storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
-              .storageTexture("normalAccumulation", pathNormalAccumulation.view);
+          .storageTexture("output", litColor[f].view);
       if (hybrid)
-        writer.texture("hybridNormalRoughness", normalRoughness)
-              .texture("hybridBaseMetallic", gbufferBaseMetallic)
-              .texture("hybridGeometricDepth", gbufferGeometricCoverage)
-              .texture("hybridIdentity", gbufferIdentity);
-      writer
-          .sampler("environmentSampler", environmentState->linearSampler())
-          .sampler("materialSampler", defaultSampler)
-          .apply();
+        frameWriter.buffer("hybridInverseViewProjection", target.hybridInverseViewProjection)
+            .texture("hybridNormalRoughness", normalRoughness)
+            .texture("hybridBaseMetallic", gbufferBaseMetallic)
+            .texture("hybridGeometricDepth", gbufferGeometricCoverage)
+            .texture("hybridIdentity", gbufferIdentity);
+      else
+        frameWriter.buffer("restirResults", restirResults)
+            .buffer("restirGuides", restirGuides)
+            .storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
+            .storageTexture("normalAccumulation", pathNormalAccumulation.view);
+      frameWriter.apply();
       if (hybrid) {
-        frames[f].pathGuideExportSet = pool->allocate(pathGuideExportProgram->setLayouts[0]);
-        DescriptorWriter(context, pathGuideExportProgram->compute(), frames[f].pathGuideExportSet)
+        frames[f].pathGuideExportSet = pathGuideExportProgram->allocate(*pool);
+        DescriptorWriter(context, *pathGuideExportProgram, frames[f].pathGuideExportSet)
             .buffer("samples", pathReconstruction ? pathReconstruction->samples() : pathReconstructionSamples)
             .buffer("uniforms", frames[f].pathUniforms)
             .storageTexture("albedoAccumulation", pathAlbedoAccumulation.view)
@@ -3114,13 +3015,13 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
   context.beginLabel(command, "path trace");  // a range for GPU profilers
   if (wavefront) {
     recordWavefront(command, frame, thisFrame, software, wideSoftware, pipelineBackend, profiling);
-  } else if (pipelineBackend) {
-    pathRayPipeline->trace(command, frame.pathPipelineSet, width, height);
   } else {
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program->layout, 0, 1, &frame.pathSet, 0,
-                            nullptr);
-    vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
+    const ShaderLayout &layout = pipelineBackend ? pathRayPipeline->shaderLayout() : program->shaderLayout();
+    if (pipelineBackend) pathRayPipeline->bind(command);
+    else vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->handle);
+    bindPathSets(command, layout, frame.pathSets);
+    if (pipelineBackend) pathRayPipeline->traceRays(command, width, height);
+    else vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
   }
   context.endLabel(command);
   if (hybrid) {
@@ -3134,8 +3035,7 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
     guideDependency.pMemoryBarriers = &guideBarrier;
     vkCmdPipelineBarrier2(command, &guideDependency);
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathGuideExportPipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathGuideExportProgram->layout,
-                            0, 1, &frame.pathGuideExportSet, 0, nullptr);
+    pathGuideExportProgram->bind(command, frame.pathGuideExportSet);
     vkCmdDispatch(command, (width + 7) / 8, (height + 7) / 8, 1);
   }
   transitionImage(command, lit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, litWriter,
@@ -3204,6 +3104,7 @@ void Renderer::recordRestir(VkCommandBuffer command, FrameResources &frame, bool
   const std::uint32_t environmentVersion = environmentState->version();
   std::uint64_t key = hashBytes(&resourceGeneration, sizeof(resourceGeneration), settingsKey());
   key = hashBytes(&environmentVersion, sizeof(environmentVersion), key);
+  // estimator.z bit 0: temporal reuse.
   bool valid = restirHistory && key == restirHistoryKey && (uniforms.estimator.z & 1u) != 0u;
   if (valid) {
     const pt::PathUniforms &p = restirPreviousUniforms;
@@ -3225,6 +3126,7 @@ void Renderer::recordRestir(VkCommandBuffer command, FrameResources &frame, bool
   std::array<std::uint32_t, 32> counters{};
   counters[16] = groups; counters[17] = 1u; counters[18] = 1u;
   counters[19] = pixels; counters[20] = 1u; counters[21] = 1u;
+  // The wavefront control (pt_wavefront.slang): one batch of every pixel, one sample, accumulating.
   const std::array<std::uint32_t, 8> control{0u, pixels, 0u, pixels, 0u, 1u, 1u, 0u};
   vkCmdUpdateBuffer(command, restirCamera.handle, 0, sizeof(camera), &camera);
   vkCmdUpdateBuffer(command, restirCounters.handle, 0, sizeof(counters), counters.data());
@@ -3243,34 +3145,39 @@ void Renderer::recordRestir(VkCommandBuffer command, FrameResources &frame, bool
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(command, &d);
   };
-  auto dispatch = [&](const Pipeline &pipeline, const Program &program, VkDescriptorSet set) {
+  auto dispatch = [&](const Pipeline &pipeline, const Program &program, const PathSets &sets) {
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0, nullptr);
+    bindPathSets(command, program.shaderLayout(), sets);
     vkCmdDispatch(command, groups, 1, 1);
+  };
+  auto trace = [&](const RayPipeline &rays, const PathSets &sets) {
+    rays.bind(command);
+    bindPathSets(command, rays.shaderLayout(), sets);
+    rays.traceRays(command, pixels);
   };
   barrier();
   if (pipelineBackend) {
-    pathWaveIntersectRayPipeline->trace(command, frame.restirIntersectSet, pixels);
+    trace(*pathWaveIntersectRayPipeline, frame.restirIntersectSets);
   } else {
     const Program &program = software ? (wideSoftware ? *pathWaveIntersectWideProgram : *pathWaveIntersectProgram)
                                       : *pathWaveIntersectRtProgram;
     const Pipeline &pipeline = software ? (wideSoftware ? pathWaveIntersectWidePipeline : pathWaveIntersectPipeline)
                                         : pathWaveIntersectRtPipeline;
-    dispatch(pipeline, program, frame.restirIntersectSet);
+    dispatch(pipeline, program, frame.restirIntersectSets);
   }
   barrier();
-  dispatch(pathRestirInitialPipeline, *pathRestirInitialProgram, frame.restirInitialSet[restirParity]);
+  dispatch(pathRestirInitialPipeline, *pathRestirInitialProgram, frame.restirInitialSets[restirParity]);
   barrier();
-  dispatch(pathRestirSpatialPipeline, *pathRestirSpatialProgram, frame.restirSpatialSet[restirParity]);
+  dispatch(pathRestirSpatialPipeline, *pathRestirSpatialProgram, frame.restirSpatialSets[restirParity]);
   barrier();
   if (pipelineBackend) {
-    pathWaveShadowRayPipeline->trace(command, frame.restirShadowSet, pixels);
+    trace(*pathWaveShadowRayPipeline, frame.restirShadowSets);
   } else {
     const Program &program = software ? (wideSoftware ? *pathWaveShadowWideProgram : *pathWaveShadowProgram)
                                       : *pathWaveShadowRtProgram;
     const Pipeline &pipeline = software ? (wideSoftware ? pathWaveShadowWidePipeline : pathWaveShadowPipeline)
                                         : pathWaveShadowRtPipeline;
-    dispatch(pipeline, program, frame.restirShadowSet);
+    dispatch(pipeline, program, frame.restirShadowSets);
   }
   barrier();
   restirParity ^= 1u;
@@ -3307,14 +3214,21 @@ void Renderer::recordWavefront(VkCommandBuffer command, FrameResources &frame, s
   const bool indirectTrace = pipelineBackend && context.rayPipelineIndirectSupported;
   const VkDeviceAddress counterAddress = indirectTrace ? pathWaveCounters.deviceAddress() : 0u;
   // Counter group g (0, 1: continuation parity; 2: shadow) at uint 8g: dispatch x, y, z, then
-  // count, 1, 1 (the indirect trace dimensions), overflow, reserved.
+  // count, 1, 1 (the indirect trace dimensions), two reserved; uint 24 the frame's overflow.
+  // A ray pipeline launch: its dimensions from the counter group at `offset` when the device
+  // reads them, else the whole capacity.
+  auto trace = [&](const RayPipeline &rays, const PathSets &sets, std::uint32_t offset) {
+    rays.bind(command);
+    bindPathSets(command, rays.shaderLayout(), sets);
+    if (indirectTrace) rays.traceRaysIndirect(command, counterAddress + offset + 12u);
+    else rays.traceRays(command, pathWaveCapacity);
+  };
   auto intersect = [&](std::uint32_t parity) {
     if (pipelineBackend) {
-      if (indirectTrace) pathWaveIntersectRayPipeline->traceIndirect(command, frame.pathWaveIntersectSet, counterAddress + parity * 32u + 12u);
-      else pathWaveIntersectRayPipeline->trace(command, frame.pathWaveIntersectSet, pathWaveCapacity);
+      trace(*pathWaveIntersectRayPipeline, frame.pathWaveIntersectSets, parity * 32u);
     } else {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipeline->handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, intersectProgram->layout, 0, 1, &frame.pathWaveIntersectSet, 0, nullptr);
+      bindPathSets(command, intersectProgram->shaderLayout(), frame.pathWaveIntersectSets);
       vkCmdDispatchIndirect(command, pathWaveCounters.handle, parity * 32u);
     }
   };
@@ -3328,18 +3242,17 @@ void Renderer::recordWavefront(VkCommandBuffer command, FrameResources &frame, s
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                       fused ? fusedPipeline.handle :
                       subgroup ? pathWaveShadePipeline.handle : pathWaveShadeAtomicPipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            (fused ? fusedProgram : subgroup ? pathWaveShadeProgram.get() : pathWaveShadeAtomicProgram.get())->layout,
-                            0, 1, &frame.pathWaveShadeSet, 0, nullptr);
+    bindPathSets(command,
+                 (fused ? fusedProgram : subgroup ? pathWaveShadeProgram.get() : pathWaveShadeAtomicProgram.get())->shaderLayout(),
+                 frame.pathWaveShadeSets);
     vkCmdDispatchIndirect(command, pathWaveCounters.handle, parity * 32u);
   };
   auto shadow = [&]() {
     if (pipelineBackend) {
-      if (indirectTrace) pathWaveShadowRayPipeline->traceIndirect(command, frame.pathWaveShadowSet, counterAddress + 64u + 12u);
-      else pathWaveShadowRayPipeline->trace(command, frame.pathWaveShadowSet, pathWaveCapacity);
+      trace(*pathWaveShadowRayPipeline, frame.pathWaveShadowSets, 64u);
     } else {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipeline->handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, shadowProgram->layout, 0, 1, &frame.pathWaveShadowSet, 0, nullptr);
+      bindPathSets(command, shadowProgram->shaderLayout(), frame.pathWaveShadowSets);
       vkCmdDispatchIndirect(command, pathWaveCounters.handle, 64u);
     }
   };
@@ -3347,7 +3260,7 @@ void Renderer::recordWavefront(VkCommandBuffer command, FrameResources &frame, s
   auto resolve = [&](std::uint32_t pixels, std::uint32_t samples) {
     const std::uint32_t pixelsPerGroup = samples > 0u && samples <= 128u ? 128u / samples : 128u;
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathWaveResolvePipeline.handle);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pathWaveResolveProgram->layout, 0, 1, &frame.pathWaveResolveSet, 0, nullptr);
+    bindPathSets(command, pathWaveResolveProgram->shaderLayout(), frame.pathWaveResolveSets);
     vkCmdDispatch(command, (pixels + pixelsPerGroup - 1u) / pixelsPerGroup, 1, 1);
   };
   const std::uint32_t pixels = width * height;
@@ -3376,6 +3289,8 @@ void Renderer::recordWavefront(VkCommandBuffer command, FrameResources &frame, s
                                                  0u, 1u, 1u, 0u, 1u, 1u, 0u, 0u,
                                                  0u, 1u, 1u, 0u, 1u, 1u, 0u, 0u,
                                                  0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+    // waveControl (pt_wavefront.slang): parity, queue capacity, batch's first path, batch paths;
+    // bounce, samples per pixel, flags (bit 0 accumulate), batch's first pixel.
     std::array<std::uint32_t, 8> control{0u, queueCapacity, static_cast<std::uint32_t>(base), count,
                                          0u, thisFrame, 1u, firstPixel};
     // The frame's overflow total (uint 24) is cleared by the first batch only.

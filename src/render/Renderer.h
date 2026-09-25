@@ -266,6 +266,9 @@ private:
   void recordCpuTrace(VkCommandBuffer command, const Camera &camera);
   // The GPU path tracer: accumulates into float images and writes this frame's lit image.
   void recordGpuTrace(VkCommandBuffer command, const Camera &camera);
+  // A path tracer's "scene" block: geometry, texture table and samplers, lights,
+  // environment distribution, albedo table and emitters.
+  void writePathScene(const ShaderLayout &layout, VkDescriptorSet set, const Buffer &instanceRows);
   void recordHybridSnapshot(VkCommandBuffer command);
   void recordPathComparison(VkCommandBuffer command);
   void buildCpuScene();
@@ -311,7 +314,7 @@ private:
   // litColor into this frame's, which bloom and post read.
   Image litCurrent;
   Image litColor[kFramesInFlight];
-  Image depthBuffer, shadowMap, shadowDummyColor, bloomChain;
+  Image depthBuffer, shadowMap, bloomChain;
   std::vector<VkImageView> bloomMipViews;
   std::uint32_t bloomMipCount = 0;
   std::uint32_t reflectionMipCount = 0;
@@ -351,6 +354,16 @@ private:
   Pipeline pathWaveShadowPipeline, pathWaveShadowWidePipeline, pathWaveShadowRtPipeline;
   Pipeline pathRestirInitialPipeline, pathRestirSpatialPipeline;
 
+  // A path tracing program's sets: its loose globals, written per use, and its scene and traced
+  // structure blocks when its stages read them.
+  struct PathSets {
+    VkDescriptorSet frame = VK_NULL_HANDLE, scene = VK_NULL_HANDLE, structure = VK_NULL_HANDLE;
+  };
+  // Allocates a program's sets and writes its scene and structure blocks; the caller writes the
+  // frame set's globals.
+  PathSets allocatePathSets(const ShaderLayout &layout, const Buffer &instanceRows, bool software, bool wideSoftware);
+  static void bindPathSets(VkCommandBuffer command, const ShaderLayout &layout, const PathSets &sets);
+
   // Per-frame data, one copy per frame in flight.
   struct FrameResources {
     Buffer frameUniforms;
@@ -361,39 +374,32 @@ private:
     Buffer pathUniforms;
     Buffer hybridInverseViewProjection;
     Buffer pathComparisonUniforms;
-    VkDescriptorSet pathSet = VK_NULL_HANDLE;
-    VkDescriptorSet pathPipelineSet = VK_NULL_HANDLE;
+    PathSets pathSets;
     VkDescriptorSet pathGuideExportSet = VK_NULL_HANDLE;
     VkDescriptorSet pathComparisonSet = VK_NULL_HANDLE;
-    VkDescriptorSet pathWaveShadeSet = VK_NULL_HANDLE;
-    VkDescriptorSet pathWaveIntersectSet = VK_NULL_HANDLE, pathWaveShadowSet = VK_NULL_HANDLE;
-    VkDescriptorSet pathWaveResolveSet = VK_NULL_HANDLE;
+    PathSets pathWaveShadeSets, pathWaveIntersectSets, pathWaveShadowSets, pathWaveResolveSets;
     // ReSTIR DI: the backend's intersect and shadow stages over the per-pixel buffers, and
     // the reservoir passes per surface/final-reservoir parity.
-    VkDescriptorSet restirIntersectSet = VK_NULL_HANDLE, restirShadowSet = VK_NULL_HANDLE;
-    VkDescriptorSet restirInitialSet[2]{}, restirSpatialSet[2]{};
-    // Cascade rows packed for the forward pass and strided for the shadow pass, which binds one at a time.
+    PathSets restirIntersectSets, restirShadowSets;
+    PathSets restirInitialSets[2], restirSpatialSets[2];
+    // Cascade rows for the forward pass; the shadow pass pushes its cascade's.
     Buffer cascadePacked;
-    Buffer cascadeStrided;
-    VkDescriptorSet forwardVertexSet = VK_NULL_HANDLE;
+    VkDescriptorSet forwardViewSet = VK_NULL_HANDLE;
     VkDescriptorSet skySet = VK_NULL_HANDLE;
-    VkDescriptorSet skyVertexSet = VK_NULL_HANDLE;
     VkDescriptorSet postSet = VK_NULL_HANDLE;
-    VkDescriptorSet postVertexSet = VK_NULL_HANDLE;
     VkDescriptorSet resolveSet = VK_NULL_HANDLE;
     VkDescriptorSet compositeSet = VK_NULL_HANDLE;
     VkDescriptorSet temporalSet = VK_NULL_HANDLE;
     VkDescriptorSet clusterSet = VK_NULL_HANDLE;
     VkDescriptorSet bloomFirstSet = VK_NULL_HANDLE; // Bloom's first level reads this frame's lit image.
-    std::array<VkDescriptorSet, 4> shadowVertexSets{};
-    std::vector<VkDescriptorSet> forwardMaterialSets;
   };
   std::array<FrameResources, kFramesInFlight> frames;
-  std::vector<VkDescriptorSet> shadowMaterialSets;
+  // Sets that live as long as the scene: per material, and the traced entries' scene (null
+  // where the program traces nothing).
+  VkDescriptorSet shadowSceneSet = VK_NULL_HANDLE;
+  std::vector<VkDescriptorSet> shadowMaterialSets, forwardMaterialSets;
+  VkDescriptorSet forwardTraceSet = VK_NULL_HANDLE, resolveTraceSet = VK_NULL_HANDLE;
   std::vector<VkDescriptorSet> bloomDownSets, bloomUpSets;
-  // The bloom parameters the current sets were built with: threshold, knee, radius.
-  std::array<float, 3> builtBloom{-1.0f, -1.0f, -1.0f};
-  std::vector<Buffer> bloomUniformBuffers;
 
   // Static for the scene's life; instance records are indexed by the draw's first instance.
   Buffer materialBuffer, lightBuffer, instanceBuffer;
@@ -404,7 +410,6 @@ private:
   std::uint32_t lightCount = 0;
   std::vector<LightRecord> hostLights;
   int builtTestLights = -1;
-  VkDeviceSize cascadeStride = 0;
 
   // Neutral textures bound where a material has none.
   Image whiteTexture, normalTexture, blackTexture;
@@ -412,6 +417,7 @@ private:
   VkSampler clampSampler = VK_NULL_HANDLE;
   VkSampler pointSampler = VK_NULL_HANDLE;
   VkSampler shadowSampler = VK_NULL_HANDLE;
+  std::unique_ptr<GltfSamplers> pathSamplers;
 
   std::unique_ptr<DescriptorPool> pool;
   VkQueryPool timestampPool = VK_NULL_HANDLE;
@@ -494,7 +500,7 @@ private:
   VkQueryPool updateTimestamps = VK_NULL_HANDLE;
   std::array<bool, kFramesInFlight> updateRecorded{};
   // The wide tree's traversal stack bound, and whether the wide kernels are the deep-stack ones
-  // (PT_WIDE_BVH_STACK_DEEP), which a bound above 64 needs.
+  // (kWideStackDeep), which a bound above 64 needs.
   std::uint32_t softwareWideStack = 0;
   bool wideStackNeeded = false;  // some tree since the last fresh build needed the deep stack
   bool wideStackDeep = false;
@@ -518,6 +524,7 @@ private:
   std::unique_ptr<GpuProfiler> profiler;  // GPU tracers: trace timing, stage marks on request
   int reconstructionBackend = 0;
   std::uint32_t pathDistributionVersion = ~0u;
+  // What the path sets were written for; any change (or ~0u) rewrites every frame's sets.
   std::uint32_t pathSetsGeneration = ~0u, pathSetsEnvironment = ~0u;
   int pathSetsBackend = -1;
   std::uint32_t gpuSamples = 0;

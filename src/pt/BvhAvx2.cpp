@@ -6,14 +6,15 @@
 
 namespace pt {
 
-PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint *indices,
-                       const float *vertices, const HostTextures &textures, float3 origin,
-                       float3 direction, float tMax, uint mask, uint seed, float2 cone, uint anyHit) {
+PtHit traceWideBvhAvx2(const WideBvh &bvh, const TraceView &view, float3 origin, float3 direction, float tMax, uint mask,
+                       uint seed, float2 cone, uint anyHit) {
+  const PtCpuScene scene = view.withInstances(bvh.instances);
   PtHit hit{}; hit.t = tMax;
   PtRayPrep ray{}; float3 prepOrigin = origin, prepDirection = direction;
   bool prepare = true, done = false; uint stack[128]{};
   uint depth = bvh.nodes.empty() ? 0u : 1u, bottomBase = 0u, inBottom = 0u, instance = 0u;
   while (depth > 0u && !done) {
+    // Back above the bottom level's entries: trace the world-space ray again.
     if (inBottom != 0u && depth <= bottomBase) {
       inBottom = 0u; prepOrigin = origin; prepDirection = direction; prepare = true;
     }
@@ -38,13 +39,14 @@ PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint
         for (uint i = 0; i < count && !done; ++i) {
           const uint triangle = (first + i) * 3u; const float4 v0 = bvh.triangles[triangle];
           float distance = 0.0f; float2 barycentric(0.0f);
+          // ptIntersectTriangle sets bit 1 of hit.ambiguous when the triangle faces the ray; bit 0
+          // is the real flag.
           if (ptIntersectTriangle(ray, xyz(v0), xyz(bvh.triangles[triangle + 1u]),
               xyz(bvh.triangles[triangle + 2u]), hit.t, distance, barycentric, hit.ambiguous)) {
             const uint primitive = as_type<uint>(v0.w);
             if ((bvh.instances[instance].flags & kInstanceBlended) != 0u) hit.ambiguous |= 1u;
-            if (ptCandidateSolid(bvh.instances.data(), materials, indices, vertices, textures,
-                instance, primitive, barycentric, (hit.ambiguous >> 1u) & 1u, seed, direction,
-                ptConeWidthOrLevelZero(cone, distance))) {
+            if (ptCandidateSolid(scene, instance, primitive, barycentric, (hit.ambiguous >> 1u) & 1u, seed, direction,
+                                 ptConeWidthOrLevelZero(cone, distance))) {
               hit.ambiguous &= 1u; hit.t = distance; hit.barycentric = barycentric;
               hit.instance = instance; hit.primitive = primitive; hit.found = 1u;
               if (anyHit != 0u) done = true;
@@ -88,6 +90,8 @@ PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint
     slab(ly, hy, ray.origin.y, ray.inverse.y, ny, fy);
     slab(lz, hz, ray.origin.z, ray.inverse.z, nz, fz);
     const __m256 nearV = _mm256_max_ps(_mm256_setzero_ps(), _mm256_max_ps(nx, _mm256_max_ps(ny, nz)));
+    // As the shared slab test: the far distance grown by a few ulps, so rounding cannot drop a
+    // grazed box.
     const __m256 farV = _mm256_mul_ps(_mm256_min_ps(_mm256_set1_ps(hit.t),
         _mm256_min_ps(fx, _mm256_min_ps(fy, fz))), _mm256_set1_ps(1.0000004f));
     uint hitMask = static_cast<uint>(_mm256_movemask_ps(_mm256_cmp_ps(nearV, farV, _CMP_LE_OQ)));
@@ -99,6 +103,7 @@ PtHit traceWideBvhAvx2(const WideBvh &bvh, const Material *materials, const uint
       if ((hitMask & (1u << child)) != 0u) {
         distances[found] = nearDistances[child]; entries[found++] = node.children[child].w;
       }
+    // Far to near, so the nearest child is popped first, as the shared tracer's SORTED order.
     for (uint i = 1u; i < found; ++i) {
       const float d = distances[i]; const uint e = entries[i]; uint j = i;
       while (j > 0u && distances[j - 1u] < d) {

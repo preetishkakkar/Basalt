@@ -18,8 +18,8 @@ constexpr std::uint32_t kPrefilteredSize = 128;
 constexpr std::uint32_t kPrefilteredMips = 6;
 constexpr std::uint32_t kPrefilterSamples = 128;
 
-// Parameters for one bake dispatch, matching BakeUniforms in shaders/ibl.metal.
-struct BakeUniforms {
+// Parameters for one bake dispatch, the push constants of shaders/slang/entries/ibl.slang.
+struct Bake {
   Vec4 parameters;
 };
 
@@ -235,7 +235,6 @@ void Environment::bake() {
   context.waitIdle();
   for (VkImageView view : temporaryViews) vkDestroyImageView(context.device, view, nullptr);
   temporaryViews.clear();
-  temporaryBuffers.clear();
   pool->reset();
 
   // A cube a kernel writes is bound as a six-layer 2D array view.
@@ -244,54 +243,42 @@ void Environment::bake() {
     temporaryViews.push_back(view);
     return view;
   };
-  auto parameterBuffer = [&](const BakeUniforms &uniforms) -> const Buffer & {
-    Buffer buffer(context, sizeof(BakeUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                  VMA_MEMORY_USAGE_AUTO,
-                  VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                      VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                  "bake.parameters");
-    buffer.write(&uniforms, sizeof(uniforms));
-    temporaryBuffers.push_back(std::move(buffer));
-    return temporaryBuffers.back();
-  };
-
-  const VkDescriptorSet equirectSet = pool->allocate(equirectProgram->setLayouts[0]);
-  const BakeUniforms equirectUniforms{{static_cast<float>(kCubeSize), 0, 0, 0}};
-  DescriptorWriter(context, equirectProgram->compute(), equirectSet)
+  const VkDescriptorSet equirectSet = equirectProgram->allocate(*pool);
+  const Bake equirectBake{{static_cast<float>(kCubeSize), 0, 0, 0}};
+  DescriptorWriter(context, *equirectProgram, equirectSet)
       .storageTexture("destination", storageView(environmentCube, 0))
       .texture("equirectangular", equirectangular)
-      .buffer("bake", parameterBuffer(equirectUniforms))
       .sampler("linearSampler", sampler)
       .apply();
 
   std::vector<VkDescriptorSet> prefilterSets(kPrefilteredMips);
+  std::vector<Bake> prefilterBakes(kPrefilteredMips);
   for (std::uint32_t mip = 0; mip < kPrefilteredMips; ++mip) {
     const float roughness = static_cast<float>(mip) / static_cast<float>(kPrefilteredMips - 1);
-    const BakeUniforms uniforms{{static_cast<float>(kPrefilteredSize >> mip), roughness,
-                                 static_cast<float>(kPrefilterSamples),
-                                 static_cast<float>(environmentCube.description.mipLevels)}};
-    prefilterSets[mip] = pool->allocate(prefilterProgram->setLayouts[0]);
-    DescriptorWriter(context, prefilterProgram->compute(), prefilterSets[mip])
+    prefilterBakes[mip] = {{static_cast<float>(kPrefilteredSize >> mip), roughness,
+                            static_cast<float>(kPrefilterSamples),
+                            static_cast<float>(environmentCube.description.mipLevels)}};
+    prefilterSets[mip] = prefilterProgram->allocate(*pool);
+    DescriptorWriter(context, *prefilterProgram, prefilterSets[mip])
         .storageTexture("destination", storageView(prefilteredCube, mip))
         .texture("source", environmentCube.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-        .buffer("bake", parameterBuffer(uniforms))
         .sampler("linearSampler", sampler)
         .apply();
   }
 
   uploader.runImmediate([&](VkCommandBuffer command) {
     auto dispatchCube = [&](const Pipeline &pipeline, const Program &program, VkDescriptorSet set,
-                            std::uint32_t size) {
+                            const Bake &bake, std::uint32_t size) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, program.layout, 0, 1, &set, 0,
-                              nullptr);
+      program.bind(command, set);
+      program.push(command, bake);
       vkCmdDispatch(command, std::max(1u, size / 8u), std::max(1u, size / 8u), 6);
     };
 
     transitionImage(command, environmentCube, VK_IMAGE_LAYOUT_GENERAL,
                     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_WRITE_BIT);
-    dispatchCube(equirectPipeline, *equirectProgram, equirectSet, kCubeSize);
+    dispatchCube(equirectPipeline, *equirectProgram, equirectSet, equirectBake, kCubeSize);
 
     // Mips for the prefilter to pick by sample solid angle.
     transitionImage(command, environmentCube, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -346,7 +333,8 @@ void Environment::bake() {
                     VK_ACCESS_2_SHADER_WRITE_BIT);
 
     for (std::uint32_t mip = 0; mip < kPrefilteredMips; ++mip)
-      dispatchCube(prefilterPipeline, *prefilterProgram, prefilterSets[mip], kPrefilteredSize >> mip);
+      dispatchCube(prefilterPipeline, *prefilterProgram, prefilterSets[mip], prefilterBakes[mip],
+                   kPrefilteredSize >> mip);
 
     transitionImage(command, prefilteredCube, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,

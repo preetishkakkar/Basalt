@@ -1,2 +1,0 @@
-#define PATH_WAVEFRONT_INTERSECT path_wavefront_intersect
-#include "path_wavefront_intersect_body.metal"

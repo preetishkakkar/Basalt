@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(basalt LANGUAGES CXX)
 
-# Basalt: a Vulkan renderer whose shaders are written in Metal Shading Language
-# and compiled to SPIR-V by msl2spirv (tools/metal2vulkan). Windows only.
+# Basalt: a Vulkan renderer whose shaders are Slang modules, compiled to SPIR-V by slangc and,
+# for the CPU path tracer, to C++. Windows only.
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,7 +24,10 @@ else()
   set(BASALT_GIT_DIRTY 0)
 endif()
 
-# A genuinely GPU-independent configuration: no Vulkan discovery, shader compiler,
+# The Slang shader compiler (SPIR-V for the GPU, C++ for the CPU tracer's shared modules).
+include(cmake/slang.cmake)
+
+# A genuinely GPU-independent configuration: no Vulkan discovery, SPIR-V shaders,
 # window system or renderer targets. It builds the shared CPU integrator, glTF loader,
 # command-line renderer and analytic tests.
 option(BASALT_CPU_ONLY "Build only the headless CPU path tracer and tests" OFF)
@@ -39,8 +42,10 @@ if(BASALT_CPU_ONLY)
   add_library(basalt-pt STATIC
     src/pt/Tracing.cpp src/pt/Bvh.cpp src/pt/BvhVariants.cpp src/pt/BvhAvx2.cpp src/pt/Tables.cpp src/pt/CpuTracer.cpp
     src/pt/Embree.cpp src/pt/Denoiser.cpp src/pt/Gltf.cpp src/pt/CaptureMetadata.cpp src/pt/WavefrontPlan.cpp
-    src/pt/ImageFile.cpp src/pt/EnvironmentSun.cpp)
-  target_include_directories(basalt-pt PUBLIC src shaders)
+    src/pt/ImageFile.cpp src/pt/EnvironmentSun.cpp src/pt/SlangCpu.cpp)
+  basalt_slang_cpu(basalt-pt)
+  target_include_directories(basalt-pt PUBLIC src)
+  target_compile_definitions(basalt-pt PUBLIC SLANG_PRELUDE_NAMESPACE=slangcpp)
   target_include_directories(basalt-pt PRIVATE third_party/cgltf third_party/stb)
   target_compile_definitions(basalt-pt PUBLIC NOMINMAX)
   target_link_libraries(basalt-pt PUBLIC basalt-asset-deps)
@@ -55,12 +60,15 @@ if(BASALT_CPU_ONLY)
   if(MSVC)
     target_compile_options(basalt-pt PRIVATE /W4 /permissive-)
     set_source_files_properties(src/pt/BvhAvx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    # The generated C++ is small static functions; RelWithDebInfo's /Ob1 would inline none.
+    set_source_files_properties(src/pt/SlangCpu.cpp PROPERTIES COMPILE_OPTIONS "/Ob2")
   endif()
 
   add_executable(basalt-pt-cli src/pt/main.cpp)
   target_link_libraries(basalt-pt-cli PRIVATE basalt-pt)
   target_compile_definitions(basalt-pt-cli PRIVATE
-    BASALT_GIT_REVISION="${BASALT_GIT_REVISION}" BASALT_GIT_DIRTY=${BASALT_GIT_DIRTY})
+    BASALT_GIT_REVISION="${BASALT_GIT_REVISION}" BASALT_GIT_DIRTY=${BASALT_GIT_DIRTY}
+    BASALT_SLANG_VERSION="${BASALT_SLANG_VERSION}")
   basalt_copy_runtime_dlls(basalt-pt-cli)
   add_executable(pt-tests tests/pt_tests.cpp)
   target_link_libraries(pt-tests PRIVATE basalt-pt)
@@ -121,146 +129,147 @@ endif()
 
 find_package(Vulkan REQUIRED)
 
-# The Metal shader compiler, fetched on the first configure.
-include(cmake/msl2spirv.cmake)
-basalt_fetch_msl2spirv()
-
 set(BASALT_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 file(MAKE_DIRECTORY "${BASALT_SHADER_DIR}")
 set(BASALT_SHADER_OUTPUTS "")
 
-# basalt_shader(<source.metal> ENTRY <name> [PAIR <fragment entry>] [OPTIONS ...])
+# basalt_slang_shader(<source.slang> ENTRY <name> STAGE <stage> [CAPABILITIES ...])
 #
-# Compiles one entry point to <binary>/shaders/<name>.spv beside its reflection
-# JSON. PAIR asks the compiler to check the vertex entry's outputs against that
-# fragment entry's inputs, so an interface mismatch fails the build rather than
-# the frame. The depfile makes edits to shaders/common.metal rebuild dependents.
-function(basalt_shader source)
-  cmake_parse_arguments(SH "" "ENTRY;PAIR" "OPTIONS" ${ARGN})
+# Compiles one Slang entry point to <binary>/shaders/<name>.spv beside slangc's reflection JSON,
+# then validates the module (slangc does not by default). Slang assigns every binding and the
+# host builds its layouts from the JSON. CAPABILITIES extend the SPIR-V 1.6 profile, e.g.
+# spvRayQueryKHR. The depfile makes edits to imported modules rebuild their dependents.
+find_program(BASALT_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
+set(BASALT_SLANG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders/slang")
+function(basalt_slang_shader source)
+  cmake_parse_arguments(SH "" "ENTRY;STAGE" "CAPABILITIES" ${ARGN})
   set(spv "${BASALT_SHADER_DIR}/${SH_ENTRY}.spv")
   set(json "${BASALT_SHADER_DIR}/${SH_ENTRY}.json")
-  set(pair "")
-  if(SH_PAIR)
-    set(pair --check-fragment-entry ${SH_PAIR})
-  endif()
+  set(profile spirv_1_6)
+  foreach(capability IN LISTS SH_CAPABILITIES)
+    string(APPEND profile "+${capability}")
+  endforeach()
+  # -fvk-use-entrypoint-name keeps the entry's own name in the SPIR-V (not "main"); Shader passes
+  # it as pName. 41012 ("profile implicitly upgraded") names capabilities the module does not use.
   add_custom_command(
     OUTPUT "${spv}" "${json}"
-    COMMAND "${BASALT_MSL2SPIRV}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
-            --stdlib "${BASALT_MSL_STDLIB}"
-            -I "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-            --entry ${SH_ENTRY} ${pair} ${SH_OPTIONS}
-            -o "${spv}" --emit-reflection "${json}"
-            --depfile "${spv}.d"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${BASALT_MSL2SPIRV}"
+    COMMAND "${BASALT_SLANGC}" "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+            -target spirv -profile ${profile} -std 2026 -O1
+            -fp-mode precise -matrix-layout-column-major -default-image-format-unknown
+            -fvk-use-entrypoint-name -warnings-as-errors all -warnings-disable 41012
+            -I "${BASALT_SLANG_DIR}" -I "${BASALT_SLANG_DIR}/basalt" -I "${BASALT_SLANG_DIR}/pt"
+            -entry ${SH_ENTRY} -stage ${SH_STAGE}
+            -o "${spv}" -reflection-json "${json}" -depfile "${spv}.d"
+    COMMAND "${BASALT_SPIRV_VAL}" --target-env vulkan1.3 "${spv}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}" "${BASALT_SLANGC}"
     DEPFILE "${spv}.d"
-    COMMENT "msl2spirv ${source} [${SH_ENTRY}]"
+    COMMENT "slangc ${source} [${SH_ENTRY}]"
     VERBATIM)
   set(BASALT_SHADER_OUTPUTS ${BASALT_SHADER_OUTPUTS} "${spv}" "${json}" PARENT_SCOPE)
 endfunction()
 
-basalt_shader(shaders/forward.metal ENTRY forward_vertex PAIR forward_fragment)
-basalt_shader(shaders/forward.metal ENTRY forward_fragment)
-basalt_shader(shaders/forward_rt.metal ENTRY forward_fragment_rt)
-basalt_shader(shaders/shadow.metal  ENTRY shadow_vertex PAIR shadow_fragment)
-basalt_shader(shaders/shadow.metal  ENTRY shadow_fragment)
-basalt_shader(shaders/sky.metal     ENTRY sky_vertex PAIR sky_fragment)
-basalt_shader(shaders/sky.metal     ENTRY sky_fragment)
-basalt_shader(shaders/post.metal    ENTRY post_vertex PAIR post_fragment)
-basalt_shader(shaders/post.metal    ENTRY post_fragment)
-basalt_shader(shaders/reflect.metal ENTRY resolve_reflections OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/reflect.metal ENTRY composite_reflections OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/reflect_rt.metal ENTRY resolve_reflections_rt OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/taa.metal     ENTRY resolve_temporal OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/cluster.metal ENTRY cull_lights OPTIONS --local-size 64)
-basalt_shader(shaders/ui.metal      ENTRY ui_vertex PAIR ui_fragment)
-basalt_shader(shaders/ui.metal      ENTRY ui_fragment)
-basalt_shader(shaders/ibl.metal     ENTRY equirect_to_cube OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/ibl.metal     ENTRY prefilter_specular OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/bloom.metal   ENTRY bloom_downsample OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/bloom.metal   ENTRY bloom_upsample OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace.metal ENTRY path_trace OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_wide.metal ENTRY path_trace_wide OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_wide_emissive.metal ENTRY path_trace_wide_emissive OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_wide_deep.metal ENTRY path_trace_wide_deep OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_wide_emissive_deep.metal ENTRY path_trace_wide_emissive_deep OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_emissive.metal ENTRY path_trace_emissive OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_rt.metal ENTRY path_trace_rt OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_trace_pipeline.metal ENTRY path_trace_pipeline)
-basalt_shader(shaders/path_trace_pipeline.metal ENTRY path_pipeline_miss)
-basalt_shader(shaders/path_trace_pipeline.metal ENTRY path_pipeline_closest)
-basalt_shader(shaders/path_trace_pipeline.metal ENTRY path_pipeline_alpha)
-basalt_shader(shaders/path_trace_hybrid_rt.metal ENTRY path_trace_hybrid_rt OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_wavefront.metal ENTRY path_wavefront_shade OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_atomic.metal ENTRY path_wavefront_shade_atomic OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_fused_rt.metal ENTRY path_wavefront_fused_rt OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_fused.metal ENTRY path_wavefront_fused OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_fused_wide.metal ENTRY path_wavefront_fused_wide OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_fused_wide_deep.metal ENTRY path_wavefront_fused_wide_deep OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_intersect.metal ENTRY path_wavefront_intersect OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_intersect_wide.metal ENTRY path_wavefront_intersect_wide OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_intersect_wide_deep.metal ENTRY path_wavefront_intersect_wide_deep OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_intersect_rt.metal ENTRY path_wavefront_intersect_rt OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wavefront_intersect_pipeline)
-basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pipeline_miss)
-basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pipeline_closest)
-basalt_shader(shaders/path_wavefront_intersect_pipeline.metal ENTRY path_wave_pipeline_alpha)
-basalt_shader(shaders/path_wavefront_shadow.metal ENTRY path_wavefront_shadow OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_shadow_wide.metal ENTRY path_wavefront_shadow_wide OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_shadow_wide_deep.metal ENTRY path_wavefront_shadow_wide_deep OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_shadow_rt.metal ENTRY path_wavefront_shadow_rt OPTIONS --local-size 64)
-basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wavefront_shadow_pipeline)
-basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wave_shadow_pipeline_miss)
-basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wave_shadow_pipeline_closest)
-basalt_shader(shaders/path_wavefront_shadow_pipeline.metal ENTRY path_wave_shadow_pipeline_alpha)
-basalt_shader(shaders/path_wavefront_resolve.metal ENTRY path_wavefront_resolve OPTIONS --local-size 128)
-basalt_shader(shaders/path_restir.metal ENTRY path_restir_initial OPTIONS --local-size 64)
-basalt_shader(shaders/path_restir.metal ENTRY path_restir_spatial OPTIONS --local-size 64)
-basalt_shader(shaders/path_export_guides.metal ENTRY path_export_guides OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_compare.metal ENTRY path_compare OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/ray_query_oracle.metal ENTRY ray_query_oracle OPTIONS --local-size 64)
-basalt_shader(shaders/ray_pipeline_oracle.metal ENTRY pipeline_oracle_generate)
-basalt_shader(shaders/ray_pipeline_oracle.metal ENTRY pipeline_oracle_miss)
-basalt_shader(shaders/ray_pipeline_oracle.metal ENTRY pipeline_oracle_closest)
-basalt_shader(shaders/ray_pipeline_oracle.metal ENTRY pipeline_oracle_alpha)
-basalt_shader(shaders/bvh_oracle.metal ENTRY bvh_oracle OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_wide_oracle.metal ENTRY bvh_wide_oracle OPTIONS --local-size 64)
-basalt_shader(shaders/raycone_oracle.metal ENTRY raycone_oracle OPTIONS --local-size 64)
-basalt_shader(shaders/wavefront_enqueue.metal ENTRY wavefront_enqueue OPTIONS --local-size 64)
-basalt_shader(shaders/wavefront_trace.metal ENTRY wavefront_trace OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_build.metal ENTRY bvh_build OPTIONS --local-size 1)
-basalt_shader(shaders/bvh_cost.metal ENTRY bvh_cost OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_cost.metal ENTRY bvh_wide_cost OPTIONS --local-size 64)
-basalt_shader(shaders/animate.metal ENTRY animate_vertices OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_gather OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_size OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_roots OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_emit OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_emit_args OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_collapse.metal ENTRY bvh_collapse_rows OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_init OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_single OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_neighbours OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_scan_sums OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_compact OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_ploc.metal ENTRY bvh_ploc_finish OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_extents OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_instances OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_morton OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_topology OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_seed OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_fit OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_number OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_emit OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_lbvh.metal ENTRY bvh_lbvh_finish OPTIONS --local-size 64)
-basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_histogram OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_reduce OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_blocks OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_apply OPTIONS --local-size 128)
-basalt_shader(shaders/bvh_sort.metal ENTRY bvh_sort_scatter OPTIONS --local-size 128)
-basalt_shader(shaders/path_temporal.metal ENTRY path_temporal OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_temporal.metal ENTRY path_atrous OPTIONS --local-size 8 --local-size-y 8)
-basalt_shader(shaders/path_temporal.metal ENTRY path_reconstruct OPTIONS --local-size 8 --local-size-y 8)
+set(BASALT_SLANG_ENTRIES shaders/slang/entries)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/forward.slang ENTRY forward_vertex STAGE vertex)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/forward.slang ENTRY forward_fragment STAGE fragment)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/forward.slang ENTRY forward_fragment_rt STAGE fragment CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/shadow.slang ENTRY shadow_vertex STAGE vertex)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/shadow.slang ENTRY shadow_fragment STAGE fragment)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/sky.slang ENTRY sky_vertex STAGE vertex)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/sky.slang ENTRY sky_fragment STAGE fragment)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/post.slang ENTRY post_vertex STAGE vertex)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/post.slang ENTRY post_fragment STAGE fragment)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bloom.slang ENTRY bloom_downsample STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bloom.slang ENTRY bloom_upsample STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/reflect.slang ENTRY resolve_reflections STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/reflect.slang ENTRY composite_reflections STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/reflect.slang ENTRY resolve_reflections_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/taa.slang ENTRY resolve_temporal STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/cluster.slang ENTRY cull_lights STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/ui.slang ENTRY ui_vertex STAGE vertex)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/ui.slang ENTRY ui_fragment STAGE fragment)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/ibl.slang ENTRY equirect_to_cube STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/ibl.slang ENTRY prefilter_specular STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_wide STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_wide_emissive STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_wide_deep STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_wide_emissive_deep STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_emissive STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_pipeline STAGE raygeneration CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_pipeline_miss STAGE miss CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_pipeline_closest STAGE closesthit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_pipeline_alpha STAGE anyhit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_trace.slang ENTRY path_trace_hybrid_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shade STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shade_atomic STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_fused STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_fused_wide STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_fused_wide_deep STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_intersect STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_intersect_wide STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_intersect_wide_deep STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shadow STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shadow_wide STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shadow_wide_deep STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_resolve STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_fused_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_intersect_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shadow_rt STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_intersect_pipeline STAGE raygeneration CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wave_pipeline_miss STAGE miss CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wave_pipeline_closest STAGE closesthit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wave_pipeline_alpha STAGE anyhit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wavefront_shadow_pipeline STAGE raygeneration CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wave_shadow_pipeline_miss STAGE miss CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_wavefront.slang ENTRY path_wave_shadow_pipeline_alpha STAGE anyhit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_restir.slang ENTRY path_restir_initial STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_restir.slang ENTRY path_restir_spatial STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_export_guides.slang ENTRY path_export_guides STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_compare.slang ENTRY path_compare STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY ray_query_oracle STAGE compute CAPABILITIES spvRayQueryKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY pipeline_oracle_generate STAGE raygeneration CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY pipeline_oracle_miss STAGE miss CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY pipeline_oracle_closest STAGE closesthit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY pipeline_oracle_alpha STAGE anyhit CAPABILITIES spvRayTracingKHR)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY bvh_oracle STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY bvh_wide_oracle STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/raycone_oracle.slang ENTRY raycone_oracle STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY wavefront_enqueue STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/oracles.slang ENTRY wavefront_trace STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_build.slang ENTRY bvh_build STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_cost.slang ENTRY bvh_cost STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_cost.slang ENTRY bvh_wide_cost STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/animate.slang ENTRY animate_vertices STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_gather STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_size STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_roots STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_emit STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_emit_args STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_collapse.slang ENTRY bvh_collapse_rows STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_init STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_single STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_neighbours STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_scan_sums STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_compact STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_ploc.slang ENTRY bvh_ploc_finish STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_extents STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_instances STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_morton STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_topology STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_seed STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_fit STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_number STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_emit STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_lbvh.slang ENTRY bvh_lbvh_finish STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_sort.slang ENTRY bvh_sort_histogram STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_sort.slang ENTRY bvh_sort_reduce STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_sort.slang ENTRY bvh_sort_blocks STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_sort.slang ENTRY bvh_sort_apply STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/bvh_sort.slang ENTRY bvh_sort_scatter STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_temporal.slang ENTRY path_temporal STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_temporal.slang ENTRY path_atrous STAGE compute)
+basalt_slang_shader(${BASALT_SLANG_ENTRIES}/path_temporal.slang ENTRY path_reconstruct STAGE compute)
 
 add_custom_target(basalt-shaders ALL DEPENDS ${BASALT_SHADER_OUTPUTS})
 
@@ -291,17 +300,7 @@ if(MSVC)
   target_compile_options(basalt-deps PRIVATE /W0)
 endif()
 
-# The Metal2Vulkan host library: reflection reading, descriptor layouts and
-# sampler descriptions, built from the copy under tools/ so the engine has one
-# toolchain and one configuration.
-add_library(m2v-host STATIC tools/metal2vulkan/src/m2v_host.cpp)
-target_include_directories(m2v-host PUBLIC tools/metal2vulkan/src)
-target_link_libraries(m2v-host PUBLIC Vulkan::Vulkan)
-if(MSVC)
-  target_compile_options(m2v-host PRIVATE /W0)
-endif()
-
-# The path tracer's CPU backend: the shared shader headers compiled as C++. No Vulkan.
+# The path tracer's CPU backend: the shared Slang modules generated as C++ (pt_cpu). No Vulkan.
 include(cmake/prebuilt.cmake)
 add_library(basalt-pt STATIC
   src/pt/Tracing.cpp
@@ -316,8 +315,11 @@ add_library(basalt-pt STATIC
   src/pt/CaptureMetadata.cpp
   src/pt/ImageFile.cpp
   src/pt/EnvironmentSun.cpp
-  src/pt/WavefrontPlan.cpp)
-target_include_directories(basalt-pt PUBLIC src shaders)
+  src/pt/WavefrontPlan.cpp
+  src/pt/SlangCpu.cpp)
+basalt_slang_cpu(basalt-pt)
+target_include_directories(basalt-pt PUBLIC src)
+target_compile_definitions(basalt-pt PUBLIC SLANG_PRELUDE_NAMESPACE=slangcpp)
 target_include_directories(basalt-pt PRIVATE third_party/cgltf third_party/stb)
 target_compile_definitions(basalt-pt PUBLIC NOMINMAX)
 target_link_libraries(basalt-pt PUBLIC basalt-asset-deps)
@@ -332,12 +334,15 @@ endif()
 if(MSVC)
   target_compile_options(basalt-pt PRIVATE /W4 /permissive-)
   set_source_files_properties(src/pt/BvhAvx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+  # The generated C++ is small static functions; RelWithDebInfo's /Ob1 would inline none.
+  set_source_files_properties(src/pt/SlangCpu.cpp PROPERTIES COMPILE_OPTIONS "/Ob2")
 endif()
 
 add_executable(basalt-pt-cli src/pt/main.cpp)
 target_link_libraries(basalt-pt-cli PRIVATE basalt-pt)
 target_compile_definitions(basalt-pt-cli PRIVATE
-  BASALT_GIT_REVISION="${BASALT_GIT_REVISION}" BASALT_GIT_DIRTY=${BASALT_GIT_DIRTY})
+  BASALT_GIT_REVISION="${BASALT_GIT_REVISION}" BASALT_GIT_DIRTY=${BASALT_GIT_DIRTY}
+  BASALT_SLANG_VERSION="${BASALT_SLANG_VERSION}")
 basalt_copy_runtime_dlls(basalt-pt-cli)
 if(MSVC)
   target_compile_options(basalt-pt-cli PRIVATE /W4 /permissive-)
@@ -351,7 +356,7 @@ add_executable(basalt WIN32
   src/gpu/Context.cpp
   src/gpu/Swapchain.cpp
   src/gpu/Resources.cpp
-  src/gpu/Shader.cpp
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp
   src/gpu/Pipeline.cpp
   src/gpu/RayPipeline.cpp
   src/gpu/Descriptors.cpp
@@ -369,16 +374,15 @@ add_executable(basalt WIN32
   src/render/RayTracing.cpp
   src/render/TraceScene.cpp
   src/render/UiPass.cpp)
-# shaders/ for the headers the path tracer compiles as both MSL and C++.
-target_include_directories(basalt PRIVATE src shaders)
-target_link_libraries(basalt PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan comdlg32 shell32)
+target_include_directories(basalt PRIVATE src)
+target_link_libraries(basalt PRIVATE basalt-deps basalt-pt Vulkan::Vulkan comdlg32 shell32)
 add_dependencies(basalt basalt-shaders)
 basalt_copy_runtime_dlls(basalt)
 target_compile_definitions(basalt PRIVATE
   UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
   BASALT_GIT_REVISION="${BASALT_GIT_REVISION}" BASALT_GIT_DIRTY=${BASALT_GIT_DIRTY}
   BASALT_SHADER_DIR="${BASALT_SHADER_DIR}"
-  BASALT_MSL2SPIRV_VERSION="${BASALT_MSL2SPIRV_VERSION}"
+  BASALT_SLANG_VERSION="${BASALT_SLANG_VERSION}"
   BASALT_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
 if(MSVC)
   target_compile_options(basalt PRIVATE /W4 /permissive- /wd4324)
@@ -410,7 +414,7 @@ add_executable(gpu-ray-tests
   src/platform/Window.cpp
   src/gpu/Context.cpp
   src/gpu/Resources.cpp
-  src/gpu/Shader.cpp
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp
   src/gpu/Pipeline.cpp
   src/gpu/RayPipeline.cpp
   src/gpu/Descriptors.cpp
@@ -421,8 +425,8 @@ add_executable(gpu-ray-tests
   src/render/GpuLbvhBuilder.cpp
   src/render/GpuBvhCollapse.cpp
   src/render/TraceScene.cpp)
-target_include_directories(gpu-ray-tests PRIVATE src shaders)
-target_link_libraries(gpu-ray-tests PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan)
+target_include_directories(gpu-ray-tests PRIVATE src)
+target_link_libraries(gpu-ray-tests PRIVATE basalt-deps basalt-pt Vulkan::Vulkan)
 add_dependencies(gpu-ray-tests basalt-shaders)
 target_compile_definitions(gpu-ray-tests PRIVATE
   UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN BASALT_SHADER_DIR="${BASALT_SHADER_DIR}")
@@ -558,10 +562,10 @@ if(Python3_Interpreter_FOUND AND NOT BASALT_CPU_ONLY)
 endif()
 add_executable(gpu-temporal-tests tests/gpu_temporal_tests.cpp
   src/core/Log.cpp src/platform/Window.cpp src/gpu/Context.cpp src/gpu/Resources.cpp
-  src/gpu/Shader.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp
   src/render/PathReconstruction.cpp)
-target_include_directories(gpu-temporal-tests PRIVATE src shaders)
-target_link_libraries(gpu-temporal-tests PRIVATE basalt-deps m2v-host Vulkan::Vulkan)
+target_include_directories(gpu-temporal-tests PRIVATE src)
+target_link_libraries(gpu-temporal-tests PRIVATE basalt-pt basalt-deps Vulkan::Vulkan)
 add_dependencies(gpu-temporal-tests basalt-shaders)
 target_compile_definitions(gpu-temporal-tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
   BASALT_SHADER_DIR="${BASALT_SHADER_DIR}")
@@ -572,9 +576,9 @@ add_test(NAME gpu-temporal-tests COMMAND gpu-temporal-tests)
 # The ray-cone level of detail, bitwise on the CPU and the GPU.
 add_executable(gpu-raycone-tests tests/gpu_raycone_tests.cpp
   src/core/Log.cpp src/platform/Window.cpp src/gpu/Context.cpp src/gpu/Resources.cpp
-  src/gpu/Shader.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp)
-target_include_directories(gpu-raycone-tests PRIVATE src shaders)
-target_link_libraries(gpu-raycone-tests PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan)
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp)
+target_include_directories(gpu-raycone-tests PRIVATE src)
+target_link_libraries(gpu-raycone-tests PRIVATE basalt-deps basalt-pt Vulkan::Vulkan)
 add_dependencies(gpu-raycone-tests basalt-shaders)
 basalt_copy_runtime_dlls(gpu-raycone-tests)
 target_compile_definitions(gpu-raycone-tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
@@ -583,22 +587,23 @@ if(MSVC)
   target_compile_options(gpu-raycone-tests PRIVATE /W4 /permissive- /wd4324)
 endif()
 add_test(NAME gpu-raycone-tests COMMAND gpu-raycone-tests)
-# Driver statistics (registers, spills) of the compute pipelines; a diagnostic, not a test.
+# Driver statistics (registers, spills) of the compute and ray pipelines; a diagnostic, not a test.
 add_executable(shader-stats tools/shader_stats.cpp
   src/core/Log.cpp src/core/Math.cpp src/platform/Window.cpp src/gpu/Context.cpp src/gpu/Resources.cpp
-  src/gpu/Shader.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp)
-target_include_directories(shader-stats PRIVATE src shaders)
-target_link_libraries(shader-stats PRIVATE basalt-deps m2v-host Vulkan::Vulkan)
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp
+  src/gpu/RayPipeline.cpp)
+target_include_directories(shader-stats PRIVATE src)
+target_link_libraries(shader-stats PRIVATE basalt-deps Vulkan::Vulkan)
 add_dependencies(shader-stats basalt-shaders)
 target_compile_definitions(shader-stats PRIVATE
   UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN BASALT_SHADER_DIR="${BASALT_SHADER_DIR}")
 
 add_executable(gpu-motion-tests tests/gpu_motion_tests.cpp
   src/core/Log.cpp src/core/Math.cpp src/platform/Window.cpp src/gpu/Context.cpp src/gpu/Resources.cpp
-  src/gpu/Shader.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp
+  src/gpu/Shader.cpp src/gpu/SlangReflection.cpp src/core/Json.cpp src/gpu/Pipeline.cpp src/gpu/Descriptors.cpp src/gpu/Uploader.cpp
   src/scene/Scene.cpp src/render/RayTracing.cpp src/render/GpuBvhBuilder.cpp src/render/GpuLbvhBuilder.cpp src/render/GpuBvhCollapse.cpp src/render/PathReconstruction.cpp)
-target_include_directories(gpu-motion-tests PRIVATE src shaders)
-target_link_libraries(gpu-motion-tests PRIVATE basalt-deps basalt-pt m2v-host Vulkan::Vulkan)
+target_include_directories(gpu-motion-tests PRIVATE src)
+target_link_libraries(gpu-motion-tests PRIVATE basalt-deps basalt-pt Vulkan::Vulkan)
 add_dependencies(gpu-motion-tests basalt-shaders)
 basalt_copy_runtime_dlls(gpu-motion-tests)
 target_compile_definitions(gpu-motion-tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN

@@ -208,4 +208,23 @@ std::uint32_t mipLevelsFor(std::uint32_t width, std::uint32_t height) {
   return levels;
 }
 
+GltfSamplers::GltfSamplers(const Context &ctx) : context(ctx) {
+  const VkSamplerAddressMode wraps[3]{VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                      VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
+  for (std::size_t i = 0; i < 6; ++i) {
+    VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    info.magFilter = info.minFilter = i < 3 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.addressModeU = info.addressModeV = wraps[i % 3];
+    info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    info.maxLod = VK_LOD_CLAMP_NONE;
+    check(vkCreateSampler(context.device, &info, nullptr, &handles[i]), "vkCreateSampler (glTF mode)");
+  }
+}
+
+GltfSamplers::~GltfSamplers() {
+  for (VkSampler sampler : handles)
+    if (sampler) vkDestroySampler(context.device, sampler, nullptr);
+}
+
 } // namespace basalt

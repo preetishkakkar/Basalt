@@ -84,4 +84,22 @@ void computeImageBarrier(VkCommandBuffer command, VkImage image, VkImageAspectFl
 
 std::uint32_t mipLevelsFor(std::uint32_t width, std::uint32_t height);
 
+// The path tracers' six glTF sampler modes for their texture table: repeat, clamp and mirror, each
+// linear then nearest; mips always linear, no anisotropy, w clamped. `names` are the GpuMaps
+// fields (shaders/slang/pt/pt_gpu.slang) they bind to.
+class GltfSamplers {
+public:
+  explicit GltfSamplers(const Context &context);
+  ~GltfSamplers();
+  GltfSamplers(const GltfSamplers &) = delete;
+  GltfSamplers &operator=(const GltfSamplers &) = delete;
+
+  static constexpr const char *names[6] = {"repeatLinear", "clampLinear", "mirrorLinear",
+                                           "repeatNearest", "clampNearest", "mirrorNearest"};
+  VkSampler handles[6]{};
+
+private:
+  const Context &context;
+};
+
 } // namespace basalt

@@ -181,8 +181,8 @@ EnvironmentSun extractEnvironmentSun(std::vector<float> &rgba, uint width, uint 
   return sun;
 }
 
-void environmentSunUniforms(float3 direction, float3 irradiance, float angularRadius, float4 &sunDirection,
-                            float4 &sunRadiance) {
+void environmentSunUniforms(float3 direction, float3 irradiance, float angularRadius, Vector<float, 4> &sunDirection,
+                            Vector<float, 4> &sunRadiance) {
   sunDirection = float4(0.0f);
   sunRadiance = float4(0.0f);
   if (!(std::max(irradiance.x, std::max(irradiance.y, irradiance.z)) > 0.0f)) return;

@@ -10,7 +10,7 @@
 #include <vector>
 
 namespace pt {
-struct BvhBuildStatus2;  // shaders/pt/bvh_build.h
+struct BvhBuildStatus2;  // pt_bvh_build.slang
 }
 
 namespace basalt {
@@ -19,7 +19,7 @@ class Context;
 class DescriptorPool;
 class Uploader;
 
-// The GPU builders' shared status record (shaders/pt/bvh_build.h), widened for the host.
+// The GPU builders' shared status record (pt_bvh_build.slang), widened for the host.
 struct GpuBvhStatus {
   std::uint32_t error = 0, topDepth = 0, bottomDepth = 0, maximumBuilderStack = 0;
   std::uint32_t nodes = 0, triangles = 0, instances = 0, sortPasses = 0;
@@ -62,10 +62,10 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
                               const Scene &scene, const TraceScene &trace);
 
 // The parallel builder's topology: Karras's LBVH (the serial builder's tree), or PLOC's
-// agglomerative clustering in Morton order (shaders/bvh_ploc.metal), numbered and published alike.
+// agglomerative clustering in Morton order (bvh_ploc.slang), numbered and published alike.
 enum class GpuBvhTopology { Lbvh, Ploc };
 
-// The parallel LBVH (shaders/bvh_lbvh.metal, bvh_sort.metal): the serial builder's tree for
+// The parallel LBVH (bvh_lbvh.slang, bvh_sort.slang): the serial builder's tree for
 // every bottom level and the TLAS in one set of dispatches, with its numbering; or, with the PLOC
 // topology, the same sort, fit, numbering and layout around PLOC's tree. The programs and
 // pipelines are made once; build() allocates one scene's scratch and releases it unless asked to
@@ -165,7 +165,7 @@ struct GpuWideCollapseResult {
 
 // Collapses a resident binary tree (the TLAS at node 0 and one bottom level per instance, as
 // every builder publishes) into pt::buildWideBvh's quantized BVH4/BVH8 nodes, byte for byte
-// and in its node order (shaders/bvh_collapse.metal). The programs are made once.
+// and in its node order (bvh_collapse.slang). The programs are made once.
 class GpuBvhCollapser {
 public:
   explicit GpuBvhCollapser(const Context &context);

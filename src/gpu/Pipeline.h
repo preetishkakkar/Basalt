@@ -37,10 +37,9 @@ struct GraphicsPipelineDescription {
   bool depthWrite = true;
   VkCompareOp depthCompare = VK_COMPARE_OP_GREATER_OR_EQUAL; // Reverse-Z everywhere but the shadow pass.
   bool depthBias = false;
-  // No fragment stage: the profile has no `fragment void`, so a depth-only pass would otherwise write a colour nothing receives.
+  // No fragment stage: a depth-only pass whose fragments would do nothing (opaque shadow casters).
   bool depthOnly = false;
   bool blend = false;                 // Straight alpha over the destination.
-  bool additive = false;              // Add, for the bloom composite.
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   const VkSpecializationInfo *vertexSpecialization = nullptr;
   const VkSpecializationInfo *fragmentSpecialization = nullptr;
