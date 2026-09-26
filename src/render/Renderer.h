@@ -17,6 +17,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace basalt {
@@ -24,12 +25,43 @@ namespace basalt {
 class GpuLbvhBuilder;
 class GpuBvhCollapser;
 
-// Software GPU BVH builders, as RenderSettings::pathBvhBuilder numbers them; the names are
-// --bvh-builder's and the capture metadata's.
-inline constexpr const char *kBvhBuilderNames[] = {"cpu-sah", "gpu-serial", "gpu-lbvh", "gpu-ploc"};
-inline constexpr int kBvhBuilderCount = static_cast<int>(sizeof(kBvhBuilderNames) / sizeof(kBvhBuilderNames[0]));
+// Software GPU BVH builders, as RenderSettings::pathBvhBuilder numbers them: the --bvh-builder
+// name, the interface's label and the capture metadata's builder.
+struct BvhBuilderInfo {
+  const char *name, *label, *metadata;
+};
+inline constexpr BvhBuilderInfo kBvhBuilders[] = {
+    {"cpu-sah", "CPU binned SAH", "cpu-binned-sah"},
+    {"gpu-serial", "GPU serial LBVH", "gpu-serial-lbvh"},
+    {"gpu-lbvh", "GPU parallel LBVH", "gpu-parallel-lbvh"},
+    {"gpu-ploc", "GPU parallel PLOC", "gpu-parallel-ploc"},
+    {"gpu-apetrei", "GPU single-pass LBVH (Apetrei)", "gpu-single-pass-lbvh"},
+    {"gpu-batched", "GPU batched LBVH (HIPRT)", "gpu-batched-lbvh"},
+    {"gpu-plocpp", "GPU PLOC++ (fused iterations)", "gpu-parallel-plocpp"},
+    {"gpu-hploc", "GPU H-PLOC", "gpu-hploc"},
+    {"gpu-sah", "GPU binned SAH", "gpu-binned-sah"},
+};
+inline constexpr int kBvhBuilderCount = static_cast<int>(sizeof(kBvhBuilders) / sizeof(kBvhBuilders[0]));
+// The default: the GPU binned SAH, the CPU builder's tree (the fastest to trace of the builders on
+// every scene measured) built on the GPU; the CPU builder where the device cannot run it.
+inline constexpr int kDefaultBvhBuilder = 8;
+static_assert(std::string_view(kBvhBuilders[kDefaultBvhBuilder].name) == "gpu-sah");
+
+// The binary layout's GPU traversals (pt_bvh.slang's kBinary*): the name --bvh-traversal takes,
+// and the suffix of their kernels' entry points.
+struct BvhTraversalInfo {
+  const char *name;
+  const char *suffix;
+};
+inline constexpr BvhTraversalInfo kBvhTraversals[] = {
+    {"stack", ""},
+    {"while-while", "_while_while"},
+    {"speculative", "_speculative"},
+    {"restart-trail", "_restart_trail"},
+};
+inline constexpr int kBvhTraversalCount = static_cast<int>(sizeof(kBvhTraversals) / sizeof(kBvhTraversals[0]));
 inline const char *bvhBuilderName(int builder) {
-  return builder >= 0 && builder < kBvhBuilderCount ? kBvhBuilderNames[builder] : "unknown";
+  return builder >= 0 && builder < kBvhBuilderCount ? kBvhBuilders[builder].name : "unknown";
 }
 
 // What the last software BVH build measured, for the metadata and the interface.
@@ -42,6 +74,8 @@ struct SoftwareBvhReport {
   std::uint32_t layoutNodes = 0;                       // nodes of the traversed layout
   std::vector<double> stageMilliseconds;               // GPU builders: kGpuBvhStageNames order
   std::uint32_t plocIterations = 0;                    // gpu-ploc: merge iterations that merged
+  std::uint32_t references = 0;                        // split clipping: the bottom levels' references
+  double clipMilliseconds = 0.0;                       // split clipping on the host (pt::clipReferences)
   // Animated scenes: the per-frame updates (a GPU LBVH refit and/or TLAS rebuild, then the wide
   // re-emit or collapse; a full build for the other builders or --bvh-update rebuild).
   std::uint32_t refits = 0, topRebuilds = 0, fullBuilds = 0;
@@ -126,8 +160,11 @@ struct RenderSettings {
   int animate = 0;            // software GPU only, synthetic seeded motion per frame: 0 off, 1 instances, 2 vertices, 3 both
   int pathWideStack = 0;      // wide kernels' traversal stack: 0 auto (96 in the megakernel, where it is faster; 64 in the
                               // wavefront stages unless the tree needs 96), 1 always 96, 2 64 unless the tree needs 96
-  int pathBvhBuilder = 0;     // software GPU only: kBvhBuilderNames (0 CPU SAH, 1 serial GPU LBVH, 2 parallel GPU LBVH,
-                              // 3 parallel GPU PLOC)
+  int pathBvhBuilder = kDefaultBvhBuilder;  // software GPU only: an index into kBvhBuilders
+  int pathBvhTraversal = 0;   // software GPU, binary layout: 0 stack, 1 while-while, 2 speculative while-while,
+                              // 3 restart trail (kBvhTraversals)
+  float pathBvhSplitClipping = 0.0f;  // software GPU only: early split clipping's area factor
+                                      // (pt::clipReferences) for every builder; 0 off
   int pathBvhWidth = 0;       // software GPU only: 0 binary, 1 quantized BVH4, 2 quantized BVH8
   int pathExecution = 0;      // GPU tracer: 0 megakernel (iterative raygen for the ray pipeline), 1 wavefront queues
   int pathWaveCapacity = 0;   // wavefront: paths per batch; 0 automatic (pt::kWavefrontDefaultPaths within device limits)
@@ -276,6 +313,13 @@ private:
   void recordSoftwareBvhUpdate(VkCommandBuffer command, bool moved, bool warped);
   void checkSoftwareBvhFrame(std::uint32_t slot);
   void selectWideStack(bool deep);
+  // Whether the binary kernels need the deep stack: a tree deeper than kBvhStack, or in-frame
+  // updates (a TLAS rebuilt in the frame may deepen before its depth is read back).
+  bool binaryStackNeeded() const {
+    return softwareBvhStatistics.topDepth + softwareBvhStatistics.bottomDepth > std::uint32_t(pt::kBvhStack) ||
+           softwareBvhInFrame;
+  }
+  void selectBinaryTraversal(int traversal, bool deep);
   void animateScene(VkCommandBuffer command, bool inFrame);
   void ensureEmissiveTriangles();
   pt::PathUniforms makePathUniforms(const Camera &camera);
@@ -486,6 +530,7 @@ private:
   std::uint32_t softwareBvhVersion = ~0u;
   int softwareBvhBuilder = -1;
   int softwareBvhWidth = -1;
+  float softwareBvhSplitClipping = 0.0f;
   VkDeviceSize softwareBvhScratchBytes = 0, softwareBvhOutputBytes = 0;
   std::uint32_t softwareBvhRadixPasses = 0, softwareBvhMaximumStack = 0;
   // A GPU LBVH kept for updates (animated scenes): its binary nodes (the traced nodes unless
@@ -504,6 +549,8 @@ private:
   std::uint32_t softwareWideStack = 0;
   bool wideStackNeeded = false;  // some tree since the last fresh build needed the deep stack
   bool wideStackDeep = false;
+  int binaryTraversal = 0;  // the traversal the binary kernels were made with
+  bool binaryStackDeep = false;  // and whether with the deep stack (kBvhStackDeep)
   Buffer softwareBvhBinaryNodes;
   std::uint32_t softwareBvhBinaryCount = 0, softwareBvhDepth = 0;
   std::uint32_t softwareBvhGeometry = 0, softwareBvhTransforms = 0;

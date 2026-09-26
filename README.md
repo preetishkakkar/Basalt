@@ -201,10 +201,24 @@ library and calls its exports; the host keeps only what it owns, its copies of t
 its own intersectors (Embree and an AVX2 BVH8 traversal), which the generated code calls back
 through. The constants the host shares with the shaders are generated from the modules too.
 
-**BVH builders.** The software BVH is built on the CPU (binned SAH) or on the GPU: a serial SAH
-kernel, a parallel LBVH (Karras) over a GPU radix sort, or PLOC, all publishing the same node
-layout, collapsed on the GPU to quantized BVH4/BVH8 and refitted in place for animated geometry.
-The parallel builders publish the serial builder's tree byte for byte, which the tests check.
+**BVH builders.** The software BVH is built by default on the GPU with a binned SAH: the CPU
+builder's tree, which traces fastest on every scene measured, built top-down one level per
+dispatch (`--bvh-builder gpu-sah`; on the CPU where the device lacks subgroups of 32 or more).
+The others (`--bvh-builder`) are the CPU builder itself, a serial LBVH kernel, a parallel LBVH
+(Karras) over a GPU radix sort, Apetrei's single-pass LBVH, HIPRT's batched LBVH, PLOC, PLOC++
+(PLOC with each iteration one fused dispatch) and H-PLOC (PLOC merges at the nodes of an LBVH
+climb), all publishing the same node layout, collapsed on the GPU to quantized BVH4/BVH8 and
+refitted in place for animated geometry (the SAH trees are rebuilt instead). The three parallel
+LBVHs publish the serial builder's tree byte for byte, PLOC++
+PLOC's and the GPU SAH the CPU builder's, which the tests check. Early split clipping
+(`--bvh-split-clipping`, Ernst and Greiner) feeds any of them references to the parts of large
+triangles instead of the triangles, clipped on the GPU for the GPU builders (the host's bytes, in
+double precision; on the host where the device has no 64-bit floats); those trees are rebuilt
+when animated.
+The binary layout is traversed on the GPU with a stack by default, or (`--bvh-traversal`) with
+Aila and Laine's while-while or speculative while-while loops or Laine's restart trail, which all
+find the same hits. A tree deeper than 64 levels, top and bottom together (PLOC's reach that on
+large scenes), is traversed by kernels with a 96-entry stack; the restart trail keeps no stack.
 
 ## Layout
 
@@ -217,7 +231,7 @@ The parallel builders publish the serial builder's tree byte for byte, which the
 | `src/render/` | The frame: shadow, forward, sky, reflection, bloom and post passes; the GPU path tracers' passes and reconstruction; the acceleration structures and the GPU BVH builders; the IBL bake; the ImGui backend. |
 | `src/pt/` | The CPU side: the generated path tracer's host view (`Shared.h`, `Tracing.h`), the BVH builders and wide layouts, the environment and albedo tables, the CPU tracer, capture metadata and image files. |
 | `tests/` | The CTest manifest's programs and scripts: CPU transport tests, GPU oracles and image gates per backend, lifecycle and CLI rejection tests, and generated test scenes in `tests/data/`. |
-| `tools/` | The image comparison script, the benchmark harness and `shader-stats`. |
+| `tools/` | The image comparison script, the benchmark harness, `fetch_scenes.py` (the larger benchmark scenes, from McGuire's archive) and `shader-stats`. |
 | `cmake/` | Fetching Slang and the prebuilt Embree and Open Image Denoise, and generating the CPU tracer's C++ and constants. |
 | `docs/` | The screenshot above. |
 
@@ -236,6 +250,10 @@ The parallel builders publish the serial builder's tree byte for byte, which the
 - Transparent surfaces are sorted per primitive, not per triangle, and cast no
   shadows.
 - `KHR_materials_specular_glossiness` is approximated, not implemented.
+- The serial GPU BVH builder (`--bvh-builder gpu-serial`) is one GPU thread, a correctness
+  baseline. It submits its bottom levels in batches so that no submission outlasts the driver's
+  timeout, but it rejects a mesh of more than 262,144 triangles and takes seconds on a large
+  scene (about 14 s for the Godot Bistro's 2.8 million triangles on an RTX 4090).
 - In the rasteriser's traced effects, blended surfaces are left out of the
   acceleration structure, so those rays pass through them; the path tracers
   test blended and masked surfaces in their any-hit.

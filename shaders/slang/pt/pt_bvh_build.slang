@@ -12,10 +12,26 @@ public __extern_cpp struct BvhBuildDescriptor {
 public __extern_cpp struct BvhBuildControl {
   __extern_cpp uint4 sizes;    // instance count, total triangles, scratch records, node capacity
   __extern_cpp uint4 geometry; // index count, vertex count, traversal stack capacity, layout version
+  __extern_cpp uint4 part;     // this dispatch's bottom levels [x, y), and z: 1 when it builds the TLAS
+};
+
+// A part of a triangle after early split clipping (pt::clipReferences): a bottom level's record
+// is its box, and its leaf publishes the whole triangle.
+public __extern_cpp struct BvhReference {
+  __extern_cpp float4 low;  // w: the primitive (within its instance), as bits
+  __extern_cpp float4 high;
+};
+
+// The GPU split clipping's dispatch (bvh_clip.slang).
+public __extern_cpp struct BvhClipControl {
+  __extern_cpp uint4 sizes;   // instances, triangles, area blocks, scan blocks
+  __extern_cpp float4 factor; // x: the area factor
 };
 
 public __extern_cpp struct BvhBuildRecord {
-  __extern_cpp uint4 identity; // primitive/instance ID, Morton code, reserved, reserved
+  __extern_cpp uint4 identity; // primitive/instance ID, Morton code, segment (the parallel builders), the
+                               // record's index in its level (orders equal Morton codes: the primitive
+                               // or instance, or with split clipping the reference)
   __extern_cpp float4 low;
   __extern_cpp float4 high;
 };
@@ -47,10 +63,13 @@ public __extern_cpp struct BvhSegment {
 public __extern_cpp struct BvhLbvhControl {
   __extern_cpp uint4 sizes;    // records, segments, internal nodes, triangles
   __extern_cpp uint4 geometry; // index count, vertex count, traversal stack capacity, layout version
-  __extern_cpp uint4 range;    // instance count, first record of the TLAS, fit iteration (per dispatch), reserved
+  __extern_cpp uint4 range;    // instance count, first record of the TLAS, fit iteration (per dispatch), batched
+                               // level size (the batched build's slot only: lbvhBatched; 0 elsewhere)
   __extern_cpp uint4 part;     // the part built: first record (Morton), first internal node, internal nodes,
                                // triangles (the whole scene: 0, 0, internal nodes, triangles; the TLAS alone:
                                // its first record and node, its nodes, 0)
+  __extern_cpp uint4 source;   // x: 1 when the bottom levels' records are split clipping's references; y: the
+                               // binned SAH's levels with large-task slots (bvh_sah.slang)
 };
 
 public __extern_cpp struct BvhSortControl {
@@ -131,3 +150,38 @@ public uint ptOrderedBits(float f) {
   return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
 }
 public float ptOrderedFloat(uint u) { return asfloat((u & 0x80000000u) != 0u ? (u & 0x7FFFFFFFu) : ~u); }
+
+// The parallel LBVH builders' shared steps, generic over read-only and read-write buffers.
+
+// Whether a batched build (bvh_batched.slang) builds this bottom level in one workgroup, so the
+// global extents, Morton and climb kernels skip it.
+public bool lbvhBatched(BvhSegment segment, BvhLbvhControl control) {
+  return control.range.w != 0u && segment.flags.x == 0u && segment.range.y >= 2u && segment.range.y <= control.range.w;
+}
+
+// The segment holding record r: the last of the first `searched` segments whose first record is
+// <= r (empty segments share their successor's first record and are skipped that way).
+public uint lbvhSegmentOfRecord<S : IArray<BvhSegment>>(S segments, uint searched, uint record) {
+  uint low = 0u, high = searched;
+  while (high - low > 1u) {
+    const uint middle = (low + high) >> 1u;
+    if (segments[middle].range.x <= record) low = middle;
+    else high = middle;
+  }
+  return low;
+}
+
+// The serial builder's commonPrefix over (Morton code, index in the level) at a segment's sorted
+// positions a and b (the segment's keys start at `first`; codes and sortedIndex are the sorted
+// keys); -1 when b is outside the segment.
+public int lbvhPrefix<C : IArray<uint>, I : IArray<uint>, R : IArray<BvhBuildRecord>>(C codes, I sortedIndex, R records,
+                                                                                    uint first, uint count, uint a, int b) {
+  if (b < 0 || uint(b) >= count) return -1;
+  const uint ma = codes[first + a];
+  const uint mb = codes[first + uint(b)];
+  if (ma != mb) return int(leadingZeros(ma ^ mb));
+  const uint ia = records[sortedIndex[first + a]].identity.w;
+  const uint ib = records[sortedIndex[first + uint(b)]].identity.w;
+  if (ia == ib) return 64;
+  return 32 + int(leadingZeros(ia ^ ib));
+}

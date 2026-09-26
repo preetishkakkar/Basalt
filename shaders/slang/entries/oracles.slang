@@ -53,16 +53,44 @@ void softwareOracle<T : IPtTracer>(T tracer, uint id) {
   hits[id] = output;
 }
 
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void bvh_oracle(uint3 id: SV_DispatchThreadID) {
-  BinaryBvhTracer<GpuMaps> tracer;
+void binaryOracle<let TRAVERSAL : int, let STACK : int = kBvhStack>(uint id) {
+  BinaryBvhTracer<GpuMaps, TRAVERSAL, STACK> tracer;
   tracer.nodes = bvhNodes;
   tracer.triangles = bvhTriangles;
   tracer.geometry = geometry;
   tracer.maps = maps;
-  softwareOracle(tracer, id.x);
+  softwareOracle(tracer, id);
 }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinaryStack>(id.x); }
+
+// The binary tree's other traversals (--bvh-traversal).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_while_while(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinaryWhileWhile>(id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_speculative(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinarySpeculative>(id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_restart_trail(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinaryRestartTrail>(id.x); }
+
+// The deep traversal stack (kBvhStackDeep).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_deep(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinaryStack, kBvhStackDeep>(id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_while_while_deep(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinaryWhileWhile, kBvhStackDeep>(id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bvh_oracle_speculative_deep(uint3 id: SV_DispatchThreadID) { binaryOracle<kBinarySpeculative, kBvhStackDeep>(id.x); }
 
 // The deep traversal stack: tests may trace any tree the conversion accepts.
 [shader("compute")]

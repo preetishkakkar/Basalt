@@ -21,7 +21,7 @@ namespace {
 static_assert(sizeof(pt::BvhCollapseControl) == 32);
 static_assert(sizeof(pt::BvhCollapseStatus) == 16);
 
-constexpr std::uint32_t kLevels = pt::kBvhStack;  // bvh_collapse.slang's kCollapseLevels
+constexpr std::uint32_t kLevels = pt::kBvhStackDeep;  // bvh_collapse.slang's kCollapseLevels
 constexpr VkDeviceSize kSlot = 256;    // the largest offset alignment Vulkan allows
 
 const char *const kEntries[] = {"bvh_collapse_gather", "bvh_collapse_size", "bvh_collapse_roots",

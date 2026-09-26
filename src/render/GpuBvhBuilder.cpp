@@ -16,10 +16,16 @@ namespace basalt {
 namespace {
 
 static_assert(sizeof(pt::BvhBuildDescriptor) == 32);
-static_assert(sizeof(pt::BvhBuildControl) == 32);
+static_assert(sizeof(pt::BvhBuildControl) == 48);
 static_assert(sizeof(pt::BvhBuildRecord) == 48);
 static_assert(sizeof(pt::BvhBuildStatus) == 32);
 static_assert(sizeof(pt::BvhBuildStatus2) == 64);
+
+// The serial build's parts: its one thread takes about 5 us per record on an RTX 4090, so a part
+// of kSerialPartRecords takes about 0.35 s, and a bottom level of kSerialMeshRecords (the largest
+// it takes, alone in its part) about 1.4 s, under the driver's ~2 s timeout (which resets the
+// device).
+constexpr std::uint32_t kSerialPartRecords = 65536, kSerialMeshRecords = 262144;
 
 const char *errorName(std::uint32_t error) {
   switch (error) {
@@ -48,8 +54,22 @@ void computeBarrier(VkCommandBuffer command) {
 
 } // namespace
 
+GpuBvhReferences uploadReferences(Uploader &uploader, const pt::BvhReferences &references) {
+  const auto started = std::chrono::steady_clock::now();
+  GpuBvhReferences result;
+  const pt::BvhReference empty{};
+  result.references = uploader.createBuffer(
+      references.references.empty() ? static_cast<const void *>(&empty) : references.references.data(),
+      std::max<std::size_t>(1, references.references.size()) * sizeof(pt::BvhReference), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "path.gpu-bvh.references");
+  result.counts = references.counts;
+  result.milliseconds = references.milliseconds +
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+  return result;
+}
+
 GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
-                              const Scene &scene, const TraceScene &trace) {
+                              const Scene &scene, const TraceScene &trace, const GpuBvhReferences *references) {
   const auto started = std::chrono::steady_clock::now();
   GpuBvhBuildResult result;
   result.instances = trace.instances;
@@ -60,16 +80,19 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
   const std::uint32_t topNodes = nodeOffset;
   std::uint32_t triangleOffset = 0;
   std::uint32_t maximumTriangles = instanceCount;
+  if (references && references->counts.size() != instanceCount)
+    throw std::runtime_error("GPU BVH build received references for other instances");
   for (std::uint32_t i = 0; i < instanceCount; ++i) {
     const std::uint32_t primitiveIndex = trace.primitives[i];
     if (primitiveIndex >= scene.primitives.size())
       throw std::runtime_error("GPU BVH build received an invalid primitive mapping");
     const Primitive &primitive = scene.primitives[primitiveIndex];
-    const std::uint32_t triangles = primitive.indexCount / 3u;
+    // Its records: its triangles, or its references (the table's from its triangle base).
+    const std::uint32_t triangles = references ? references->counts[i] : primitive.indexCount / 3u;
     pt::BvhBuildDescriptor descriptor{};
     descriptor.geometry = {result.instances[i].firstIndex, result.instances[i].vertexOffset,
                            triangles, i};
-    descriptor.output = {nodeOffset, triangleOffset, 0u, 0u};
+    descriptor.output = {nodeOffset, triangleOffset, 0u, references ? 1u : 0u};
     descriptors.push_back(descriptor);
     result.instances[i].blasRoot = nodeOffset;
     result.instances[i].triangleOffset = triangleOffset;
@@ -77,6 +100,23 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
     triangleOffset += triangles;
     maximumTriangles = std::max(maximumTriangles, triangles);
   }
+
+  for (std::uint32_t i = 0; i < instanceCount; ++i)
+    if (descriptors[i].geometry.z > kSerialMeshRecords)
+      throw std::runtime_error("the serial GPU builder builds bottom levels of up to " + std::to_string(kSerialMeshRecords) +
+                               " triangles within the driver's timeout (instance " + std::to_string(i) + " has " +
+                               std::to_string(descriptors[i].geometry.z) + "); use a parallel builder");
+  // The parts: runs of bottom levels up to kSerialPartRecords records (a larger one alone), then
+  // the TLAS.
+  std::vector<pt::uint4> parts;
+  for (std::uint32_t first = 0; first < instanceCount;) {
+    std::uint32_t last = first, records = 0;
+    while (last < instanceCount && (last == first || records + descriptors[last].geometry.z <= kSerialPartRecords))
+      records += descriptors[last++].geometry.z;
+    parts.push_back({first, last, 0u, 0u});
+    first = last;
+  }
+  parts.push_back({instanceCount, instanceCount, 1u, 0u});
 
   const std::uint32_t scratchRecords = std::max(1u, maximumTriangles);
   const std::uint32_t nodeCapacity = std::max(1u, nodeOffset);
@@ -105,38 +145,49 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
       result.instances.empty() ? static_cast<const void *>(&emptyInstance) : result.instances.data(),
       std::max<std::size_t>(1, result.instances.size()) * sizeof(pt::TraceInstance),
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "path.gpu-bvh.instances");
+  const pt::BvhReference emptyReference{};
+  Buffer placeholder;  // bound when there are no references
+  if (!references)
+    placeholder = uploader.createBuffer(&emptyReference, sizeof(emptyReference), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                        "path.gpu-bvh.no-references");
+  const Buffer &referenceBuffer = references ? references->references : placeholder;
   const pt::BvhBuildStatus emptyStatus{};
   Buffer statusBuffer = uploader.createBuffer(&emptyStatus, sizeof(emptyStatus),
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "path.gpu-bvh.status");
   pt::BvhBuildControl control{};
   control.sizes = {instanceCount, triangleOffset, scratchRecords, nodeCapacity};
-  control.geometry = {scene.indexCount, scene.vertexCount, pt::kBvhStack, pt::kBvhBuildLayoutVersion};
-  Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control),
-      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "path.gpu-bvh.control");
+  control.geometry = {scene.indexCount, scene.vertexCount, pt::kBvhStackDeep, pt::kBvhBuildLayoutVersion};
 
   Program program(context, "bvh_build");
   Pipeline pipeline(context, program, "GPU LBVH build");
-  DescriptorPool pool(context, 1);
-  const VkDescriptorSet set = program.allocate(pool);
-  DescriptorWriter(context, program, set)
-      .buffer("descriptors", descriptorBuffer)
-      .buffer("instances", instanceBuffer)
-      .buffer("indices", scene.indexBuffer)
-      .buffer("vertices", scene.vertexBuffer)
-      .buffer("nodes", result.nodes)
-      .buffer("triangles", result.triangles)
-      .buffer("scratchA", scratchA)
-      .buffer("scratchB", scratchB)
-      .buffer("status", statusBuffer)
-      .buffer("instanceRecords", instanceRecords)
-      .buffer("control", controlBuffer)
-      .apply();
-  uploader.runImmediate([&](VkCommandBuffer command) {
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
-    program.bind(command, set);
-    vkCmdDispatch(command, 1, 1, 1);
-    computeBarrier(command);
-  });
+  DescriptorPool pool(context, static_cast<std::uint32_t>(parts.size()));
+  // Each part its own submission (the status carries over).
+  for (const pt::uint4 &part : parts) {
+    control.part = part;
+    Buffer controlBuffer = uploader.createBuffer(&control, sizeof(control), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                 "path.gpu-bvh.control");
+    const VkDescriptorSet set = program.allocate(pool);
+    DescriptorWriter(context, program, set)
+        .buffer("descriptors", descriptorBuffer)
+        .buffer("instances", instanceBuffer)
+        .buffer("indices", scene.indexBuffer)
+        .buffer("vertices", scene.vertexBuffer)
+        .buffer("nodes", result.nodes)
+        .buffer("triangles", result.triangles)
+        .buffer("scratchA", scratchA)
+        .buffer("scratchB", scratchB)
+        .buffer("status", statusBuffer)
+        .buffer("instanceRecords", instanceRecords)
+        .buffer("references", referenceBuffer)
+        .buffer("control", controlBuffer)
+        .apply();
+    uploader.runImmediate([&](VkCommandBuffer command) {
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.handle);
+      program.bind(command, set);
+      vkCmdDispatch(command, 1, 1, 1);
+      computeBarrier(command);
+    });
+  }
   const std::vector<std::uint8_t> statusBytes = uploader.readBuffer(statusBuffer, sizeof(pt::BvhBuildStatus));
   pt::BvhBuildStatus status{};
   std::memcpy(&status, statusBytes.data(), sizeof(status));
@@ -169,7 +220,7 @@ GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
   result.status.triangles = status.counts.y;
   result.status.instances = status.counts.z;
   result.status.sortPasses = status.counts.w;
-  result.status.dispatches = 1;
+  result.status.dispatches = static_cast<std::uint32_t>(parts.size());
 
   const pt::LayoutCost cost = gpuBvhSahCost(context, uploader, result.nodes, nodeCapacity, result.instances, false);
   result.status.topCost = cost.top;

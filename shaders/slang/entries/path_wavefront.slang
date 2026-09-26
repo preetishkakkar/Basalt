@@ -117,8 +117,8 @@ void addCosts(uint local, PtHit hit, bool first) {
 
 // ---- tracers
 
-BinaryBvhTracer<GpuMaps> binaryTracer() {
-  BinaryBvhTracer<GpuMaps> tracer;
+BinaryBvhTracer<GpuMaps, TRAVERSAL, STACK> binaryTracer<let TRAVERSAL : int = kBinaryStack, let STACK : int = kBvhStack>() {
+  BinaryBvhTracer<GpuMaps, TRAVERSAL, STACK> tracer;
   tracer.nodes = structure.bvhNodes;
   tracer.triangles = structure.bvhTriangles;
   tracer.geometry = scene.geometry;
@@ -238,6 +238,19 @@ void intersect<T : IPtTracer>(T tracer, uint id) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void path_wavefront_intersect(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer(), id.x); }
+
+// The binary tree's other traversals (--bvh-traversal), here and for the fused and shadow stages.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_while_while(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinaryWhileWhile>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_speculative(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinarySpeculative>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_restart_trail(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinaryRestartTrail>(), id.x); }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -518,6 +531,18 @@ void path_wavefront_fused(uint3 id: SV_DispatchThreadID) { shade<true, true>(bin
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
+void path_wavefront_fused_while_while(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinaryWhileWhile>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_fused_speculative(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinarySpeculative>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_fused_restart_trail(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinaryRestartTrail>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
 void path_wavefront_fused_rt(uint3 id: SV_DispatchThreadID) { shade<true, true>(rayQueryTracer(), id.x); }
 
 [shader("compute")]
@@ -550,6 +575,56 @@ void shadow<T : IPtTracer>(T tracer, uint id) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void path_wavefront_shadow(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_while_while(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinaryWhileWhile>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_speculative(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinarySpeculative>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_restart_trail(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinaryRestartTrail>(), id.x); }
+
+// The deep traversal stack (kBvhStackDeep), for binary trees deeper than kBvhStack, in the stages
+// that trace; the restart trail needs none.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_deep(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinaryStack, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_while_while_deep(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinaryWhileWhile, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_intersect_speculative_deep(uint3 id: SV_DispatchThreadID) { intersect(binaryTracer<kBinarySpeculative, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_fused_deep(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinaryStack, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_fused_while_while_deep(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinaryWhileWhile, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_fused_speculative_deep(uint3 id: SV_DispatchThreadID) { shade<true, true>(binaryTracer<kBinarySpeculative, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_deep(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinaryStack, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_while_while_deep(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinaryWhileWhile, kBvhStackDeep>(), id.x); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void path_wavefront_shadow_speculative_deep(uint3 id: SV_DispatchThreadID) { shadow(binaryTracer<kBinarySpeculative, kBvhStackDeep>(), id.x); }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]

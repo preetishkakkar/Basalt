@@ -39,13 +39,13 @@ int rendererFromName(const std::string &name) {
          (name == "gpu-pipeline" || name == "ray-pipeline") ? 5 : -2;
 }
 
-// --bvh-builder names (kBvhBuilderNames) and their aliases; -2 is unknown. "gpu" names the
-// fastest GPU builder available.
+// --bvh-builder names (kBvhBuilders) and their aliases; -2 is unknown. "gpu" names the fastest
+// GPU builder available.
 int bvhBuilderFromName(const std::string &name) {
-  if (name == "cpu" || name == "cpu-sah") return 0;
-  if (name == "gpu-serial") return 1;
-  if (name == "gpu" || name == "gpu-lbvh") return 2;
-  if (name == "gpu-ploc") return 3;
+  if (name == "cpu") return 0;
+  if (name == "gpu") return 2;
+  for (int builder = 0; builder < kBvhBuilderCount; ++builder)
+    if (name == kBvhBuilders[builder].name) return builder;
   return -2;
 }
 
@@ -230,8 +230,7 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
                   active == 3 ? "software-bvh-compute" : active == 5 ? "driver-built-hardware-as" :
                   active == 4 ? "raster-primary-hardware-ray-query" : active == 2 ? "hardware-ray-query" : "not-applicable";
   m.builder = active == 1 ? (s.cpuIntersector == 1 ? "embree" : "cpu-binned-sah") :
-              active == 3 ? (s.pathBvhBuilder == 3 ? "gpu-parallel-ploc" : s.pathBvhBuilder == 2 ? "gpu-parallel-lbvh" :
-                            s.pathBvhBuilder == 1 ? "gpu-serial-lbvh" : "cpu-binned-sah") :
+              active == 3 ? kBvhBuilders[std::clamp(s.pathBvhBuilder, 0, kBvhBuilderCount - 1)].metadata :
               active == 0 ? "not-applicable" : "driver";
   m.bvhLayout = active == 3 ? (s.pathBvhWidth == 1 ? "quantized-bvh4" : s.pathBvhWidth == 2 ? "quantized-bvh8" : "binary-float") :
                 active == 1 ? (s.cpuIntersector == 2 ? "quantized-bvh8" : s.cpuIntersector == 1 ? "embree" : "binary-float") :
@@ -305,6 +304,8 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
   if (const SoftwareBvhReport *bvh = active == 3 ? renderer.softwareBvh() : nullptr) {
     const pt::BvhStatistics *statistics = renderer.cpuBvh();
     m.notes.push_back({"bvh_builder", bvhBuilderName(bvh->builder)});
+    if (s.pathBvhWidth == 0)
+      m.notes.push_back({"bvh_traversal", kBvhTraversals[std::clamp(s.pathBvhTraversal, 0, kBvhTraversalCount - 1)].name});
     m.measurements.push_back({"bvh_build_ms", bvh->buildMilliseconds});
     m.measurements.push_back({"bvh_collapse_ms", bvh->collapseMilliseconds});
     m.measurements.push_back({"bvh_sah_cost", bvh->bottomCost});
@@ -312,7 +313,12 @@ bool Application::writeCaptureMetadata(const std::string &path, int framesRender
     m.measurements.push_back({"bvh_layout_sah_cost", bvh->layoutBottomCost});
     m.measurements.push_back({"bvh_layout_sah_cost_tlas", bvh->layoutTopCost});
     m.measurements.push_back({"bvh_layout_nodes", static_cast<double>(bvh->layoutNodes)});
-    if (bvh->builder == 3) m.measurements.push_back({"bvh_ploc_iterations", static_cast<double>(bvh->plocIterations)});
+    if (bvh->builder == 3 || bvh->builder == 6) m.measurements.push_back({"bvh_ploc_iterations", static_cast<double>(bvh->plocIterations)});
+    if (s.pathBvhSplitClipping > 0.0f) {
+      m.measurements.push_back({"bvh_split_clipping", s.pathBvhSplitClipping});
+      m.measurements.push_back({"bvh_references", static_cast<double>(bvh->references)});
+      m.measurements.push_back({"bvh_clip_ms", bvh->clipMilliseconds});
+    }
     if (statistics) {
       m.measurements.push_back({"bvh_nodes", static_cast<double>(statistics->topNodes + statistics->bottomNodes)});
       m.measurements.push_back({"bvh_depth_tlas", static_cast<double>(statistics->topDepth)});
@@ -605,15 +611,24 @@ void Application::drawInterface() {
       ImGui::TreePop();
     }
     if (settings.renderer == 3) {
-      const char *builders[] = {"CPU binned SAH", "GPU serial LBVH", "GPU parallel LBVH", "GPU parallel PLOC"};
-      static_assert(std::size(builders) == static_cast<std::size_t>(kBvhBuilderCount));
-      if (ImGui::BeginCombo("BVH builder", builders[std::clamp(settings.pathBvhBuilder, 0, kBvhBuilderCount - 1)])) {
+      if (ImGui::BeginCombo("BVH builder", kBvhBuilders[std::clamp(settings.pathBvhBuilder, 0, kBvhBuilderCount - 1)].label)) {
         for (int choice = 0; choice < kBvhBuilderCount; ++choice)
-          if (ImGui::Selectable(builders[choice], settings.pathBvhBuilder == choice)) settings.pathBvhBuilder = choice;
+          if (ImGui::Selectable(kBvhBuilders[choice].label, settings.pathBvhBuilder == choice)) settings.pathBvhBuilder = choice;
         ImGui::EndCombo();
       }
       ImGui::Combo("BVH layout", &settings.pathBvhWidth,
                    "Binary float bounds\0BVH4 quantized bounds\0BVH8 quantized bounds\0");
+      if (settings.pathBvhWidth == 0 &&
+          ImGui::BeginCombo("BVH traversal", kBvhTraversals[std::clamp(settings.pathBvhTraversal, 0, kBvhTraversalCount - 1)].name)) {
+        for (int choice = 0; choice < kBvhTraversalCount; ++choice)
+          if (ImGui::Selectable(kBvhTraversals[choice].name, settings.pathBvhTraversal == choice))
+            settings.pathBvhTraversal = choice;
+        ImGui::EndCombo();
+      }
+      ImGui::DragFloat("Split clipping", &settings.pathBvhSplitClipping, 0.05f, 0.0f, 64.0f, "%.2f");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Early split clipping for every builder: split triangles whose box area is above this many "
+                          "times their mesh's mean; 0 off");
       if (ImGui::Combo("Animation", &settings.animate, "Off\0Instances\0Vertices\0Both\0") && settings.animate != 0)
         settings.pathTemporal = false;
       if (settings.animate != 0 && ImGui::IsItemHovered())
@@ -1138,8 +1153,9 @@ constexpr const char *kUsage =
     "         --no-ui  --no-vsync  --no-validation  --device NAME\n"
     "Renderer: --renderer raster|cpu|gpu|gpu-bvh|gpu-pipeline|hybrid\n"
     "Path tracing: --bounces N  --strategy 0|1|2  --seed N  --spf N  --threads N  --intersector own|embree|avx2\n"
-    "         --denoise  --path-execution megakernel|wavefront  --bvh-builder cpu|gpu|gpu-serial|gpu-lbvh|gpu-ploc  --bvh-width binary|bvh4|bvh8\n"
+    "         --denoise  --path-execution megakernel|wavefront  --bvh-builder gpu-sah|cpu|gpu|gpu-serial|gpu-lbvh|gpu-ploc|gpu-plocpp|gpu-hploc|gpu-apetrei|gpu-batched  --bvh-width binary|bvh4|bvh8\n"
     "         --bvh-cost off|nodes|triangles  --bvh-update on-change|rebuild|refit  --animate off|instances|vertices|both\n"
+    "         --bvh-split-clipping off|on|FACTOR  --bvh-traversal stack|while-while|speculative|restart-trail\n"
     "         --wide-stack auto|deep|shallow  --path-temporal  --texture-filter level0|raycone\n"
     "         --aperture R  --focus-distance D  --di-estimator nee|restir  --restir-reuse none|temporal|spatial|both\n"
     "         --restir-candidates N  --hybrid-comparison traced|raster|difference|split|spp  --gpu-profile\n"
@@ -1197,6 +1213,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
   int bvhBuilder = -1;
   int bvhWidth = -1;
   int bvhUpdate = -1;
+  float bvhSplitClipping = -1.0f;  // -1: not given
+  int bvhTraversal = -1;
   int animate = -1;
   int wideStack = -1;
   int pathExecution = -1;
@@ -1372,7 +1390,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
         const std::string name = std::filesystem::path(arguments[++i]).string();
         bvhBuilder = basalt::bvhBuilderFromName(name);
         if (bvhBuilder == -2) {
-          basalt::logError("unknown BVH builder {}: cpu, gpu, gpu-serial, gpu-lbvh or gpu-ploc", name);
+          basalt::logError("unknown BVH builder {}: cpu, gpu, gpu-serial, gpu-lbvh, gpu-ploc, gpu-plocpp, gpu-hploc, gpu-apetrei, gpu-batched or gpu-sah", name);
           argumentError = true;
         }
       } else if (argument == "--bvh-width" && i + 1 < count) {
@@ -1381,6 +1399,25 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
                    name == "8" || name == "bvh8" ? 2 : -2;
         if (bvhWidth == -2) {
           basalt::logError("unknown BVH width {}: binary, 4/bvh4 or 8/bvh8", name);
+          argumentError = true;
+        }
+      } else if (argument == "--bvh-traversal" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        bvhTraversal = -2;
+        for (int t = 0; t < basalt::kBvhTraversalCount; ++t)
+          if (name == basalt::kBvhTraversals[t].name) bvhTraversal = t;
+        if (bvhTraversal == -2) {
+          basalt::logError("unknown BVH traversal {}: stack, while-while, speculative or restart-trail", name);
+          argumentError = true;
+        }
+      } else if (argument == "--bvh-split-clipping" && i + 1 < count) {
+        const std::string name = std::filesystem::path(arguments[++i]).string();
+        char *end = nullptr;
+        const float factor = std::strtof(name.c_str(), &end);
+        bvhSplitClipping = name == "off" ? 0.0f : name == "on" ? pt::kDefaultClipFactor
+                         : end && *end == '\0' && std::isfinite(factor) && factor > 0.0f ? factor : -2.0f;
+        if (bvhSplitClipping == -2.0f) {
+          basalt::logError("unknown BVH split clipping {}: off, on or a positive area factor", name);
           argumentError = true;
         }
       } else if (argument == "--bvh-update" && i + 1 < count) {
@@ -1543,6 +1580,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
       throw std::runtime_error("--bvh-width requires --renderer gpu-bvh");
     if (bvhUpdate >= 0 && rendererKind != 3)
       throw std::runtime_error("--bvh-update requires --renderer gpu-bvh");
+    if (bvhSplitClipping >= 0.0f && rendererKind != 3)
+      throw std::runtime_error("--bvh-split-clipping requires --renderer gpu-bvh");
+    if (bvhTraversal >= 0 && rendererKind != 3)
+      throw std::runtime_error("--bvh-traversal requires --renderer gpu-bvh");
+    if (bvhTraversal > 0 && bvhWidth > 0)
+      throw std::runtime_error("--bvh-traversal applies to the binary layout (--bvh-width binary)");
     if (wideStack >= 0 && rendererKind != 3)
       throw std::runtime_error("--wide-stack requires --renderer gpu-bvh");
     if (animate > 0 && rendererKind != 3)
@@ -1610,6 +1653,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     if (bvhBuilder >= 0) application.renderer.settings.pathBvhBuilder = bvhBuilder;
     if (bvhWidth >= 0) application.renderer.settings.pathBvhWidth = bvhWidth;
     if (bvhUpdate >= 0) application.renderer.settings.pathBvhUpdate = bvhUpdate;
+    if (bvhSplitClipping >= 0.0f) application.renderer.settings.pathBvhSplitClipping = bvhSplitClipping;
+    if (bvhTraversal >= 0) application.renderer.settings.pathBvhTraversal = bvhTraversal;
     if (animate >= 0) application.renderer.settings.animate = animate;
     if (wideStack >= 0) application.renderer.settings.pathWideStack = wideStack;
     if (pathExecution >= 0) application.renderer.settings.pathExecution = pathExecution;

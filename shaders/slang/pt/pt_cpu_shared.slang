@@ -11,7 +11,8 @@ public export __extern_cpp void ptCpuDeclareRecords(out BvhBuildDescriptor descr
                                                     out BvhBuildStatus2 status2, out BvhSegment segment,
                                                     out BvhLbvhControl lbvh, out BvhSortControl sort,
                                                     out BvhCollapseControl collapse, out BvhCollapseStatus collapseStatus,
-                                                    out AnimateControl animate) {
+                                                    out AnimateControl animate, out BvhReference reference,
+                                                    out BvhClipControl clip) {
   descriptor = {};
   control = {};
   record = {};
@@ -23,6 +24,8 @@ public export __extern_cpp void ptCpuDeclareRecords(out BvhBuildDescriptor descr
   collapse = {};
   collapseStatus = {};
   animate = {};
+  reference = {};
+  clip = {};
 }
 
 // basalt_random

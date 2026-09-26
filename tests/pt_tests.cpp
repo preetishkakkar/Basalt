@@ -1443,6 +1443,127 @@ PT_TEST(bvh_layout_cost_matches_builder) {
   return {};
 }
 
+// Early split clipping: a triangle's references are together and in order, at most
+// kMaxClipReferences, each inside the triangle's box, and together they hold every point of the
+// triangle (sampled exactly, in double); with a huge factor each triangle is one reference, its box.
+PT_TEST(bvh_split_clipping_covers_triangles) {
+  auto at = [](const float4 &v, uint a) { return a == 0u ? v.x : a == 1u ? v.y : v.z; };
+  std::mt19937 random(97);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f), exponent(-3.0f, 1.0f);
+  std::vector<float> vertices;
+  std::vector<uint> indices;
+  auto vertex = [&](float3 p) {
+    indices.push_back(static_cast<uint>(vertices.size() / kVertexFloats));
+    vertices.insert(vertices.end(), {p.x, p.y, p.z});
+    vertices.resize(vertices.size() + kVertexFloats - 3u, 0.0f);
+  };
+  constexpr uint triangles = 5000;  // several of clipReferences' chunks
+  for (uint t = 0; t < triangles; ++t) {
+    const float3 centre(unit(random), unit(random), unit(random));
+    const float size = std::pow(10.0f, exponent(random));  // 1e-3 to 10
+    float3 corner[3];
+    for (float3 &c : corner) c = centre + float3(unit(random), unit(random), unit(random)) * size;
+    if (t % 7u == 0u) for (float3 &c : corner) c.z = centre.z;                     // axis-aligned
+    if (t % 11u == 0u) corner[2] = (corner[0] + corner[1]) * 0.5f;                  // degenerate
+    if (t % 13u == 0u) corner[1] = corner[0] + float3(size * 20.0f, 0.0f, 0.0f);   // long and thin
+    for (const float3 &c : corner) vertex(c);
+  }
+  std::vector<TraceInstance> instances(1);
+  const std::vector<uint> counts{triangles};
+  const BvhReferences whole = clipReferences(vertices, indices, instances, counts, 1e30f);
+  if (whole.references.size() != triangles || whole.counts != counts) return "a huge factor split a triangle";
+  const BvhReferences clipped = clipReferences(vertices, indices, instances, counts, 0.05f);
+  if (clipped.counts.size() != 1u || clipped.counts[0] != clipped.references.size()) return "reference counts are wrong";
+  const BvhReferences threaded = clipReferences(vertices, indices, instances, counts, 0.05f, 8u);
+  if (threaded.counts != clipped.counts ||
+      std::memcmp(threaded.references.data(), clipped.references.data(), clipped.references.size() * sizeof(BvhReference)) != 0)
+    return "threads change the references";
+  std::size_t next = 0;
+  uint split = 0;
+  for (uint t = 0; t < triangles; ++t) {
+    const BvhReference &own = whole.references[t];
+    if (as_type<uint>(own.low.w) != t) return "an unsplit reference names another primitive";
+    const std::size_t first = next;
+    while (next < clipped.references.size() && as_type<uint>(clipped.references[next].low.w) == t) ++next;
+    const std::size_t made = next - first;
+    if (made == 0u || made > kMaxClipReferences) return "triangle " + std::to_string(t) + " has " + std::to_string(made) + " references";
+    split += made > 1u ? 1u : 0u;
+    double corner[3][3];
+    for (uint k = 0; k < 3; ++k)
+      for (uint a = 0; a < 3; ++a) corner[k][a] = vertices[static_cast<std::size_t>(indices[t * 3 + k]) * kVertexFloats + a];
+    for (uint a = 0; a < 3; ++a) {
+      const double low = std::min({corner[0][a], corner[1][a], corner[2][a]});
+      const double high = std::max({corner[0][a], corner[1][a], corner[2][a]});
+      if (at(own.low, a) != low || at(own.high, a) != high) return "an unsplit reference's box is not its triangle's";
+      for (std::size_t r = first; r < next; ++r)
+        if (at(clipped.references[r].low, a) < low || at(clipped.references[r].high, a) > high)
+          return "a reference of triangle " + std::to_string(t) + " leaves the triangle's box";
+    }
+    // Samples on a barycentric grid: the corners exactly, the others within the double
+    // arithmetic's rounding of the point they stand for.
+    double scale = 0.0;
+    for (uint k = 0; k < 3; ++k)
+      for (uint a = 0; a < 3; ++a) scale = std::max(scale, std::abs(corner[k][a]));
+    constexpr int steps = 24;
+    for (int i = 0; i <= steps; ++i)
+      for (int j = 0; i + j <= steps; ++j) {
+        const double u = double(i) / steps, v = double(j) / steps, w = 1.0 - u - v;
+        const bool isCorner = (i == 0 || i == steps) && (j == 0 || j == steps);
+        const double slack = isCorner ? 0.0 : scale * 1e-12;
+        double p[3];
+        for (uint a = 0; a < 3; ++a) p[a] = w * corner[0][a] + u * corner[1][a] + v * corner[2][a];
+        bool covered = false;
+        for (std::size_t r = first; r < next && !covered; ++r) {
+          const BvhReference &ref = clipped.references[r];
+          covered = true;
+          for (uint a = 0; a < 3; ++a)
+            covered = covered && double(at(ref.low, a)) - slack <= p[a] && p[a] <= double(at(ref.high, a)) + slack;
+        }
+        if (!covered) return "a point of triangle " + std::to_string(t) + " is in none of its references";
+      }
+  }
+  if (next != clipped.references.size()) return "references are out of triangle order";
+  if (split == 0u) return "a small factor split nothing";
+  std::printf("  %u of %u triangles split into %zu references in %.2f ms\n", split, triangles, clipped.references.size(),
+              clipped.milliseconds);
+  return {};
+}
+
+// A tree over split clipping's references finds the unclipped tree's hits: the same triangles,
+// duplicated, under tighter boxes.
+PT_TEST(bvh_split_clipping_traces_like_triangles) {
+  Builder b = soup(2000);
+  CpuScene clipped = b.scene;
+  const BvhReferences references =
+      clipReferences(b.scene.vertices, b.scene.indices, b.scene.instances, b.scene.triangleCounts, 0.25f);
+  clipped.instances = b.scene.instances;
+  clipped.bvhStatistics = buildBvh(clipped.vertices, clipped.indices, clipped.instances, clipped.triangleCounts,
+                                   clipped.bvh, sharedPool().size(), &references);
+  if (clipped.bvhStatistics.triangles != references.references.size())
+    return "the clipped tree does not publish a triangle per reference";
+  std::mt19937 random(5);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  int hits = 0, ties = 0;
+  for (int r = 0; r < 50000; ++r) {
+    const float3 origin = float3(unit(random), unit(random), unit(random)) * 3.5f;
+    const float3 direction = normalize(float3(unit(random) * 1.7f, unit(random), unit(random)) - origin);
+    const uint seed = pcgHash(static_cast<uint>(r));
+    for (uint anyHit = 0; anyHit < 2u; ++anyHit) {
+      const PtHit a = ptTraceBvh(FrameView(b.scene, b.frame), origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), anyHit);
+      const PtHit c = ptTraceBvh(FrameView(clipped, b.frame), origin, direction, kPtInfinity, 7u, seed, float2(-1.0f, 0.0f), anyHit);
+      if (a.found != c.found) return "ray " + std::to_string(r) + ": the clipped tree " + (c.found ? "hits" : "misses");
+      if (anyHit != 0u || a.found == 0u) continue;
+      if (as_type<uint>(a.t) != as_type<uint>(c.t)) return "ray " + std::to_string(r) + ": the clipped tree's nearest t differs";
+      hits += 1;
+      if (a.instance != c.instance || a.primitive != c.primitive) ties += 1;  // two triangles at the same t
+    }
+  }
+  if (ties > hits / 1000) return std::to_string(ties) + " nearest hits name other triangles";
+  std::printf("  %zu references for %zu triangles; %d nearest hits, %d ties\n", references.references.size(),
+              b.scene.indices.size() / 3u, hits, ties);
+  return {};
+}
+
 PT_TEST(quantized_bvh4_bvh8_match_binary) {
   Builder b = soup(2000);
   const WideBvh wide4 = buildWideBvh(b.scene.bvh, b.scene.instances, 4u);

@@ -175,8 +175,8 @@ void tracePixel<T : IPtTracer, let EMISSIVE : bool, let GBUFFER : bool, let COST
   output.Store(id, float4(total.xyz / max(total.w, 1.0f), 1.0f));
 }
 
-BinaryBvhTracer<GpuMaps> binaryTracer() {
-  BinaryBvhTracer<GpuMaps> tracer;
+BinaryBvhTracer<GpuMaps, TRAVERSAL, STACK> binaryTracer<let TRAVERSAL : int, let STACK : int = kBvhStack>() {
+  BinaryBvhTracer<GpuMaps, TRAVERSAL, STACK> tracer;
   tracer.nodes = structure.bvhNodes;
   tracer.triangles = structure.bvhTriangles;
   tracer.geometry = scene.geometry;
@@ -203,13 +203,78 @@ RayQueryTracer<GpuMaps> rayQueryTracer() {
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void path_trace(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps>, false, false, true>(binaryTracer(), id.xy); }
+void path_trace(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps>, false, false, true>(binaryTracer<kBinaryStack>(), id.xy);
+}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void path_trace_emissive(uint3 id: SV_DispatchThreadID) {
-  tracePixel<BinaryBvhTracer<GpuMaps>, true, false, true>(binaryTracer(), id.xy);
+  tracePixel<BinaryBvhTracer<GpuMaps>, true, false, true>(binaryTracer<kBinaryStack>(), id.xy);
 }
+
+// The binary tree's other traversals (--bvh-traversal).
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_while_while(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinaryWhileWhile>, false, false, true>(binaryTracer<kBinaryWhileWhile>(), id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_while_while(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinaryWhileWhile>, true, false, true>(binaryTracer<kBinaryWhileWhile>(), id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_speculative(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinarySpeculative>, false, false, true>(binaryTracer<kBinarySpeculative>(), id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_speculative(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinarySpeculative>, true, false, true>(binaryTracer<kBinarySpeculative>(), id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_restart_trail(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinaryRestartTrail>, false, false, true>(binaryTracer<kBinaryRestartTrail>(), id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_restart_trail(uint3 id: SV_DispatchThreadID) {
+  tracePixel<BinaryBvhTracer<GpuMaps, kBinaryRestartTrail>, true, false, true>(binaryTracer<kBinaryRestartTrail>(), id.xy);
+}
+
+// The deep traversal stack (kBvhStackDeep), for binary trees deeper than kBvhStack; the restart
+// trail needs none.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinaryStack, kBvhStackDeep>, false, false, true>(binaryTracer<kBinaryStack, kBvhStackDeep>(), id.xy); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinaryStack, kBvhStackDeep>, true, false, true>(binaryTracer<kBinaryStack, kBvhStackDeep>(), id.xy); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_while_while_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinaryWhileWhile, kBvhStackDeep>, false, false, true>(binaryTracer<kBinaryWhileWhile, kBvhStackDeep>(), id.xy); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_while_while_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinaryWhileWhile, kBvhStackDeep>, true, false, true>(binaryTracer<kBinaryWhileWhile, kBvhStackDeep>(), id.xy); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_speculative_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinarySpeculative, kBvhStackDeep>, false, false, true>(binaryTracer<kBinarySpeculative, kBvhStackDeep>(), id.xy); }
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void path_trace_emissive_speculative_deep(uint3 id: SV_DispatchThreadID) { tracePixel<BinaryBvhTracer<GpuMaps, kBinarySpeculative, kBvhStackDeep>, true, false, true>(binaryTracer<kBinarySpeculative, kBvhStackDeep>(), id.xy); }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]

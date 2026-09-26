@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""The parallel GPU LBVH builds the serial builder's tree, so captures traced through either
-must be byte-identical: same topology, bounds and leaf order give the same traversal and the
-same hits. Megakernel and wavefront, on the fixtures in tests/data, with validation on.
+"""The parallel GPU LBVH builds the serial builder's tree, and the GPU binned SAH the CPU
+builder's, so captures traced through either of a pair must be byte-identical: same topology,
+bounds and leaf order give the same traversal and the same hits. Megakernel and wavefront, on the
+fixtures in tests/data, with validation on; with early split clipping too (megakernel), every
+builder over the same references. The binary layout's traversals (--bvh-traversal) find the same
+hits, so they capture the stack traversal's image.
 
 Animated (--animate both), the per-frame updates (a refit, a TLAS rebuild, the wide re-emit or
 collapse) must trace like a full build every frame: the frames' closest hits are the same, so
@@ -36,13 +39,46 @@ def main():
     for name, scene, environment in scenes:
         for execution in ("megakernel", "wavefront"):
             serial = args.output_dir / f"{name}-{execution}-serial.pfm"
-            parallel = args.output_dir / f"{name}-{execution}-lbvh.pfm"
             capture(args.exe, scene, environment, serial, "gpu-serial", execution)
-            capture(args.exe, scene, environment, parallel, "gpu-lbvh", execution)
-            if serial.read_bytes() != parallel.read_bytes():
-                capture_harness.preserve_failure([serial, parallel], f"lbvh-{name}-{execution}")
-                raise RuntimeError(f"{name} {execution}: the parallel LBVH capture differs from the serial builder's")
-            print(f"PASS: {name} {execution} parallel LBVH capture is byte-identical to the serial builder's")
+            # The parallel, single-pass (Apetrei) and batched (HIPRT) LBVHs all build the serial tree.
+            for builder, label in (("gpu-lbvh", "parallel LBVH"), ("gpu-apetrei", "single-pass LBVH"),
+                                   ("gpu-batched", "batched LBVH")):
+                parallel = args.output_dir / f"{name}-{execution}-{builder}.pfm"
+                capture(args.exe, scene, environment, parallel, builder, execution)
+                if serial.read_bytes() != parallel.read_bytes():
+                    capture_harness.preserve_failure([serial, parallel], f"{builder}-{name}-{execution}")
+                    raise RuntimeError(f"{name} {execution}: the {label} capture differs from the serial builder's")
+                print(f"PASS: {name} {execution} {label} capture is byte-identical to the serial builder's")
+            cpu = args.output_dir / f"{name}-{execution}-cpu.pfm"
+            sah = args.output_dir / f"{name}-{execution}-gpu-sah.pfm"
+            capture(args.exe, scene, environment, cpu, "cpu", execution)
+            capture(args.exe, scene, environment, sah, "gpu-sah", execution)
+            if cpu.read_bytes() != sah.read_bytes():
+                capture_harness.preserve_failure([cpu, sah], f"gpu-sah-{name}-{execution}")
+                raise RuntimeError(f"{name} {execution}: the GPU binned SAH capture differs from the CPU builder's")
+            print(f"PASS: {name} {execution} GPU binned SAH capture is byte-identical to the CPU builder's")
+    # The binary layout's traversals find the same hits: the stack traversal's captures.
+    for name, scene, environment in scenes:
+        for execution in ("megakernel", "wavefront"):
+            stack = args.output_dir / f"{name}-{execution}-gpu-lbvh.pfm"
+            for traversal in ("while-while", "speculative", "restart-trail"):
+                other = args.output_dir / f"{name}-{execution}-{traversal}.pfm"
+                capture(args.exe, scene, environment, other, "gpu-lbvh", execution, ["--bvh-traversal", traversal])
+                if stack.read_bytes() != other.read_bytes():
+                    capture_harness.preserve_failure([stack, other], f"traversal-{traversal}-{name}-{execution}")
+                    raise RuntimeError(f"{name} {execution}: the {traversal} traversal's capture differs from the stack's")
+                print(f"PASS: {name} {execution} {traversal} traversal capture is byte-identical to the stack's")
+    for name, scene, environment in scenes:
+        clip = ["--bvh-split-clipping", "on"]
+        for reference, builder in (("gpu-serial", "gpu-lbvh"), ("cpu", "gpu-sah")):
+            expected = args.output_dir / f"{name}-clipped-{reference}.pfm"
+            actual = args.output_dir / f"{name}-clipped-{builder}.pfm"
+            capture(args.exe, scene, environment, expected, reference, "megakernel", clip)
+            capture(args.exe, scene, environment, actual, builder, "megakernel", clip)
+            if expected.read_bytes() != actual.read_bytes():
+                capture_harness.preserve_failure([expected, actual], f"clipped-{builder}-{name}")
+                raise RuntimeError(f"{name}: with split clipping, the {builder} capture differs from the {reference} one")
+            print(f"PASS: {name} split clipping {builder} capture is byte-identical to the {reference} one")
     for name, scene, environment in scenes:
         for width in ("binary", "bvh8"):
             updated = args.output_dir / f"{name}-{width}-animated-updated.pfm"

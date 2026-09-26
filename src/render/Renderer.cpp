@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <thread>
 
 namespace basalt {
@@ -1178,7 +1179,7 @@ std::uint64_t Renderer::settingsKey() const {
   add(s.pathDiEstimator); add(s.pathRestirReuse); add(s.pathRestirCandidates);
   add(s.pathStrategy); add(s.pathClamp); add(s.pathTargetSamples); add(s.cpuIntersector); add(s.pathDenoise);
   add(s.pathSamplesPerFrame); add(s.pathTemporal); add(s.pathBvhDiagnostic); add(s.pathBvhBuilder);
-  add(s.pathBvhWidth); add(s.pathBvhUpdate); add(s.pathWideStack);
+  add(s.pathBvhWidth); add(s.pathBvhUpdate); add(s.pathWideStack); add(s.pathBvhSplitClipping); add(s.pathBvhTraversal);
   add(s.pathExecution);
   return key;
 }
@@ -2225,7 +2226,8 @@ void Renderer::buildSoftwareBvh() {
   // rebuild. Animation (moved instances, warped vertices) updates a kept GPU LBVH (policy A)
   // and rebuilds the others.
   const bool changed = softwareBvhVersion != sceneVersion || softwareBvhBuilder != settings.pathBvhBuilder ||
-                       softwareBvhWidth != settings.pathBvhWidth;
+                       softwareBvhWidth != settings.pathBvhWidth ||
+                       softwareBvhSplitClipping != settings.pathBvhSplitClipping;
   const bool everyFrame = settings.pathBvhUpdate == 1;
   const bool moved = softwareBvhTransforms != animationTransforms, warped = softwareBvhGeometry != animationGeometry;
   if (!changed && !everyFrame && !moved && !warped) return;
@@ -2250,17 +2252,81 @@ void Renderer::buildSoftwareBvh() {
   softwareBinaryRows.reset();
   softwareBvhGeometry = animationGeometry;
   softwareBvhTransforms = animationTransforms;
+  // The GPU binned SAH where the device can run it; else the CPU builder, the same tree.
+  if (settings.pathBvhBuilder == kDefaultBvhBuilder) {
+    if (!gpuLbvhBuilder) gpuLbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
+    if (!gpuLbvhBuilder->sahAvailable()) {
+      logWarning("the GPU binned SAH builder needs subgroups of 32 to 128 lanes; building the same tree on the CPU");
+      settings.pathBvhBuilder = 0;
+    }
+  }
+  // The geometry read back, for the CPU builder and split clipping.
+  std::vector<float> vertices;
+  std::vector<std::uint32_t> indices, triangleCounts;
+  auto readGeometry = [&] {
+    const std::vector<std::uint8_t> vertexBytes = uploader.readBuffer(
+        activeScene->vertexBuffer, static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex));
+    vertices.resize(vertexBytes.size() / sizeof(float));
+    std::memcpy(vertices.data(), vertexBytes.data(), vertexBytes.size());
+    const std::vector<std::uint8_t> indexBytes = uploader.readBuffer(
+        activeScene->indexBuffer, static_cast<VkDeviceSize>(activeScene->indexCount) * sizeof(std::uint32_t));
+    indices.resize(indexBytes.size() / sizeof(std::uint32_t));
+    std::memcpy(indices.data(), indexBytes.data(), indexBytes.size());
+    triangleCounts.clear();
+    for (const std::uint32_t primitive : traceScene.primitives)
+      triangleCounts.push_back(activeScene->primitives[primitive].indexCount / 3);
+  };
+  // Early split clipping: every builder's bottom levels over the same references. The GPU
+  // builders' come from the GPU (the same bytes) where it has 64-bit floats, else from the host
+  // like the CPU builder's.
+  const float clipFactor = settings.pathBvhSplitClipping;
+  const bool clipped = clipFactor > 0.0f;
+  std::optional<pt::BvhReferences> references;
+  std::optional<GpuBvhReferences> gpuReferences;
+  if (clipped && settings.pathBvhBuilder != 0) {
+    if (!gpuLbvhBuilder) gpuLbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
+    if (gpuLbvhBuilder->clipAvailable()) {
+      gpuReferences = gpuLbvhBuilder->clipReferences(uploader, *activeScene, traceScene, clipFactor);
+    } else {
+      readGeometry();
+      gpuReferences = uploadReferences(uploader, pt::clipReferences(vertices, indices, traceScene.instances, triangleCounts,
+                                                                   clipFactor, std::max(1u, std::thread::hardware_concurrency())));
+    }
+    softwareBvhReport.references = 0;
+    for (const std::uint32_t count : gpuReferences->counts) softwareBvhReport.references += count;
+    softwareBvhReport.clipMilliseconds = gpuReferences->milliseconds;
+  } else if (clipped) {
+    readGeometry();
+    references = pt::clipReferences(vertices, indices, traceScene.instances, triangleCounts, clipFactor,
+                                    std::max(1u, std::thread::hardware_concurrency()));
+    softwareBvhReport.references = static_cast<std::uint32_t>(references->references.size());
+    softwareBvhReport.clipMilliseconds = references->milliseconds;
+  }
+  const pt::BvhReferences *referenced = references ? &*references : nullptr;
+  const GpuBvhReferences *gpuReferenced = gpuReferences ? &*gpuReferences : nullptr;
+  softwareBvhSplitClipping = clipFactor;
+
   if (settings.pathBvhBuilder != 0) {
-    if (settings.pathBvhBuilder < 1 || settings.pathBvhBuilder > 3)
+    if (settings.pathBvhBuilder < 1 || settings.pathBvhBuilder >= kBvhBuilderCount)
       throw std::runtime_error(std::string("unknown software BVH builder ") + bvhBuilderName(settings.pathBvhBuilder));
-    // The parallel builders (LBVH, PLOC topology) share one builder; animated scenes keep its
-    // tree (and the collapse) for per-frame updates. A TLAS rebuild is an LBVH over instances.
+    // The parallel builders (LBVH, single-pass and batched LBVH, PLOC, PLOC++, H-PLOC, binned
+    // SAH) share one builder; animated scenes keep its tree (and the collapse) for per-frame
+    // updates, except the SAH's and split clipping's, which are rebuilt. A TLAS rebuild is an
+    // LBVH over instances.
     const bool parallel = settings.pathBvhBuilder >= 2;
     if (parallel && !gpuLbvhBuilder) gpuLbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
-    const bool updatable = settings.animate != 0 && parallel && !everyFrame;
-    const GpuBvhTopology topology = settings.pathBvhBuilder == 3 ? GpuBvhTopology::Ploc : GpuBvhTopology::Lbvh;
-    GpuBvhBuildResult built = parallel ? gpuLbvhBuilder->build(uploader, *activeScene, traceScene, updatable, topology)
-                                       : buildGpuBvh(context, uploader, *activeScene, traceScene);
+    const bool updatable =
+        settings.animate != 0 && parallel && settings.pathBvhBuilder != 8 && !clipped && !everyFrame;
+    const GpuBvhTopology topology = settings.pathBvhBuilder == 3 ? GpuBvhTopology::Ploc :
+                                    settings.pathBvhBuilder == 4 ? GpuBvhTopology::SinglePassLbvh :
+                                    settings.pathBvhBuilder == 5 ? GpuBvhTopology::BatchedLbvh :
+                                    settings.pathBvhBuilder == 6 ? GpuBvhTopology::PlocPlusPlus :
+                                    settings.pathBvhBuilder == 7 ? GpuBvhTopology::Hploc :
+                                    settings.pathBvhBuilder == 8 ? GpuBvhTopology::BinnedSah :
+                                                                   GpuBvhTopology::Lbvh;
+    GpuBvhBuildResult built =
+        parallel ? gpuLbvhBuilder->build(uploader, *activeScene, traceScene, updatable, topology, gpuReferenced)
+                 : buildGpuBvh(context, uploader, *activeScene, traceScene, gpuReferenced);
     double gpuMilliseconds = 0.0;
     for (const double stage : built.stageMilliseconds) gpuMilliseconds += stage;
     softwareBvhReport.buildMilliseconds = built.milliseconds;
@@ -2364,7 +2430,9 @@ void Renderer::buildSoftwareBvh() {
             softwareBvhStatistics.topDepth, softwareBvhStatistics.bottomDepth,
             softwareBvhReport.topCost, softwareBvhReport.bottomCost,
             softwareBvhRadixPasses,
-            settings.pathBvhBuilder == 3 ? std::format(", {} PLOC iterations", softwareBvhReport.plocIterations) : "",
+            settings.pathBvhBuilder == 3 || settings.pathBvhBuilder == 6
+                ? std::format(", {} PLOC iterations", softwareBvhReport.plocIterations)
+                : "",
             softwareBvhMaximumStack,
             static_cast<double>(softwareBvhScratchBytes) / (1024.0 * 1024.0),
             static_cast<double>(softwareBvhOutputBytes) / (1024.0 * 1024.0),
@@ -2372,24 +2440,11 @@ void Renderer::buildSoftwareBvh() {
     return;
   }
 
-  const std::vector<std::uint8_t> vertexBytes = uploader.readBuffer(
-      activeScene->vertexBuffer, static_cast<VkDeviceSize>(activeScene->vertexCount) * sizeof(Vertex));
-  std::vector<float> vertices(vertexBytes.size() / sizeof(float));
-  std::memcpy(vertices.data(), vertexBytes.data(), vertexBytes.size());
-  const std::vector<std::uint8_t> indexBytes = uploader.readBuffer(
-      activeScene->indexBuffer, static_cast<VkDeviceSize>(activeScene->indexCount) * sizeof(std::uint32_t));
-  std::vector<std::uint32_t> indices(indexBytes.size() / sizeof(std::uint32_t));
-  std::memcpy(indices.data(), indexBytes.data(), indexBytes.size());
-
+  if (!references) readGeometry();
   std::vector<pt::TraceInstance> instances = traceScene.instances;
-  std::vector<std::uint32_t> triangleCounts;
-  triangleCounts.reserve(traceScene.primitives.size());
-  for (const std::uint32_t primitive : traceScene.primitives)
-    triangleCounts.push_back(activeScene->primitives[primitive].indexCount / 3);
-
   pt::Bvh bvh;
   const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-  softwareBvhStatistics = pt::buildBvh(vertices, indices, instances, triangleCounts, bvh, threads);
+  softwareBvhStatistics = pt::buildBvh(vertices, indices, instances, triangleCounts, bvh, threads, referenced);
   softwareBvhReport.buildMilliseconds = softwareBvhStatistics.milliseconds;
   softwareBvhReport.topCost = softwareBvhReport.layoutTopCost = pt::binaryLayoutCost(bvh.nodes, instances).top;
   softwareBvhReport.bottomCost = softwareBvhReport.layoutBottomCost = softwareBvhStatistics.sahCost;
@@ -2467,6 +2522,36 @@ void Renderer::selectWideStack(bool deep) {
   pathSetsGeneration = ~0u;
   logInfo("wide traversal kernels: {}-entry stack (tree bound {})", deep ? pt::kWideStackDeep : 64,
           softwareWideStack);
+}
+
+// The binary kernels (megakernel, and the wavefront stages that trace) for a traversal
+// (kBvhTraversals), with the deep stack (*_deep, kBvhStackDeep) for trees deeper than kBvhStack.
+// The restart trail keeps no stack: it has no deep kernels.
+void Renderer::selectBinaryTraversal(int traversal, bool deep) {
+  if (traversal < 0 || traversal >= kBvhTraversalCount)
+    throw std::runtime_error("unknown BVH traversal " + std::to_string(traversal));
+  deep = deep && std::string_view(kBvhTraversals[traversal].name) != "restart-trail";
+  if (traversal == binaryTraversal && deep == binaryStackDeep) return;
+  context.waitIdle();
+  const std::string suffix = std::string(kBvhTraversals[traversal].suffix) + (deep ? "_deep" : "");
+  pathTraceProgram = std::make_unique<Program>(context, "path_trace" + suffix);
+  pathTraceEmissiveProgram = std::make_unique<Program>(context, "path_trace_emissive" + suffix);
+  pathWaveFusedProgram = std::make_unique<Program>(context, "path_wavefront_fused" + suffix);
+  pathWaveIntersectProgram = std::make_unique<Program>(context, "path_wavefront_intersect" + suffix);
+  pathWaveShadowProgram = std::make_unique<Program>(context, "path_wavefront_shadow" + suffix);
+  pathTracePipeline = Pipeline(context, *pathTraceProgram, "path.trace.software" + suffix);
+  pathTraceEmissivePipeline = Pipeline(context, *pathTraceEmissiveProgram, "path.trace.software.emissive" + suffix);
+  pathWaveFusedPipeline = Pipeline(context, *pathWaveFusedProgram, "path.wavefront.fused" + suffix);
+  pathWaveIntersectPipeline = Pipeline(context, *pathWaveIntersectProgram, "path.wavefront.intersect" + suffix);
+  pathWaveShadowPipeline = Pipeline(context, *pathWaveShadowProgram, "path.wavefront.shadow" + suffix);
+  binaryTraversal = traversal;
+  binaryStackDeep = deep;
+  pathSetsGeneration = ~0u;
+  if (std::string_view(kBvhTraversals[traversal].name) == "restart-trail")
+    logInfo("binary BVH traversal: restart-trail ({}-level trail)", pt::kTrailLevels);
+  else
+    logInfo("binary BVH traversal: {}, {}-entry stack", kBvhTraversals[traversal].name,
+            deep ? pt::kBvhStackDeep : pt::kBvhStack);
 }
 
 // Orders every earlier compute and transfer access (earlier frames' traces included: same queue)
@@ -2711,6 +2796,8 @@ void Renderer::recordGpuTrace(VkCommandBuffer command, const Camera &camera) {
   if (software && settings.pathBvhWidth != 0)
     selectWideStack(wideStackNeeded || settings.pathWideStack == 1 ||
                     (settings.pathWideStack == 0 && !(settings.pathExecution == 1 && settings.renderer != 4)));
+  if (software && settings.pathBvhWidth == 0)
+    selectBinaryTraversal(settings.pathBvhTraversal, binaryStackNeeded());
   const bool emissiveSoftware = software && !pathEmissiveMetadata.empty();
   const bool wideSoftware = software && settings.pathBvhWidth != 0;
   const bool wavefront = settings.pathExecution == 1 && !hybrid;

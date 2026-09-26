@@ -18,6 +18,7 @@ StructuredBuffer<TraceInstance> instances;
 StructuredBuffer<uint> indices;
 StructuredBuffer<float> vertices;
 RWStructuredBuffer<BvhBuildRecord> records;
+StructuredBuffer<BvhReference> references;  // split clipping's, one per bottom-level record (control.source.x)
 RWStructuredBuffer<uint> segmentBox;    // six ordered-bit words per segment
 RWStructuredBuffer<uint> error;
 RWStructuredBuffer<uint> keysLo;
@@ -38,18 +39,6 @@ RWStructuredBuffer<uint2> nodeNumber;
 RWStructuredBuffer<float4> nodes;
 RWStructuredBuffer<float4> triangles;
 RWStructuredBuffer<BvhBuildStatus2> status;
-
-// The segment holding record r among the bottom levels: the last whose first record is <= r
-// (empty segments share their successor's first record and are skipped that way).
-uint segmentOfRecord(uint bottomSegments, uint record) {
-  uint low = 0u, high = bottomSegments;
-  while (high - low > 1u) {
-    const uint middle = (low + high) >> 1u;
-    if (segments[middle].range.x <= record) low = middle;
-    else high = middle;
-  }
-  return low;
-}
 
 // The segment holding global internal node n: the last whose first internal node is <= n.
 uint segmentOfNode(uint segmentCount, uint node) {
@@ -82,15 +71,21 @@ float3 segmentHigh(uint g) {
                 ptOrderedFloat(segmentBox[g * 6u + 5u]));
 }
 
-// 1. Per triangle: its record and its bottom level's object box.
+// 1. Per bottom-level record: its triangle's box (or with split clipping its reference's), and
+// its bottom level's object box.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void bvh_lbvh_extents(uint3 thread: SV_DispatchThreadID) {
   const uint id = thread.x;
   if (id >= control.sizes.w) return;
-  const uint g = segmentOfRecord(control.sizes.y - 1u, id);
+  const uint g = lbvhSegmentOfRecord(segments, control.sizes.y - 1u, id);
   const BvhSegment segment = segments[g];
-  const uint primitive = id - segment.range.x;
+  if (lbvhBatched(segment, control)) return;  // its workgroup wrote the record and the box
+  const uint index = id - segment.range.x;
+  const bool referenced = control.source.x != 0u;
+  BvhReference reference = {};
+  if (referenced) reference = references[id];
+  const uint primitive = referenced ? asuint(reference.low.w) : index;
   const TraceInstance instance = instances[segment.flags.y];
   const uint base = instance.firstIndex + primitive * 3u;
   if (base + 2u >= control.geometry.x) {
@@ -112,9 +107,9 @@ void bvh_lbvh_extents(uint3 thread: SV_DispatchThreadID) {
     return;
   }
   BvhBuildRecord record;
-  record.identity = uint4(primitive, 0u, g, 0u);
-  record.low = float4(min(v0, min(v1, v2)), 0.0f);
-  record.high = float4(max(v0, max(v1, v2)), 0.0f);
+  record.identity = uint4(primitive, 0u, g, index);
+  record.low = float4(referenced ? reference.low.xyz : min(v0, min(v1, v2)), 0.0f);
+  record.high = float4(referenced ? reference.high.xyz : max(v0, max(v1, v2)), 0.0f);
   records[id] = record;
   grow(g * 6u, record.low.xyz, record.high.xyz);
 }
@@ -128,7 +123,7 @@ void bvh_lbvh_instances(uint3 thread: SV_DispatchThreadID) {
   if (id >= control.range.x) return;
   const uint tlas = control.sizes.y - 1u;
   BvhBuildRecord world;
-  world.identity = uint4(id, 0u, tlas, 0u);
+  world.identity = uint4(id, 0u, tlas, id);
   world.low = float4(kLbvhHuge);
   world.high = float4(-kLbvhHuge);
   if (segments[id].range.y == 0u) {
@@ -160,6 +155,7 @@ void bvh_lbvh_morton(uint3 thread: SV_DispatchThreadID) {
   if (id >= control.sizes.x) return;
   const BvhBuildRecord record = records[id];
   const uint g = record.identity.z;
+  if (lbvhBatched(segments[g], control)) return;  // its workgroup wrote the code and the keys
   const uint code = morton3((record.low.xyz + record.high.xyz) * 0.5f, segmentLow(g), segmentHigh(g));
   records[id].identity.y = code;
   keysLo[id] = code;
@@ -167,18 +163,7 @@ void bvh_lbvh_morton(uint3 thread: SV_DispatchThreadID) {
   values[id] = id;
 }
 
-// The serial builder's commonPrefix over (Morton code, identity) at a segment's local sorted
-// positions a and b; -1 when b is outside the segment.
-int delta(uint first, uint count, uint a, int b) {
-  if (b < 0 || uint(b) >= count) return -1;
-  const uint ma = codes[first + a];
-  const uint mb = codes[first + uint(b)];
-  if (ma != mb) return int(leadingZeros(ma ^ mb));
-  const uint ia = records[sortedIndex[first + a]].identity.x;
-  const uint ib = records[sortedIndex[first + uint(b)]].identity.x;
-  if (ia == ib) return 64;
-  return 32 + int(leadingZeros(ia ^ ib));
-}
+int delta(uint first, uint count, uint a, int b) { return lbvhPrefix(codes, sortedIndex, records, first, count, a, b); }
 
 // Appends node to a level's queue: level L's nodes are entries[levelBase[L]...], its header
 // (groups, 1, 1, count). Every internal node joins exactly one level, so the levels together

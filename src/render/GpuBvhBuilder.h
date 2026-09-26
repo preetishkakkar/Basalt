@@ -11,6 +11,7 @@
 
 namespace pt {
 struct BvhBuildStatus2;  // pt_bvh_build.slang
+struct BvhSegment;
 }
 
 namespace basalt {
@@ -56,14 +57,35 @@ struct GpuBvhUpdateResult {
   double milliseconds = 0.0;                 // wall clock
 };
 
-// Builds the traversal structure entirely from the resident GPU geometry. The host only
-// supplies primitive counts/offsets and reads the small failure/status record.
-GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
-                              const Scene &scene, const TraceScene &trace);
+// Split clipping's references for a GPU build: pt::BvhReference rows in instance order (at least
+// one row), and each instance's count, which the build's layout needs on the host.
+struct GpuBvhReferences {
+  Buffer references;
+  std::vector<std::uint32_t> counts;
+  double milliseconds = 0.0;     // making them: wall clock
+  double gpuMilliseconds = 0.0;  // the GPU clipping's kernels; 0 when made on the host
+};
 
-// The parallel builder's topology: Karras's LBVH (the serial builder's tree), or PLOC's
-// agglomerative clustering in Morton order (bvh_ploc.slang), numbered and published alike.
-enum class GpuBvhTopology { Lbvh, Ploc };
+// The host's references (pt::clipReferences), uploaded.
+GpuBvhReferences uploadReferences(Uploader &uploader, const pt::BvhReferences &references);
+
+// Builds the traversal structure entirely from the resident GPU geometry. The host only
+// supplies primitive counts/offsets and reads the small failure/status record. With split
+// clipping's references, the bottom levels are built over them.
+GpuBvhBuildResult buildGpuBvh(const Context &context, Uploader &uploader,
+                              const Scene &scene, const TraceScene &trace,
+                              const GpuBvhReferences *references = nullptr);
+
+// The parallel builder's topology: Karras's LBVH (the serial builder's tree), Apetrei's
+// single-pass LBVH (the same tree, built and fitted bottom-up in one kernel: bvh_apetrei.slang),
+// HIPRT's batched LBVH (the single-pass LBVH with each small bottom level built by one workgroup
+// in shared memory: bvh_batched.slang; the same tree again), PLOC's agglomerative clustering in
+// Morton order (bvh_ploc.slang), PLOC++'s (the same clustering, each iteration one fused dispatch
+// with a decoupled look-back: the same tree as PLOC), or H-PLOC's (PLOC merges at the nodes of an
+// LBVH climb, in one dispatch), numbered and published alike. BinnedSah is not an LBVH: the CPU
+// builder's binned SAH tree, built top-down one level per dispatch and published in its layout
+// (bvh_sah.slang); it keeps nothing to refit.
+enum class GpuBvhTopology { Lbvh, SinglePassLbvh, BatchedLbvh, Ploc, PlocPlusPlus, Hploc, BinnedSah };
 
 // The parallel LBVH (bvh_lbvh.slang, bvh_sort.slang): the serial builder's tree for
 // every bottom level and the TLAS in one set of dispatches, with its numbering; or, with the PLOC
@@ -78,9 +100,20 @@ public:
   GpuLbvhBuilder &operator=(const GpuLbvhBuilder &) = delete;
 
   // refittable: keep this build's scratch so refit() can update the tree; a later build
-  // releases it.
+  // releases it. A BinnedSah build, or one over split clipping's references (the bottom levels'
+  // records), cannot be refittable.
   GpuBvhBuildResult build(Uploader &uploader, const Scene &scene, const TraceScene &trace, bool refittable = false,
-                          GpuBvhTopology topology = GpuBvhTopology::Lbvh);
+                          GpuBvhTopology topology = GpuBvhTopology::Lbvh,
+                          const GpuBvhReferences *references = nullptr);
+
+  // Early split clipping on the GPU (bvh_clip.slang): pt::clipReferences's references byte for
+  // byte, left on the GPU, from the resident geometry; only the per-instance counts are read
+  // back. Needs 64-bit floats in shaders: clipAvailable().
+  bool clipAvailable() const;
+  // Whether this device can run the BinnedSah build (subgroups of 32 to 128 lanes with their
+  // arithmetic, ballot and broadcast operations).
+  bool sahAvailable() const;
+  GpuBvhReferences clipReferences(Uploader &uploader, const Scene &scene, const TraceScene &trace, float factor);
 
   // The kept build's boxes and triangles from the scene's current vertices and the trace's
   // instance transforms, into that build's `nodes` and `triangles`: topology and numbering
@@ -138,8 +171,11 @@ private:
                                        const std::function<void(std::uint32_t)> &mark) const;
   const CommonSets &frameSets(const Scene &scene, const Buffer &nodes, const Buffer &triangles, bool top);
   void copyFrameStatus(VkCommandBuffer command, std::uint32_t slot);
+  void buildBinnedSah(Uploader &uploader, const Scene &scene, Kept &kept, const std::vector<pt::BvhSegment> &segments,
+                      GpuBvhBuildResult &result);
   std::vector<double> readStages(double &total) const;
-  pt::BvhBuildStatus2 readStatus(Uploader &uploader, const Kept &kept, const char *what) const;
+  // Throws unless the status reports success and `nodes` nodes, and every triangle and instance.
+  pt::BvhBuildStatus2 readStatus(Uploader &uploader, const Kept &kept, const char *what, std::uint32_t nodes) const;
   // Pass p reads keys[p & 1] and writes keys[(p & 1) ^ 1]; its BvhSortControl is at
   // controls + controlBase + p * 256.
   std::vector<SortSets> sortSets(DescriptorPool &pool, const Buffer *keysLo, const Buffer *keysHi,

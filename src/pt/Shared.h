@@ -40,6 +40,8 @@ using gen::PtRayPrep;
 using gen::BvhBuildDescriptor;
 using gen::BvhBuildControl;
 using gen::BvhBuildRecord;
+using gen::BvhReference;
+using gen::BvhClipControl;
 using gen::BvhBuildStatus;
 using gen::BvhBuildStatus2;
 using gen::BvhSegment;
@@ -84,7 +86,7 @@ inline constexpr float kRouletteStartBounce = 3.0f;
 static_assert(sizeof(Material) == 128 && sizeof(Light) == 64 && sizeof(TraceInstance) == 176);
 static_assert(sizeof(PathUniforms) == 224 && sizeof(PtEmissiveTriangle) == 112 && sizeof(PtReconstructionSample) == 128);
 static_assert(sizeof(PtReservoir) == 32 && sizeof(PtRestirSurface) == 64);
-static_assert(sizeof(BvhBuildDescriptor) == 32 && sizeof(BvhBuildControl) == 32);
+static_assert(sizeof(BvhBuildDescriptor) == 32 && sizeof(BvhBuildControl) == 48);
 
 // slangc passes a struct in-parameter by pointer and never writes through it; the wrappers take
 // values or const references and cast.

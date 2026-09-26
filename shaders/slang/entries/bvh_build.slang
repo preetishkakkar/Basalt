@@ -1,6 +1,8 @@
 // GPU-resident LBVH construction. One compute invocation deliberately performs the baseline build
 // serially: its stable radix passes are linear, deterministic and easy to validate. The parallel
-// builders compete with this correctness baseline.
+// builders compete with this correctness baseline. A build is several dispatches, each its own
+// submission (control.part: some bottom levels, then the TLAS), so none outlasts the driver's
+// timeout; each resumes from the status the one before left.
 import pt_bvh_build;
 
 static const uint kEmpty = 0xFFFFFFFFu;
@@ -17,6 +19,7 @@ RWStructuredBuffer<BvhBuildRecord> scratchA;
 RWStructuredBuffer<BvhBuildRecord> scratchB;
 RWStructuredBuffer<BvhBuildStatus> status;
 RWStructuredBuffer<BvhBuildRecord> instanceRecords;
+StructuredBuffer<BvhReference> references;  // split clipping's, when a descriptor's output.w is 1
 ConstantBuffer<BvhBuildControl> control;
 
 // Six stable 5-bit passes over the Morton codes, scratchA to scratchB and back.
@@ -44,11 +47,11 @@ void stableRadix(uint count, inout uint passes) {
 }
 
 // The records are scratchA's, in stable Morton order. The leading bits records a and b share
-// in their (Morton code, identity) key; 64 when identical.
+// in their (Morton code, index in the level) key; 64 when identical.
 uint commonPrefix(uint a, uint b) {
   const uint mortonDifference = scratchA[a].identity.y ^ scratchA[b].identity.y;
   if (mortonDifference != 0u) return leadingZeros(mortonDifference);
-  const uint identityDifference = scratchA[a].identity.x ^ scratchA[b].identity.x;
+  const uint identityDifference = scratchA[a].identity.w ^ scratchA[b].identity.w;
   return identityDifference == 0u ? 64u : 32u + leadingZeros(identityDifference);
 }
 
@@ -160,9 +163,8 @@ bool emitTree(uint count, uint nodeBase, uint leafBase, bool instanceLeaves, uin
 [numthreads(1, 1, 1)]
 void bvh_build(uint3 id: SV_DispatchThreadID) {
   if (id.x != 0u) return;
-  BvhBuildStatus result;
-  result.result = uint4(0u);
-  result.counts = uint4(0u);
+  BvhBuildStatus result = status[0];  // the earlier parts' (zero before the first)
+  if (result.result.x != kBvhBuildErrorNone) return;
   if (control.geometry.w != kBvhBuildLayoutVersion || control.sizes.z == 0u || control.sizes.w == 0u) {
     result.result.x = kBvhBuildErrorCapacity;
     status[0] = result;
@@ -170,9 +172,9 @@ void bvh_build(uint3 id: SV_DispatchThreadID) {
   }
 
   const uint instanceCount = control.sizes.x;
-  uint radixPasses = 0u;
-  // BLAS construction, retaining one world-space bound record per instance.
-  for (uint descriptorIndex = 0u; descriptorIndex < instanceCount; ++descriptorIndex) {
+  uint radixPasses = result.counts.w;
+  // This part's BLASes, retaining one world-space bound record per instance.
+  for (uint descriptorIndex = control.part.x; descriptorIndex < min(control.part.y, instanceCount); ++descriptorIndex) {
     const BvhBuildDescriptor descriptor = descriptors[descriptorIndex];
     const uint count = descriptor.geometry.z;
     if (count > control.sizes.z || descriptor.output.x >= control.sizes.w) {
@@ -180,8 +182,13 @@ void bvh_build(uint3 id: SV_DispatchThreadID) {
       status[0] = result;
       return;
     }
+    // The records: the triangles, or with split clipping the references (from the triangle base).
+    const bool referenced = descriptor.output.w != 0u;
     float3 objectLow = float3(kHuge), objectHigh = float3(-kHuge);
-    for (uint primitive = 0u; primitive < count; ++primitive) {
+    for (uint index = 0u; index < count; ++index) {
+      BvhReference reference = {};
+      if (referenced) reference = references[descriptor.output.y + index];
+      const uint primitive = referenced ? asuint(reference.low.w) : index;
       const uint base = descriptor.geometry.x + primitive * 3u;
       if (base + 2u >= control.geometry.x) {
         result.result.x = kBvhBuildErrorGeometry;
@@ -205,17 +212,17 @@ void bvh_build(uint3 id: SV_DispatchThreadID) {
         return;
       }
       BvhBuildRecord record;
-      record.identity = uint4(primitive, 0u, 0u, 0u);
-      record.low = float4(min(v0, min(v1, v2)), 0.0f);
-      record.high = float4(max(v0, max(v1, v2)), 0.0f);
-      scratchA[primitive] = record;
+      record.identity = uint4(primitive, 0u, 0u, index);
+      record.low = float4(referenced ? reference.low.xyz : min(v0, min(v1, v2)), 0.0f);
+      record.high = float4(referenced ? reference.high.xyz : max(v0, max(v1, v2)), 0.0f);
+      scratchA[index] = record;
       objectLow = min(objectLow, record.low.xyz);
       objectHigh = max(objectHigh, record.high.xyz);
     }
-    for (uint primitive = 0u; primitive < count; ++primitive) {
-      BvhBuildRecord record = scratchA[primitive];
+    for (uint index = 0u; index < count; ++index) {
+      BvhBuildRecord record = scratchA[index];
       record.identity.y = morton3((record.low.xyz + record.high.xyz) * 0.5f, objectLow, objectHigh);
-      scratchA[primitive] = record;
+      scratchA[index] = record;
     }
     stableRadix(count, radixPasses);
     for (uint sorted = 0u; sorted < count; ++sorted) {
@@ -243,7 +250,7 @@ void bvh_build(uint3 id: SV_DispatchThreadID) {
     result.counts.y += count;
 
     BvhBuildRecord world;
-    world.identity = uint4(descriptor.geometry.w, 0u, 0u, 0u);
+    world.identity = uint4(descriptor.geometry.w, 0u, 0u, descriptorIndex);
     world.low = float4(kHuge);
     world.high = float4(-kHuge);
     if (count == 0u) {
@@ -260,6 +267,12 @@ void bvh_build(uint3 id: SV_DispatchThreadID) {
       }
     }
     instanceRecords[descriptorIndex] = world;
+  }
+
+  if (control.part.z == 0u) {
+    result.counts.w = radixPasses;
+    status[0] = result;
+    return;
   }
 
   // Stable Morton order for the TLAS. Copy the instance records because scratchA may still hold

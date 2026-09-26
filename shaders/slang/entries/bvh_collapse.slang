@@ -17,7 +17,7 @@ import pt_bvh;
 import pt_wide_bvh;
 import pt_exact_float;
 
-static const uint kCollapseLevels = uint(kBvhStack); // deeper trees cannot be traversed
+static const uint kCollapseLevels = uint(kBvhStackDeep); // deeper trees cannot be traversed
 static const uint kCollapseBottom = 0x80000000u; // task word: a bottom-level node
 static const uint kCollapseMaximumSteps = 1024u; // frontier expansions; more means a malformed tree
 static const uint kExactHalf = 0x3F000000u;        // 0.5f

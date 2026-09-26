@@ -10,6 +10,7 @@
 #include "pt/BvhVariants.h"
 #include "pt/Shared.h"
 #include "render/RayTracing.h"
+#include "render/Renderer.h"
 #include "render/GpuBvhBuilder.h"
 #include "render/TraceScene.h"
 
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -559,11 +561,33 @@ std::string compareTrees(const DownloadedTree &a, const DownloadedTree &b) {
   return {};
 }
 
+// A scene's geometry read back, and each instance's triangle count: the CPU builder's and split
+// clipping's input.
+struct HostGeometry {
+  std::vector<float> vertices;
+  std::vector<std::uint32_t> indices, triangleCounts;
+};
+
+HostGeometry readGeometry(Uploader &uploader, const Scene &scene, const TraceScene &trace) {
+  HostGeometry geometry;
+  geometry.vertices.resize(static_cast<std::size_t>(scene.vertexCount) * pt::kVertexFloats);
+  geometry.indices.resize(scene.indexCount);
+  std::memcpy(geometry.vertices.data(),
+              uploader.readBuffer(scene.vertexBuffer, geometry.vertices.size() * sizeof(float)).data(),
+              geometry.vertices.size() * sizeof(float));
+  std::memcpy(geometry.indices.data(), uploader.readBuffer(scene.indexBuffer, geometry.indices.size() * 4u).data(),
+              geometry.indices.size() * 4u);
+  for (const std::uint32_t primitive : trace.primitives)
+    geometry.triangleCounts.push_back(scene.primitives[primitive].indexCount / 3u);
+  return geometry;
+}
+
 // A published binary tree is well formed: walked from its roots, every node is reached once and
 // all are reached; an interior child's slot bounds its node's children; every bottom-level leaf
-// is one triangle of its instance, each once, inside its slot's bounds; every top-level leaf is
-// one instance, each once. "" when well formed.
-std::string checkTree(const DownloadedTree &tree) {
+// is one triangle of its instance (or, for the SAH builders, up to eight consecutive ones), each
+// once, inside its slot's bounds (with split clipping, a slot within its triangle's bounds: a
+// reference's box); every top-level leaf is one instance, each once. "" when well formed.
+std::string checkTree(const DownloadedTree &tree, bool clipped = false) {
   const std::size_t nodeCount = tree.nodes.size() / 4u, triangleCount = tree.triangles.size() / 3u;
   const std::size_t instanceCount = tree.instances.size();
   std::vector<std::uint8_t> reached(nodeCount, 0u), triangleSeen(triangleCount, 0u), instanceSeen(instanceCount, 0u);
@@ -614,23 +638,42 @@ std::string checkTree(const DownloadedTree &tree) {
         stack.push_back({data, entry.instance});
         continue;
       }
-      if (count != 1u) return where + " is a leaf of " + std::to_string(count) + " primitives";
+      if (count > (entry.instance < 0 ? 1u : 8u))
+        return where + " is a leaf of " + std::to_string(count) + " primitives";
       if (entry.instance < 0) {
         if (data >= instanceCount || instanceSeen[data]++ != 0u) return where + " is a missing or repeated instance";
         continue;
       }
       const pt::uint first = tree.instances[std::size_t(entry.instance)].triangleOffset;
-      if (data < first || data >= triangleEnd(first) || triangleSeen[data]++ != 0u)
-        return where + " is a triangle outside its instance or a repeated one";
-      for (pt::uint vertex = 0; vertex < 3u; ++vertex) {
-        const pt::float4 &position = tree.triangles[data * 3u + vertex];
-        if (!inside(low, high, position.x, position.y, position.z)) {
-          char values[256];
-          std::snprintf(values, sizeof(values), " (%a %a %a outside %a %a %a .. %a %a %a)", position.x, position.y,
-                        position.z, low.x, low.y, low.z, high.x, high.y, high.z);
-          return where + " does not bound its triangle" + values;
+      // Clipped, the leaf's box is its references' boxes: within its triangles' box.
+      pt::float4 trianglesLow(3.0e38f), trianglesHigh(-3.0e38f);
+      for (pt::uint triangle = data; triangle < data + count; ++triangle) {
+        if (triangle < first || triangle >= triangleEnd(first) || triangleSeen[triangle]++ != 0u)
+          return where + " is a triangle outside its instance or a repeated one";
+        if (clipped) {
+          for (pt::uint vertex = 0; vertex < 3u; ++vertex) {
+            const pt::float4 &v = tree.triangles[triangle * 3u + vertex];
+            trianglesLow = pt::float4(std::min(trianglesLow.x, v.x), std::min(trianglesLow.y, v.y),
+                                      std::min(trianglesLow.z, v.z), 0.0f);
+            trianglesHigh = pt::float4(std::max(trianglesHigh.x, v.x), std::max(trianglesHigh.y, v.y),
+                                       std::max(trianglesHigh.z, v.z), 0.0f);
+          }
+          continue;
+        }
+        for (pt::uint vertex = 0; vertex < 3u; ++vertex) {
+          const pt::float4 &position = tree.triangles[triangle * 3u + vertex];
+          if (!inside(low, high, position.x, position.y, position.z)) {
+            char values[256];
+            std::snprintf(values, sizeof(values), " (%a %a %a outside %a %a %a .. %a %a %a)", position.x, position.y,
+                          position.z, low.x, low.y, low.z, high.x, high.y, high.z);
+            return where + " does not bound its triangle" + values;
+          }
         }
       }
+      if (clipped && (!(low.x <= high.x && low.y <= high.y && low.z <= high.z) ||
+                      !inside(trianglesLow, trianglesHigh, low.x, low.y, low.z) ||
+                      !inside(trianglesLow, trianglesHigh, high.x, high.y, high.z)))
+        return where + " is not a box within its triangles' box";
     }
   }
   if (visited != nodeCount) return "only " + std::to_string(visited) + " of " + std::to_string(nodeCount) + " nodes are reached";
@@ -844,7 +887,13 @@ void makeRefitFixture(Fixture &fixture) {
 // after the vertices warp too, the refit tree finds the same closest hits as a fresh build
 // (host traversal of both); a refit and a TLAS rebuild back restore the first build exactly.
 const char *topologyName(GpuBvhTopology topology) {
-  return topology == GpuBvhTopology::Ploc ? "PLOC" : "LBVH";
+  return topology == GpuBvhTopology::Ploc           ? "PLOC" :
+         topology == GpuBvhTopology::PlocPlusPlus   ? "PLOC++" :
+         topology == GpuBvhTopology::Hploc          ? "H-PLOC" :
+         topology == GpuBvhTopology::SinglePassLbvh ? "single-pass LBVH" :
+         topology == GpuBvhTopology::BatchedLbvh    ? "batched LBVH" :
+         topology == GpuBvhTopology::BinnedSah      ? "binned SAH" :
+                                                      "LBVH";
 }
 
 void runRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder &builder, GpuBvhTopology topology) {
@@ -1096,7 +1145,8 @@ void runWideRefitTest(const Context &context, Uploader &uploader, GpuLbvhBuilder
               "GPU %.3f ms, %u dispatches)\n", width, hits, reemitted.gpuMilliseconds, reemitted.dispatches);
 }
 
-int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide, bool wavefront, bool rayPipeline) {
+int run(bool software, bool gpuBuilder, bool lbvh, GpuBvhTopology lbvhTopology, bool ploc, GpuBvhTopology plocTopology,
+        std::uint32_t wide, bool wavefront, bool rayPipeline, float clip, const std::string &traversal) {
   Window window("Basalt GPU ray oracle", 64, 64, false);
   Context context(window, true);
   if (rayPipeline && !context.rayPipelineSupported) {
@@ -1117,17 +1167,154 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
     Uploader uploader(context);
     std::unique_ptr<GpuLbvhBuilder> lbvhBuilder;
     if (lbvh || ploc) lbvhBuilder = std::make_unique<GpuLbvhBuilder>(context);
-    const GpuBvhTopology topology = ploc ? GpuBvhTopology::Ploc : GpuBvhTopology::Lbvh;
-    // The builder under test; with --gpu-lbvh every build is also the serial builder's tree.
+    const GpuBvhTopology topology = ploc ? plocTopology : lbvhTopology;
+    const bool plocFused = topology == GpuBvhTopology::PlocPlusPlus;
+    const bool sah = topology == GpuBvhTopology::BinnedSah;
+    // The builder under test; with --gpu-lbvh, --gpu-apetrei (the single-pass LBVH) and
+    // --gpu-batched every build is also the serial builder's tree.
     // With --gpu-ploc every build is well formed, the same bytes when repeated, and publishes
-    // the serial builder's triangles (the same Morton order) and instance rows.
+    // the serial builder's triangles (the same Morton order) and instance rows; with --gpu-plocpp
+    // (PLOC++'s fused iterations) it is also the PLOC build byte for byte; --gpu-hploc (H-PLOC)
+    // takes PLOC's checks. With --gpu-sah (the binned SAH) every build is repeatable and the CPU
+    // builder's over the same geometry (read back, subnormals flushed where the device flushes
+    // them), byte for byte. With --split-clipping, every build (and the tree it is compared with)
+    // is over split clipping's references: the host's, which the GPU's must equal byte for byte
+    // (where the device has 64-bit floats); the GPU builds take the GPU's.
+    const bool clipping = clip > 0.0f;
+    if (clipping) std::printf("Split clipping (factor %g) for every build\n", clip);
+    std::unique_ptr<GpuLbvhBuilder> clipper;  // the GPU clipping, when no builder under test has it
     auto buildOnGpu = [&](const Scene &scene, const TraceScene &trace, const char *what) {
+      std::optional<pt::BvhReferences> clippedReferences;
+      std::optional<GpuBvhReferences> gpuClipped;
+      if (clipping) {
+        const HostGeometry geometry = readGeometry(uploader, scene, trace);
+        clippedReferences = pt::clipReferences(geometry.vertices, geometry.indices, trace.instances,
+                                               geometry.triangleCounts, clip, std::thread::hardware_concurrency());
+        if (!lbvhBuilder && !clipper) clipper = std::make_unique<GpuLbvhBuilder>(context);
+        GpuLbvhBuilder &gpu = lbvhBuilder ? *lbvhBuilder : *clipper;
+        if (gpu.clipAvailable()) {
+          gpuClipped = gpu.clipReferences(uploader, scene, trace, clip);
+          const std::vector<pt::BvhReference> &host = clippedReferences->references;
+          const std::vector<std::uint8_t> bytes =
+              uploader.readBuffer(gpuClipped->references, std::max<std::size_t>(1, host.size()) * sizeof(pt::BvhReference));
+          if (gpuClipped->counts != clippedReferences->counts ||
+              (!host.empty() && std::memcmp(bytes.data(), host.data(), host.size() * sizeof(pt::BvhReference)) != 0)) {
+            std::size_t first = 0;
+            while (first < host.size() && std::memcmp(bytes.data() + first * sizeof(pt::BvhReference), &host[first],
+                                                      sizeof(pt::BvhReference)) == 0)
+              ++first;
+            char detail[512] = "";
+            for (std::size_t i = 0; i < host.size() && i < gpuClipped->counts.size(); ++i)
+              if (i < clippedReferences->counts.size() && gpuClipped->counts[i] != clippedReferences->counts[i]) {
+                std::snprintf(detail, sizeof(detail), "; instance %zu: %u references, the host %u", i,
+                              gpuClipped->counts[i], clippedReferences->counts[i]);
+                break;
+              }
+            if (!detail[0] && first < host.size()) {
+              pt::BvhReference gpu{};
+              std::memcpy(&gpu, bytes.data() + first * sizeof(pt::BvhReference), sizeof(gpu));
+              const pt::BvhReference &cpu = host[first];
+              std::snprintf(detail, sizeof(detail), "; GPU %a %a %a .. %a %a %a, the host %a %a %a .. %a %a %a", gpu.low.x,
+                            gpu.low.y, gpu.low.z, gpu.high.x, gpu.high.y, gpu.high.z, cpu.low.x, cpu.low.y, cpu.low.z,
+                            cpu.high.x, cpu.high.y, cpu.high.z);
+            }
+            throw Error(std::string("the GPU split clipping differs from the host's on the ") + what + " (first at reference " +
+                        std::to_string(first) + " of " + std::to_string(host.size()) + detail + ")");
+          }
+          std::printf("PASS: the GPU split clipping makes the host's %zu references byte for byte on the %s "
+                      "(GPU %.3f ms, host %.1f ms)\n", host.size(), what, gpuClipped->gpuMilliseconds,
+                      clippedReferences->milliseconds);
+        } else {
+          gpuClipped = uploadReferences(uploader, *clippedReferences);
+        }
+      }
+      const pt::BvhReferences *hostReferences = clippedReferences ? &*clippedReferences : nullptr;
+      const GpuBvhReferences *references = gpuClipped ? &*gpuClipped : nullptr;
+      if (sah) {
+        GpuBvhBuildResult built = lbvhBuilder->build(uploader, scene, trace, false, topology, references);
+        const GpuBvhBuildResult again = lbvhBuilder->build(uploader, scene, trace, false, topology, references);
+        // Only the published nodes: the buffer holds as many as an LBVH, more than a SAH tree's.
+        const VkDeviceSize published = VkDeviceSize(built.status.nodes) * 4u * sizeof(pt::float4);
+        if (again.status.nodes != built.status.nodes ||
+            uploader.readBuffer(again.nodes, published) != uploader.readBuffer(built.nodes, published))
+          throw Error(std::string("two binned SAH builds of the ") + what + " publish different nodes");
+        DownloadedTree tree = downloadTree(uploader, built);
+        tree.nodes.resize(std::size_t(built.status.nodes) * 4u);
+        const std::string malformed = checkTree(tree, clipping);
+        if (!malformed.empty()) throw Error(std::string("binned SAH tree is malformed on the ") + what + ": " + malformed);
+        const HostGeometry geometry = readGeometry(uploader, scene, trace);
+        // Devices may flush subnormals to signed zero in the builders' arithmetic (Vulkan's
+        // default float controls): the CPU builder's tree over the vertices as read, or else as
+        // flushed (its triangles then compared flushed too). "" when the GPU build is that tree.
+        auto flush = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+        pt::BvhStatistics cpuStatistics{};
+        auto difference = [&](bool flushed) -> std::string {
+          std::vector<float> input = geometry.vertices;
+          if (flushed) std::transform(input.begin(), input.end(), input.begin(), flush);
+          // The references' boxes, flushed as the device reads them.
+          std::optional<pt::BvhReferences> flushedReferences;
+          if (flushed && hostReferences) {
+            flushedReferences = *hostReferences;
+            for (pt::BvhReference &reference : flushedReferences->references) {
+              reference.low = pt::float4(flush(reference.low.x), flush(reference.low.y), flush(reference.low.z), reference.low.w);
+              reference.high = pt::float4(flush(reference.high.x), flush(reference.high.y), flush(reference.high.z), 0.0f);
+            }
+          }
+          std::vector<pt::TraceInstance> instances = trace.instances;
+          pt::Bvh cpu;
+          cpuStatistics = pt::buildBvh(input, geometry.indices, instances, geometry.triangleCounts, cpu, 1u,
+                                       flushedReferences ? &*flushedReferences : hostReferences);
+          if (std::size_t(built.status.nodes) * 4u != cpu.nodes.size())
+            return std::to_string(built.status.nodes) + " nodes, the CPU builder " + std::to_string(cpu.nodes.size() / 4u);
+          // Flushed, box coordinates compare as flushed: the device flushes in arithmetic (the
+          // triangles' boxes, the instances' transforms) but not where it copies or bounds by
+          // integer ordering (split clipping's boxes), and its zeros may take either sign. The
+          // data and count words are exact.
+          const auto *a = reinterpret_cast<const std::uint32_t *>(tree.nodes.data());
+          const auto *b = reinterpret_cast<const std::uint32_t *>(cpu.nodes.data());
+          for (std::size_t w = 0; w < cpu.nodes.size() * 4u; ++w) {
+            const bool box = w % 4u != 3u;
+            const bool same = flushed && box ? flush(std::bit_cast<float>(a[w])) == flush(std::bit_cast<float>(b[w]))
+                                             : a[w] == b[w];
+            if (!same)
+              return "node word " + std::to_string(w) + " (node " + std::to_string(w / 16u) + ") " + std::to_string(a[w]) +
+                     ", the CPU builder's " + std::to_string(b[w]);
+          }
+          if (tree.triangles.size() != cpu.triangles.size()) return "a different triangle count";
+          for (std::size_t i = 0; i < cpu.triangles.size(); ++i) {
+            const pt::float4 &x = tree.triangles[i], &y = cpu.triangles[i];
+            const bool same = flushed ? flush(x.x) == y.x && flush(x.y) == y.y && flush(x.z) == y.z &&
+                                            std::bit_cast<std::uint32_t>(x.w) == std::bit_cast<std::uint32_t>(y.w)
+                                      : std::memcmp(&x, &y, sizeof(x)) == 0;
+            if (!same) return "triangle word " + std::to_string(i);
+          }
+          for (std::size_t i = 0; i < instances.size(); ++i)
+            if (std::memcmp(&tree.instances[i], &instances[i], sizeof(pt::TraceInstance)) != 0)
+              return "instance row " + std::to_string(i);
+          if (built.statistics.topDepth != cpuStatistics.topDepth || built.statistics.bottomDepth != cpuStatistics.bottomDepth)
+            return "depth";
+          return {};
+        };
+        const std::string raw = difference(false);
+        const bool flushed = !raw.empty();
+        if (flushed) {
+          if (const std::string after = difference(true); !after.empty())
+            throw Error(std::string("binned SAH differs from the CPU builder on the ") + what + ": " + raw +
+                        " (with subnormals flushed: " + after + ")");
+        }
+        std::printf("PASS: GPU binned SAH publishes the CPU builder's nodes, triangles and rows byte for byte on the %s%s "
+                    "(depth %u + %u, SAH %.6g vs CPU %.6g, %u dispatches, GPU %.3f ms)\n", what,
+                    flushed ? " (with subnormals flushed)" : "", built.statistics.topDepth,
+                    built.statistics.bottomDepth, built.statistics.sahCost, cpuStatistics.sahCost, built.status.dispatches,
+                    [&] { double sum = 0.0; for (double v : built.stageMilliseconds) sum += v; return sum; }());
+        return built;
+      }
       if (ploc) {
-        GpuBvhBuildResult built = lbvhBuilder->build(uploader, scene, trace, false, topology);
-        const GpuBvhBuildResult again = lbvhBuilder->build(uploader, scene, trace, false, topology);
-        const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace);
+        GpuBvhBuildResult built = lbvhBuilder->build(uploader, scene, trace, false, topology, references);
+        const GpuBvhBuildResult again = lbvhBuilder->build(uploader, scene, trace, false, topology, references);
+        const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace, references);
         const DownloadedTree tree = downloadTree(uploader, built), serialTree = downloadTree(uploader, serial);
-        const std::string malformed = checkTree(tree);
+        const std::string malformed = checkTree(tree, clipping);
         if (!malformed.empty()) throw Error(std::string("PLOC tree is malformed on the ") + what + ": " + malformed);
         if (downloadAll(uploader, again.nodes) != downloadAll(uploader, built.nodes))
           throw Error(std::string("two PLOC builds of the ") + what + " publish different nodes");
@@ -1137,39 +1324,55 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         for (std::size_t i = 0; i < tree.instances.size(); ++i)
           if (std::memcmp(&tree.instances[i], &serialTree.instances[i], sizeof(pt::TraceInstance)) != 0)
             throw Error(std::string("PLOC instance rows differ from the serial builder's on the ") + what);
-        std::printf("PASS: parallel PLOC builds a well-formed, repeatable tree on the %s (depth %u + %u, SAH %.4g vs "
-                    "LBVH %.4g, %u merge iterations, %u dispatches, GPU %.3f ms)\n", what, built.statistics.topDepth,
+        if (plocFused) {
+          const GpuBvhBuildResult plain = lbvhBuilder->build(uploader, scene, trace, false, GpuBvhTopology::Ploc, references);
+          if (downloadAll(uploader, plain.nodes) != downloadAll(uploader, built.nodes))
+            throw Error(std::string("PLOC++ nodes are not the PLOC build's byte for byte on the ") + what);
+        }
+        std::printf("PASS: parallel %s builds a well-formed, repeatable tree on the %s (depth %u + %u, SAH %.4g vs "
+                    "LBVH %.4g, %u merge iterations, %u dispatches, GPU %.3f ms)\n", topologyName(topology), what,
+                    built.statistics.topDepth,
                     built.statistics.bottomDepth, built.statistics.sahCost, serial.statistics.sahCost,
                     built.status.plocIterations, built.status.dispatches,
                     [&] { double sum = 0.0; for (double v : built.stageMilliseconds) sum += v; return sum; }());
         return built;
       }
-      if (!lbvh) return buildGpuBvh(context, uploader, scene, trace);
-      GpuBvhBuildResult parallel = lbvhBuilder->build(uploader, scene, trace);
-      const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace);
+      if (!lbvh) return buildGpuBvh(context, uploader, scene, trace, references);
+      GpuBvhBuildResult parallel = lbvhBuilder->build(uploader, scene, trace, false, topology, references);
+      const GpuBvhBuildResult serial = buildGpuBvh(context, uploader, scene, trace, references);
       const DownloadedTree parallelTree = downloadTree(uploader, parallel), serialTree = downloadTree(uploader, serial);
       const std::string difference = compareTrees(parallelTree, serialTree);
       if (!difference.empty())
-        throw Error(std::string("parallel LBVH differs from the serial builder on the ") + what + ": " + difference);
+        throw Error(std::string(topologyName(topology)) + " differs from the serial builder on the " + what + ": " + difference);
       // The serial numbering too: the published nodes are the serial builder's, byte for byte.
       if (parallelTree.nodes.size() != serialTree.nodes.size() ||
           std::memcmp(parallelTree.nodes.data(), serialTree.nodes.data(), parallelTree.nodes.size() * sizeof(pt::float4)) != 0)
-        throw Error(std::string("parallel LBVH nodes are not byte-identical to the serial builder's on the ") + what);
+        throw Error(std::string(topologyName(topology)) + " nodes are not byte-identical to the serial builder's on the " + what);
       if (parallel.statistics.topDepth != serial.statistics.topDepth ||
           parallel.statistics.bottomDepth != serial.statistics.bottomDepth ||
           std::abs(parallel.statistics.sahCost - serial.statistics.sahCost) > 1e-9 * serial.statistics.sahCost)
-        throw Error(std::string("parallel LBVH depth or cost differs from the serial builder on the ") + what);
-      std::printf("PASS: parallel LBVH publishes the serial builder's nodes byte for byte on the %s (depth %u + %u, %u fit levels, "
-                  "%u dispatches, GPU %.3f ms)\n", what, parallel.statistics.topDepth, parallel.statistics.bottomDepth,
+        throw Error(std::string(topologyName(topology)) + " depth or cost differs from the serial builder on the " + what);
+      std::printf("PASS: %s publishes the serial builder's nodes byte for byte on the %s (depth %u + %u, %u fit levels, "
+                  "%u dispatches, GPU %.3f ms)\n", topologyName(topology), what, parallel.statistics.topDepth, parallel.statistics.bottomDepth,
                   parallel.status.fitIterations, parallel.status.dispatches,
                   [&] { double sum = 0.0; for (double v : parallel.stageMilliseconds) sum += v; return sum; }());
       return parallel;
     };
-    if (lbvh) runSortTest(uploader, *lbvhBuilder);
-    if ((lbvh || ploc) && wide == 0u) runRefitTest(context, uploader, *lbvhBuilder, topology);
+    if (lbvh && !clipping) runSortTest(uploader, *lbvhBuilder);
+    if ((lbvh || ploc) && !sah && !clipping && wide == 0u) runRefitTest(context, uploader, *lbvhBuilder, topology);
+    if (sah) {
+      bool refused = false;
+      try {
+        lbvhBuilder->build(uploader, Scene{}, TraceScene{}, true, topology);
+      } catch (const std::invalid_argument &) {
+        refused = true;
+      }
+      if (!refused) throw Error("a refittable binned SAH build was not refused");
+      std::printf("PASS: a refittable binned SAH build is refused\n");
+    }
     std::unique_ptr<GpuBvhCollapser> collapser;
     if (wide != 0u) collapser = std::make_unique<GpuBvhCollapser>(context);
-    if ((lbvh || ploc) && wide != 0u) runWideRefitTest(context, uploader, *lbvhBuilder, *collapser, wide, topology);
+    if ((lbvh || ploc) && !sah && !clipping && wide != 0u) runWideRefitTest(context, uploader, *lbvhBuilder, *collapser, wide, topology);
     // The collapse on the adversarial fixture's tree, built by the builder under test.
     if (wide != 0u) {
       Fixture collapseFixture;
@@ -1242,11 +1445,46 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
       if (wide != 0u)
         checkCollapse(uploader, *collapser, stressBuild.nodes, downloadBinaryNodes(uploader, stressBuild),
                       stressBuild.instances, wide, "GPU-built stress fixture", stressBuild.statistics);
-      if (stressBuild.statistics.triangles != stressTriangles ||
+      if ((clipping ? stressBuild.statistics.triangles < stressTriangles
+                    : stressBuild.statistics.triangles != stressTriangles) ||
           stressBuild.statistics.topDepth + stressBuild.statistics.bottomDepth > pt::kBvhStack)
         throw Error("GPU LBVH stress fixture failed its count or depth contract");
       std::printf("PASS: GPU LBVH %u-triangle stress fixture (depth %u + %u)\n", stressTriangles,
                   stressBuild.statistics.topDepth, stressBuild.statistics.bottomDepth);
+
+      // Bottom levels around the batched build's one-workgroup limit (256 records), with runs of
+      // duplicate centroids: every size the batched sort and climb take, and the neighbours
+      // that go through the global kernels, under the same checks as the other fixtures.
+      Fixture small;
+      const std::uint32_t smallMaterial = addMaterial(small, AlphaMode::Opaque, 1.0f);
+      std::mt19937 smallRandom(41);
+      std::uniform_real_distribution<float> smallUnit(-1.0f, 1.0f);
+      const std::uint32_t smallSizes[] = {1u, 2u, 3u, 7u, 64u, 200u, 255u, 256u, 257u};
+      for (std::size_t level = 0; level < std::size(smallSizes); ++level) {
+        std::vector<Vec3> positions;
+        std::vector<std::uint32_t> indices;
+        for (std::uint32_t triangle = 0; triangle < smallSizes[level]; ++triangle) {
+          // Every fifth triangle is centred at the origin: equal Morton codes, kept in primitive order.
+          const Vec3 centre = triangle % 5u == 0u ? Vec3(0.0f, 0.0f, 0.0f)
+                                                  : Vec3(smallUnit(smallRandom), smallUnit(smallRandom), smallUnit(smallRandom));
+          const Vec3 a(smallUnit(smallRandom), smallUnit(smallRandom), smallUnit(smallRandom));
+          const Vec3 b(smallUnit(smallRandom), smallUnit(smallRandom), smallUnit(smallRandom));
+          const std::uint32_t base = static_cast<std::uint32_t>(positions.size());
+          positions.insert(positions.end(), {centre + a * 0.1f, centre + b * 0.1f, centre - (a + b) * 0.1f});
+          indices.insert(indices.end(), {base, base + 1u, base + 2u});
+        }
+        addMesh(small, positions, indices, smallMaterial,
+                transform(0.3f * static_cast<float>(level), {1.0f, 1.0f, 1.0f}, {2.5f * static_cast<float>(level), 0.0f, 0.0f}),
+                "small level");
+      }
+      small.scene.vertexCount = static_cast<std::uint32_t>(small.vertices.size());
+      small.scene.indexCount = static_cast<std::uint32_t>(small.indices.size());
+      small.scene.vertexBuffer = uploader.createBuffer(small.vertices.data(), small.vertices.size() * sizeof(Vertex),
+          geometryBufferUsage(context, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), "small.vertices");
+      small.scene.indexBuffer = uploader.createBuffer(small.indices.data(), small.indices.size() * sizeof(std::uint32_t),
+          geometryBufferUsage(context, VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "small.indices");
+      const TraceScene smallTrace = buildTraceScene(small.scene, std::vector<std::uint32_t>(1, 0u));
+      buildOnGpu(small.scene, smallTrace, "small-levels fixture");
     }
     Fixture fixture;
     makeFixture(fixture);
@@ -1382,9 +1620,10 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         downloadedWide.instances = trace.instances;
         downloadedWide.width = wide;
       }
-      std::uint32_t expectedTie = 300u;
+      // Duplicate Morton codes keep primitive order (a triangle per primitive: not when clipped).
+      std::uint32_t expectedTie = clipping ? 332u : 300u;
       const std::uint32_t firstCount = fixture.scene.primitives[trace.primitives[0]].indexCount / 3u;
-      for (std::uint32_t sorted = 0; sorted < firstCount; ++sorted) {
+      for (std::uint32_t sorted = 0; !clipping && sorted < firstCount; ++sorted) {
         const std::uint32_t primitive = pt::as_type<pt::uint>(
             downloadedTriangles[(trace.instances[0].triangleOffset + sorted) * 3u].w);
         if (primitive >= 300u && primitive < 332u) {
@@ -1393,7 +1632,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         }
       }
       if (expectedTie != 332u) throw Error("GPU LBVH duplicate-Morton fixture was not emitted");
-      std::printf("PASS: GPU LBVH stable duplicate-Morton ordering\n");
+      if (!clipping) std::printf("PASS: GPU LBVH stable duplicate-Morton ordering\n");
       pt::HostTextures hostTextures;
       const HostView downloadedView(hostTextures, trace.instances, materials, fixture.indices,
                                     reinterpret_cast<const float *>(fixture.vertices.data()),
@@ -1450,7 +1689,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
           context, stages, groups, ShaderBindingRecords{0u, {1u}, {2u}});
     } else {
       program = std::make_unique<Program>(context, wavefront ? "wavefront_trace" :
-          wide != 0u ? "bvh_wide_oracle" : software ? "bvh_oracle" : "ray_query_oracle");
+          wide != 0u ? "bvh_wide_oracle" : software ? "bvh_oracle" + traversal : std::string("ray_query_oracle"));
       pipeline = Pipeline(context, *program, software ? "software BVH oracle" : "ray query oracle");
     }
     const ShaderLayout &layout = rayPipeline ? tracePipeline->shaderLayout() : program->shaderLayout();
@@ -1555,7 +1794,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
         std::chrono::duration<double>(std::chrono::steady_clock::now() - dispatchStarted).count();
     std::printf("%s dispatch: %.2f M queries/s (host-timed dispatch plus wait)\n",
                 rayPipeline ? "ray pipeline" : wavefront ? "wavefront binary BVH" : wide == 4u ? "quantized BVH4" : wide == 8u ? "quantized BVH8" :
-                ploc ? "parallel-PLOC software-BVH" : lbvh ? "parallel-LBVH software-BVH" : gpuBuilder ? "GPU-built software-BVH" : software ? "software-BVH" : "ray-query",
+                sah ? "GPU binned-SAH software-BVH" : ploc ? "parallel-PLOC software-BVH" : lbvh ? "parallel-LBVH software-BVH" : gpuBuilder ? "GPU-built software-BVH" : software ? "software-BVH" : "ray-query",
                 static_cast<double>(queries.size()) / dispatchSeconds * 1e-6);
     const std::vector<std::uint8_t> bytes =
         uploader.readBuffer(hitBuffer, queries.size() * sizeof(OracleHit));
@@ -1574,7 +1813,7 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
   if (result == 0)
     std::printf("PASS: %s corpus on %s; Vulkan validation clean\n",
                 rayPipeline ? "ray pipeline" : wavefront ? "wavefront binary BVH" : wide == 4u ? "quantized BVH4" : wide == 8u ? "quantized BVH8" :
-                ploc ? "parallel-PLOC software BVH" : lbvh ? "parallel-LBVH software BVH" : gpuBuilder ? "GPU-built software BVH" : software ? "software BVH" : "hardware ray-query",
+                ploc && plocTopology == GpuBvhTopology::BinnedSah ? "GPU binned-SAH software BVH" : ploc ? "parallel-PLOC software BVH" : lbvh ? "parallel-LBVH software BVH" : gpuBuilder ? "GPU-built software BVH" : software ? "software BVH" : "hardware ray-query",
                 context.info.name.c_str());
   return result;
 }
@@ -1584,17 +1823,56 @@ int run(bool software, bool gpuBuilder, bool lbvh, bool ploc, std::uint32_t wide
 int main(int argc, char **argv) {
   try {
     const std::string mode = argc > 1 ? argv[1] : "";
-    // --gpu-lbvh-wide4/8, --gpu-ploc-wide8: the parallel builder's tree collapsed on the GPU.
-    const bool lbvh = mode == "--gpu-lbvh" || mode == "--gpu-lbvh-wide4" || mode == "--gpu-lbvh-wide8";
-    const bool ploc = mode == "--gpu-ploc" || mode == "--gpu-ploc-wide8";
+    // --gpu-lbvh-wide4/8, --gpu-apetrei-wide8, --gpu-batched-wide8, --gpu-ploc-wide8: the parallel
+    // builder's tree collapsed on the GPU.
+    const bool singlePass = mode == "--gpu-apetrei" || mode == "--gpu-apetrei-wide8";
+    const bool batched = mode == "--gpu-batched" || mode == "--gpu-batched-wide8";
+    const bool lbvh = singlePass || batched || mode == "--gpu-lbvh" || mode == "--gpu-lbvh-wide4" || mode == "--gpu-lbvh-wide8";
+    const GpuBvhTopology lbvhTopology = singlePass ? GpuBvhTopology::SinglePassLbvh :
+                                       batched    ? GpuBvhTopology::BatchedLbvh :
+                                                    GpuBvhTopology::Lbvh;
+    // --gpu-sah(-wide8): the binned SAH, run through the PLOC path with its own checks.
+    const bool plocFused = mode == "--gpu-plocpp";
+    const bool hploc = mode == "--gpu-hploc" || mode == "--gpu-hploc-wide8";
+    const bool sah = mode == "--gpu-sah" || mode == "--gpu-sah-wide8";
+    const bool ploc = plocFused || hploc || sah || mode == "--gpu-ploc" || mode == "--gpu-ploc-wide8";
+    const GpuBvhTopology plocTopology = plocFused ? GpuBvhTopology::PlocPlusPlus :
+                                        hploc     ? GpuBvhTopology::Hploc :
+                                        sah       ? GpuBvhTopology::BinnedSah :
+                                                    GpuBvhTopology::Ploc;
     const bool gpuBuilder = lbvh || ploc || mode == "--gpu-builder";
     const std::uint32_t wide = mode == "--wide4" || mode == "--gpu-lbvh-wide4" ? 4u :
-                               mode == "--wide8" || mode == "--gpu-lbvh-wide8" || mode == "--gpu-ploc-wide8" ? 8u : 0u;
+                               mode == "--wide8" || mode == "--gpu-lbvh-wide8" || mode == "--gpu-apetrei-wide8" ||
+                                       mode == "--gpu-batched-wide8" || mode == "--gpu-hploc-wide8" ||
+                                       mode == "--gpu-sah-wide8" ||
+                                       mode == "--gpu-ploc-wide8"
+                                   ? 8u
+                                   : 0u;
     const bool wavefront = argc > 1 && std::string(argv[1]) == "--wavefront";
     const bool rayPipeline = argc > 1 && std::string(argv[1]) == "--pipeline";
     const bool software = gpuBuilder || wide != 0u || wavefront ||
                           (argc > 1 && std::string(argv[1]) == "--software");
-    return run(software, gpuBuilder, lbvh, ploc, wide, wavefront, rayPipeline);
+    // A second argument --split-clipping: every build over split clipping's references.
+    const float clip = argc > 2 && std::string(argv[2]) == "--split-clipping" ? 0.5f : 0.0f;
+    // --traversal NAME (a --bvh-traversal): the binary oracle traced by that traversal's kernel.
+    std::string traversal;
+    if (argc > 3 && std::string(argv[2]) == "--traversal") {
+      for (const BvhTraversalInfo &info : kBvhTraversals)
+        if (argv[3] == std::string(info.name)) traversal = info.suffix;
+      if (traversal.empty() || wide != 0u || wavefront || !software)
+        throw Error(std::string("--traversal takes a binary software mode and one of while-while, speculative, "
+                                "restart-trail, not ") + argv[3]);
+      std::printf("Binary BVH traversal: %s\n", argv[3]);
+    }
+    // --deep (last): that traversal's deep-stack (kBvhStackDeep) kernel.
+    if (argc > 2 && std::string(argv[argc - 1]) == "--deep") {
+      if (wide != 0u || wavefront || !software || traversal == "_restart_trail")
+        throw Error("--deep takes a binary software mode and a traversal with a stack");
+      traversal += "_deep";
+      std::printf("Binary BVH traversal stack: %d entries\n", pt::kBvhStackDeep);
+    }
+    return run(software, gpuBuilder, lbvh, lbvhTopology, ploc, plocTopology, wide, wavefront, rayPipeline, clip,
+               traversal);
   } catch (const std::exception &error) {
     std::fprintf(stderr, "GPU ray oracle failed: %s\n", error.what());
     return 1;

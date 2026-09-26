@@ -242,6 +242,10 @@ Context::Context(const Window &window, bool validation) {
   enabled.textureCompressionBC = features.features.textureCompressionBC;
   enabled.shaderSampledImageArrayDynamicIndexing = features.features.shaderSampledImageArrayDynamicIndexing;
   enabled.geometryShader = features.features.geometryShader;
+  // Optional: double precision and 64-bit integers in shaders (the GPU split clipping, exact as
+  // the host's).
+  enabled.shaderFloat64 = features.features.shaderFloat64;
+  enabled.shaderInt64 = features.features.shaderInt64;
   if (!enabled.geometryShader)
     throw Error("the device does not offer geometryShader, required for fragment primitive identity");
 
@@ -323,6 +327,8 @@ Context::Context(const Window &window, bool validation) {
   record("textureCompressionBC", enabled.textureCompressionBC);
   record("shaderSampledImageArrayDynamicIndexing", enabled.shaderSampledImageArrayDynamicIndexing);
   record("geometryShader", enabled.geometryShader);
+  record("shaderFloat64", enabled.shaderFloat64);
+  record("shaderInt64", enabled.shaderInt64);
   record("shaderDrawParameters", enable11.shaderDrawParameters);
   record("scalarBlockLayout", enable12.scalarBlockLayout);
   record("hostQueryReset", enable12.hostQueryReset);

@@ -325,6 +325,7 @@ ShaderReflection readSlangReflection(const Json &document, const std::vector<std
     case spv::CapabilityImageCubeArray:
     case spv::CapabilitySampledCubeArray: addUnique(features, "imageCubeArray"); break;
     case spv::CapabilityInt64: addUnique(features, "shaderInt64"); break;
+    case spv::CapabilityFloat64: addUnique(features, "shaderFloat64"); break;
     // A fragment shader reading its primitive index.
     case spv::CapabilityGeometry: addUnique(features, "geometryShader"); break;
     case spv::CapabilityGroupNonUniform: result.subgroupOperations |= VK_SUBGROUP_FEATURE_BASIC_BIT; break;
